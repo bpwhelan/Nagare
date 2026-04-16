@@ -1,0 +1,51 @@
+# ── Build artifacts ───────────────────────────────────────────
+/target/
+/frontend/dist/
+/frontend/node_modules/
+
+# ── Runtime data ─────────────────────────────────────────────
+/data/
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+
+# ── Config with secrets ──────────────────────────────────────
+config.toml
+
+# ── OS / editor junk ────────────────────────────────────────
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+*.iml
+
+# ── Rust ─────────────────────────────────────────────────────
+**/*.rs.bk
+
+# ── Node ─────────────────────────────────────────────────────
+node_modules/
+.npm
+.pnpm-store/
+
+# ── Temp / misc dev files ───────────────────────────────────
+*.log
+*.tmp
+*.bak
+*.zip
+*.tar.gz
+
+# ── API docs / specs (local dev only) ───────────────────────
+openapi.json
+
+# ── Other projects in workspace ─────────────────────────────
+.asbplayer/
+.GameSentenceMiner/
+
+# ── Misc ─────────────────────────────────────────────────────
+name
+AGENTS.md

@@ -244,10 +244,9 @@ parts of the aggregate.
 
   6. Conveying Non-Source Forms.
 
-  You may convey a covered work in object code form under the terms
-of sections 4 and 5, provided that you also convey the
-machine-readable Corresponding Source under the terms of this License,
-in one of these ways:
+  You may convey an object code work under the terms of sections 4 and 5,
+provided that you also convey the machine-readable Corresponding Source
+under the terms of this License, in one of these ways:
 
     a) Convey the object code in, or embodied in, a physical product
     (including a physical distribution medium), accompanied by the
@@ -263,8 +262,8 @@ in one of these ways:
     product that is covered by this License, on a durable physical
     medium customarily used for software interchange, for a price no
     more than your reasonable cost of physically performing this
-    conveying of source, or (2) access to copy the
-    Corresponding Source from a network server at no charge.
+    conveying of source, or (2) access to copy the Corresponding Source
+    from a network server at no charge.
 
     c) Convey individual copies of the object code with a copy of the
     written offer to provide the Corresponding Source.  This
@@ -563,9 +562,9 @@ combination as such.
   14. Revised Versions of this License.
 
   The Free Software Foundation may publish revised and/or new versions of
-the GNU General Public License from time to time.  Such new versions will
-be similar in spirit to the present version, but may differ in detail to
-address new problems or concerns.
+this License from time to time.  Such new versions will be similar in
+spirit to the present version, but may differ in detail to address new
+problems or concerns.
 
   Each version is given a distinguishing version number.  If the
 Program specifies that a certain numbered version of the GNU General

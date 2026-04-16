@@ -1,0 +1,17 @@
+services:
+  nagare:
+    image: ghcr.io/bpwhelan/nagare:latest
+    container_name: nagare
+    ports:
+      - "9470:9470"
+    volumes:
+      - ./config.toml:/app/config.toml:ro
+      - ./data:/app/data
+      # Mount your media library for disk-mode access (optional).
+      # Adjust the host paths to match your setup:
+      # - /path/to/anime:/media/Anime:ro
+      # - /path/to/movies:/media/Movies:ro
+    extra_hosts:
+      # Allows the container to reach AnkiConnect on the host machine
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
