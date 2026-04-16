@@ -31,8 +31,7 @@ NOTE: This project is my most vibe-coded yet, so YMMV. It's really a problem tha
 
 ### Docker (recommended)
 
-1. Create a `config.toml` from [config.example.toml](config.example.toml)
-2. Run with Docker Compose:
+1. Run with Docker Compose:
 
 ```yaml
 # docker-compose.yml
@@ -43,7 +42,6 @@ services:
     ports:
       - "9470:9470"
     volumes:
-      - ./config.toml:/app/config.toml:ro
       - ./data:/app/data
       # Optional: mount media library for disk-mode access
       # - /path/to/anime:/media/Anime:ro
@@ -56,7 +54,7 @@ services:
 docker compose up -d
 ```
 
-3. Open `http://localhost:9470`
+2. Open `http://localhost:9470` and configure Nagare from the web UI Config page.
 
 ### Binary release
 
@@ -81,13 +79,11 @@ cargo build --release
 
 ## Configuration
 
-All configuration is managed through the web UI Config page. On first run, configure:
+All configuration is managed through the web UI Config page and stored in `data/nagare.sqlite`. On first run, configure:
 
 1. **Media server** — URL and API key (Emby/Jellyfin) or token (Plex)
 2. **AnkiConnect** — URL and field mappings (`Sentence`, `SentenceAudio`, `Picture`)
 3. **Media access** — `auto`, `disk`, or `api` mode; add path mappings if server and Nagare see different file paths
-
-See [config.example.toml](config.example.toml) for all available options.
 
 ## How it works
 

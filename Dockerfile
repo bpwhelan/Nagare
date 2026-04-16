@@ -22,7 +22,6 @@ WORKDIR /app
 COPY --from=backend-build /app/target/release/nagare /app/nagare
 COPY --from=frontend-build /app/frontend/dist /app/frontend/dist
 
-ENV CONFIG_PATH=/app/config.toml
 ENV FRONTEND_DIR=/app/frontend/dist
 ENV RUST_LOG=info
 
