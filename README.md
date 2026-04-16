@@ -9,8 +9,8 @@ NOTE: This project is my most vibe-coded yet, so YMMV. It's really a problem tha
 - Live subtitle timeline synced to playback
 - Sentence audio extraction and animated AVIF screenshot clips
 - AnkiConnect integration with automatic card matching
-- Playback controls (seek, pause, resume) from the browser
-- Yomitan-aware pause behavior
+- Playback controls (seek, pause, resume) from the browser.
+- Yomitan-aware pause behavior. (Must turn off Secure Popup in Yomitan) 
 - Watch history for mining after playback ends
 - Multi-server support (Emby + Jellyfin + Plex simultaneously)
 
