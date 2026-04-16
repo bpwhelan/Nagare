@@ -10,8 +10,9 @@ RUN npm run build
 FROM rust:1.87-alpine AS backend-build
 RUN apk add --no-cache musl-dev pkgconfig openssl-dev openssl-libs-static
 WORKDIR /app
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml Cargo.lock build.rs ./
 COPY src/ src/
+COPY --from=frontend-build /app/frontend/dist ./frontend/dist
 RUN cargo build --release
 
 # ── Stage 3: Runtime ────────────────────────────────────────
