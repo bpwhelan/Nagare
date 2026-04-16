@@ -142,6 +142,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: artifacts
+          pattern: "!*.dockerbuild"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
