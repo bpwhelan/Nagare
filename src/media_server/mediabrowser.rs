@@ -273,32 +273,44 @@ impl MediaServer for MediaBrowserClient {
     }
 
     async fn seek_session(&self, session_id: &str, position_ticks: i64) -> anyhow::Result<()> {
-        self.http
-            .post(self.url(&format!("/Sessions/{session_id}/Playing/Seek")))
-            .query(&[
-                self.auth_param(),
-                ("SeekPositionTicks", &position_ticks.to_string()),
-            ])
-            .send()
-            .await?;
-        Ok(())
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            self.http
+                .post(self.url(&format!("/Sessions/{session_id}/Playing/Seek")))
+                .query(&[
+                    self.auth_param(),
+                    ("SeekPositionTicks", &position_ticks.to_string()),
+                ])
+                .send()
+                .await?;
+            Ok(())
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("Seek timed out after 5s"))?
     }
 
     async fn pause_session(&self, session_id: &str) -> anyhow::Result<()> {
-        self.http
-            .post(self.url(&format!("/Sessions/{session_id}/Playing/Pause")))
-            .query(&[self.auth_param()])
-            .send()
-            .await?;
-        Ok(())
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            self.http
+                .post(self.url(&format!("/Sessions/{session_id}/Playing/Pause")))
+                .query(&[self.auth_param()])
+                .send()
+                .await?;
+            Ok(())
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("Pause timed out after 5s"))?
     }
 
     async fn unpause_session(&self, session_id: &str) -> anyhow::Result<()> {
-        self.http
-            .post(self.url(&format!("/Sessions/{session_id}/Playing/Unpause")))
-            .query(&[self.auth_param()])
-            .send()
-            .await?;
-        Ok(())
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            self.http
+                .post(self.url(&format!("/Sessions/{session_id}/Playing/Unpause")))
+                .query(&[self.auth_param()])
+                .send()
+                .await?;
+            Ok(())
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("Unpause timed out after 5s"))?
     }
 }

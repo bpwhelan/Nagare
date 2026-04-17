@@ -1,5 +1,7 @@
 const BASE = '';
 
+import { showToast } from './stores.js';
+
 async function api(path, options = {}) {
   const resp = await fetch(`${BASE}${path}`, {
     headers: { 'Content-Type': 'application/json' },
@@ -98,6 +100,17 @@ export async function seekTo(positionMs) {
 }
 
 /**
+ * Fire-and-forget seek. Returns immediately after sending.
+ * Errors are reported asynchronously via WebSocket remote_result messages.
+ */
+export function fireSeek(positionMs) {
+  seekTo(positionMs).catch(e => {
+    console.warn('[fireSeek] network error:', e);
+    showToast('error', 'Seek request failed');
+  });
+}
+
+/**
  * Toggle play/pause. Pass `paused` to force a specific state, or omit to toggle.
  * @param {boolean} [paused]
  */
@@ -107,6 +120,18 @@ export async function playPause(paused) {
   return api('/api/play-pause', {
     method: 'POST',
     body: JSON.stringify(body),
+  });
+}
+
+/**
+ * Fire-and-forget play/pause. Returns immediately after sending.
+ * Errors are reported asynchronously via WebSocket remote_result messages.
+ * @param {boolean} [paused]
+ */
+export function firePlayPause(paused) {
+  playPause(paused).catch(e => {
+    console.warn('[firePlayPause] network error:', e);
+    showToast('error', 'Play/pause request failed');
   });
 }
 
@@ -154,4 +179,36 @@ export async function updateConfig(config) {
     method: 'PUT',
     body: JSON.stringify(config),
   });
+}
+
+// === Sequential enrichment queue ===
+// Serializes enrichCard API calls so rapid confirms don't exhaust
+// the browser's connection pool (which starves subsequent requests).
+const _enrichQueue = [];
+let _enrichDraining = false;
+
+export function queueEnrichCard(payload) {
+  _enrichQueue.push(payload);
+  console.log('[enrich-queue] Queued note', payload.noteId, `(${_enrichQueue.length} pending)`);
+  _drainEnrichQueue();
+}
+
+async function _drainEnrichQueue() {
+  if (_enrichDraining) return;
+  _enrichDraining = true;
+  while (_enrichQueue.length > 0) {
+    const payload = _enrichQueue.shift();
+    try {
+      console.log('[enrich-queue] Sending note', payload.noteId);
+      const result = await enrichCard(payload);
+      console.log('[enrich-queue] Response for note', payload.noteId, result);
+      if (!result.success) {
+        showToast('error', result.error || 'Could not queue enhancement');
+      }
+    } catch (e) {
+      console.error('[enrich-queue] Error for note', payload.noteId, e);
+      showToast('error', e.message || 'Could not queue enhancement');
+    }
+  }
+  _enrichDraining = false;
 }

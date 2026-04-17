@@ -222,11 +222,31 @@ impl Config {
         Ok(())
     }
 
+    fn normalize_mapping_path(value: &str) -> String {
+        value
+            .replace('\\', "/")
+            .trim_end_matches('/')
+            .to_ascii_lowercase()
+    }
+
     pub fn map_path(&self, server_path: &str) -> PathBuf {
+        let normalized_server = Self::normalize_mapping_path(server_path);
+
         for mapping in &self.path_mappings {
-            if server_path.starts_with(&mapping.from) {
-                let relative = &server_path[mapping.from.len()..];
-                return PathBuf::from(&mapping.to).join(relative.trim_start_matches('/'));
+            let normalized_from = Self::normalize_mapping_path(&mapping.from);
+            let is_exact_match = normalized_server == normalized_from;
+            let is_prefix_match = normalized_server
+                .strip_prefix(&normalized_from)
+                .map(|rest| rest.starts_with('/'))
+                .unwrap_or(false);
+
+            if is_exact_match || is_prefix_match {
+                let relative = server_path
+                    .get(mapping.from.len()..)
+                    .or_else(|| server_path.get(normalized_from.len()..))
+                    .unwrap_or("");
+
+                return PathBuf::from(&mapping.to).join(relative.trim_start_matches(['/', '\\']));
             }
         }
         PathBuf::from(server_path)

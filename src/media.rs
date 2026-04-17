@@ -2,7 +2,7 @@ use anyhow::Result;
 use base64::Engine;
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 /// Temporary directory for ffmpeg output.
@@ -30,6 +30,7 @@ fn http_input_args(source: &str) -> Vec<&'static str> {
 
 /// Run an ffmpeg command, capturing stderr, returning a descriptive error on failure.
 async fn run_ffmpeg(mut cmd: Command) -> Result<()> {
+    cmd.kill_on_drop(true);
     let output = cmd
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
@@ -198,10 +199,29 @@ pub fn resolve_media_source(
 ) -> Result<String> {
     use crate::config::MediaAccessMode;
 
-    let disk_source = file_path.and_then(|path| {
-        let local = config.map_path(path);
-        local.exists().then(|| local.to_string_lossy().to_string())
-    });
+    let mapped_disk_source = file_path.map(|path| config.map_path(path));
+    let disk_source = mapped_disk_source
+        .as_ref()
+        .filter(|path| path.exists())
+        .map(|path| path.to_string_lossy().to_string());
+
+    if let Some(server_path) = file_path {
+        if let Some(local_path) = mapped_disk_source.as_ref() {
+            if local_path.exists() {
+                debug!(
+                    "Resolved media source on disk: server_path={} local_path={}",
+                    server_path,
+                    local_path.display()
+                );
+            } else {
+                warn!(
+                    "Mapped media path does not exist on disk: server_path={} local_path={}",
+                    server_path,
+                    local_path.display()
+                );
+            }
+        }
+    }
 
     match config.media_access_mode {
         MediaAccessMode::Disk => {
@@ -217,17 +237,25 @@ pub fn resolve_media_source(
         }
         MediaAccessMode::Api => {
             if let Some(server) = server {
+                debug!(
+                    "Using media server stream URL because media_access_mode=api for item {}",
+                    item_id
+                );
                 Ok(server.get_stream_url(item_id, media_source_id))
             } else {
                 anyhow::bail!("Media access mode is API but no media server is configured");
             }
         }
         MediaAccessMode::Auto => {
-            // Try disk first for performance
+            // Try disk first for performance and reliability.
             if let Some(source) = disk_source {
                 return Ok(source);
             }
             if let Some(server) = server {
+                warn!(
+                    "Falling back to media server stream URL for item {} because no mapped disk path was available",
+                    item_id
+                );
                 return Ok(server.get_stream_url(item_id, media_source_id));
             }
             anyhow::bail!(

@@ -154,7 +154,6 @@ async fn main() -> anyhow::Result<()> {
     // New card events are processed centrally, then broadcast as prepared dialog payloads.
     let (raw_card_tx, raw_card_rx) = mpsc::channel::<NewCardEvent>(64);
     let (card_tx, _) = broadcast::channel::<EnrichmentDialogState>(64);
-    let (enhancement_tx, enhancement_rx) = mpsc::unbounded_channel();
 
     // Create session manager
     let session_manager = Arc::new(
@@ -174,6 +173,9 @@ async fn main() -> anyhow::Result<()> {
     let history = session_manager.history();
 
     // Build shared app state
+    let (enhancement_result_tx, _) = tokio::sync::broadcast::channel(16);
+    let (remote_result_tx, _) = tokio::sync::broadcast::channel(16);
+    let (enhancement_tx, enhancement_rx) = tokio::sync::mpsc::channel(64);
     let app_state = Arc::new(AppState {
         config: config.clone(),
         db: db.clone(),
@@ -190,6 +192,8 @@ async fn main() -> anyhow::Result<()> {
         subtitle_history,
         history,
         pending_enrichments: Arc::new(RwLock::new(Vec::new())),
+        enhancement_result_tx,
+        remote_result_tx,
     });
 
     // Start background tasks
@@ -217,9 +221,9 @@ async fn main() -> anyhow::Result<()> {
         api::run_new_card_processor(processor_state, raw_card_rx).await;
     });
 
-    let enhancement_state = app_state.clone();
+    let worker_state = app_state.clone();
     tokio::spawn(async move {
-        api::run_enhancement_worker(enhancement_state, enhancement_rx).await;
+        api::run_enhancement_worker_pool(worker_state, enhancement_rx).await;
     });
 
     // Build router

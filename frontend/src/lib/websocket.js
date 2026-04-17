@@ -1,5 +1,5 @@
 import { get } from 'svelte/store';
-import { activeHistoryItemId, sessionState, pendingCards, connected, ankiStatus, enhancementQueue, syncPositionFromSessionState, isSeekLocked, isPlayLocked, applySubtitlePayload } from './stores.js';
+import { activeHistoryItemId, sessionState, pendingCards, connected, ankiStatus, enhancementQueue, syncPositionFromSessionState, isSeekLocked, isPlayLocked, applySubtitlePayload, showToast } from './stores.js';
 
 let ws = null;
 let reconnectTimer = null;
@@ -89,6 +89,21 @@ function handleMessage(msg) {
           if (cards.some(c => c.event.note_id === noteId)) return cards;
           return [...cards, msg.new_card];
         });
+      }
+      break;
+
+    case 'enhancement_result':
+      if (msg.enhancement_result) {
+        const r = msg.enhancement_result;
+        console.log('[WS] enhancement_result:', r);
+        showToast(r.success ? 'success' : 'error', r.message);
+      }
+      break;
+
+    case 'remote_result':
+      if (msg.remote_result && !msg.remote_result.success) {
+        console.warn('[WS] remote_result error:', msg.remote_result);
+        showToast('error', msg.remote_result.error || 'Remote control command failed');
       }
       break;
   }

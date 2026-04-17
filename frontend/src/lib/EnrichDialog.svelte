@@ -14,7 +14,7 @@
     subtitles,
     isPlaying,
   } from './stores.js';
-  import { enrichCard, skipEnrichment, previewAudio, previewScreenshot, getSubtitleMatches, playPause } from './api.js';
+  import { enrichCard, skipEnrichment, previewAudio, previewScreenshot, getSubtitleMatches, firePlayPause, queueEnrichCard } from './api.js';
   import { formatTime } from './utils.js';
 
   $: card = $dialogCard || $pendingCards[0] || null;
@@ -172,7 +172,7 @@
     if ($activeHistoryItemId && matchedIndex == null && includedLineFirst == null) {
       fetchHistoryMatches(card.event.sentence);
     } else if ($isPlaying) {
-      playPause(true);
+      firePlayPause(true);
       pausedByDialog = true;
     }
   }
@@ -275,13 +275,19 @@
   }
 
   function closeDialogAfterDispatch(noteId, returnToHistory = false) {
-    if (pausedByDialog) {
-      playPause(false);
-      pausedByDialog = false;
-    }
     cleanupAudio();
     cleanupScreenshot();
     removeCardFromQueue(noteId);
+
+    // Only unpause playback when there are no more pending cards.
+    // This prevents play/pause ping-pong that floods the media server
+    // with requests and starves the enrichment API calls.
+    const hasMoreCards = $pendingCards.length > 0;
+    if (pausedByDialog && !hasMoreCards) {
+      firePlayPause(false);
+      pausedByDialog = false;
+    }
+
     if (isRouteCard) {
       closeRouteDialog(returnToHistory);
     }
@@ -290,7 +296,6 @@
 
   async function handleConfirm() {
     if (!card || submitting) return;
-    submitting = true;
     const noteId = card.event.note_id;
     const payload = {
       noteId,
@@ -304,27 +309,21 @@
       includedLineLast,
     };
 
-    try {
-      const result = await enrichCard(payload);
-      if (!result.success) {
-        showToast('error', result.error || 'Could not queue enhancement');
-        submitting = false;
-        return;
-      }
+    console.log('[EnrichDialog] Confirming note', noteId, payload);
 
-      closeDialogAfterDispatch(noteId, isHistoryCard);
-      showToast('success', isHistoryCard ? 'Save queued in background' : 'Enhancement queued');
-    } catch (e) {
-      showToast('error', e.message || 'Could not queue enhancement');
-      submitting = false;
-    }
+    // Close dialog immediately — enhancement runs in the background
+    closeDialogAfterDispatch(noteId, isHistoryCard);
+    showToast('success', isHistoryCard ? 'Save queued in background' : 'Enhancement queued');
+
+    // Queue the enrichment — calls are serialized to avoid connection pool exhaustion
+    queueEnrichCard(payload);
   }
 
   async function handleSkip() {
     if (!card || submitting) return;
     submitting = true;
     if (pausedByDialog) {
-      playPause(false);
+      firePlayPause(false);
       pausedByDialog = false;
     }
     cleanupAudio();
