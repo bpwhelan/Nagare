@@ -1226,35 +1226,56 @@ impl SessionManager {
         }
     }
 
+    fn remote_command_target_reached(
+        snapshot: &SessionState,
+        session_id: &str,
+        target_position_ms: Option<i64>,
+        target_paused: Option<bool>,
+    ) -> bool {
+        if snapshot.active_session_id.as_deref() != Some(session_id) {
+            return false;
+        }
+
+        let Some(now_playing) = snapshot.now_playing.as_ref() else {
+            return false;
+        };
+
+        let pause_synced = target_paused
+            .map(|paused| now_playing.is_paused == paused)
+            .unwrap_or(true);
+        let position_synced = target_position_ms
+            .map(|target| (now_playing.position_ms - target).abs() <= 1_500)
+            .unwrap_or(true);
+
+        pause_synced && position_synced
+    }
+
     pub async fn force_refresh_after_remote_command(
         &self,
         session_id: String,
         target_position_ms: Option<i64>,
         target_paused: Option<bool>,
-    ) {
+    ) -> bool {
         const ATTEMPTS: usize = 6;
 
         for attempt in 0..ATTEMPTS {
             self.poll_once().await;
 
             let snapshot = self.state.read().await.clone();
+            if Self::remote_command_target_reached(
+                &snapshot,
+                &session_id,
+                target_position_ms,
+                target_paused,
+            ) {
+                return true;
+            }
+
             if snapshot.active_session_id.as_deref() != Some(session_id.as_str()) {
                 break;
             }
 
-            let now_playing = match snapshot.now_playing.as_ref() {
-                Some(np) => np,
-                None => break,
-            };
-
-            let pause_synced = target_paused
-                .map(|paused| now_playing.is_paused == paused)
-                .unwrap_or(true);
-            let position_synced = target_position_ms
-                .map(|target| (now_playing.position_ms - target).abs() <= 1_500)
-                .unwrap_or(true);
-
-            if pause_synced && position_synced {
+            if snapshot.now_playing.is_none() {
                 break;
             }
 
@@ -1263,6 +1284,14 @@ impl SessionManager {
                 tokio::time::sleep(Duration::from_millis(delay_ms)).await;
             }
         }
+
+        let snapshot = self.state.read().await.clone();
+        Self::remote_command_target_reached(
+            &snapshot,
+            &session_id,
+            target_position_ms,
+            target_paused,
+        )
     }
 
     async fn load_subtitles_for_item(

@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, info, warn};
 
@@ -63,7 +64,14 @@ impl AnkiClient {
     pub fn new(url: &str) -> Self {
         Self {
             url: url.trim_end_matches('/').to_string(),
-            http: Client::new(),
+            http: Client::builder()
+                .connect_timeout(Duration::from_secs(5))
+                .timeout(Duration::from_secs(30))
+                .build()
+                .unwrap_or_else(|error| {
+                    warn!("Failed to build timed AnkiConnect client: {}", error);
+                    Client::new()
+                }),
         }
     }
 

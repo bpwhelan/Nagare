@@ -16,10 +16,12 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use chrono::Utc;
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{FutureExt, SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{RwLock, broadcast, mpsc, watch};
 use tracing::{error, info, warn};
 
@@ -35,7 +37,7 @@ pub struct AppState {
     pub anki_client: Arc<RwLock<Arc<AnkiClient>>>,
     pub anki_status: Arc<RwLock<AnkiStatus>>,
     pub enhancement_queue: Arc<RwLock<Vec<EnhancementQueueItem>>>,
-    pub enhancement_tx: mpsc::UnboundedSender<EnhancementJob>,
+    pub enhancement_tx: mpsc::Sender<EnhancementJob>,
     pub session_rx: watch::Receiver<SessionState>,
     pub new_card_tx: broadcast::Sender<EnrichmentDialogState>,
     pub subtitles: Arc<RwLock<Option<SubtitleTrack>>>,
@@ -44,6 +46,10 @@ pub struct AppState {
     pub history: Arc<RwLock<HashMap<String, HistoryEntry>>>,
     /// Queue of pending enrichment requests from the frontend.
     pub pending_enrichments: Arc<RwLock<Vec<EnrichmentDialogState>>>,
+    /// Broadcast channel for enhancement job results (success/failure).
+    pub enhancement_result_tx: broadcast::Sender<EnhancementResult>,
+    /// Broadcast channel for remote control results (seek/play/pause).
+    pub remote_result_tx: broadcast::Sender<RemoteControlResult>,
 }
 
 pub fn create_router(state: Arc<AppState>) -> Router {
@@ -258,7 +264,7 @@ async fn get_dialog_by_card_id(
 }
 
 #[derive(Deserialize, Clone)]
-struct EnrichRequest {
+pub(crate) struct EnrichRequest {
     note_id: i64,
     sentence: Option<String>,
     start_ms: i64,
@@ -278,12 +284,6 @@ struct EnrichResponse {
     error: Option<String>,
 }
 
-#[derive(Clone)]
-pub(crate) struct EnhancementJob {
-    req: EnrichRequest,
-    fallback: Option<EnrichmentDialogState>,
-}
-
 #[derive(Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum EnhancementQueueState {
@@ -296,6 +296,20 @@ pub(crate) struct EnhancementQueueItem {
     note_id: i64,
     state: EnhancementQueueState,
     message: String,
+}
+
+#[derive(Clone, Serialize)]
+pub(crate) struct EnhancementResult {
+    pub note_id: i64,
+    pub success: bool,
+    pub message: String,
+}
+
+#[derive(Clone, Serialize)]
+pub(crate) struct RemoteControlResult {
+    pub action: String,
+    pub success: bool,
+    pub error: Option<String>,
 }
 
 #[derive(Clone)]
@@ -326,15 +340,22 @@ async fn resolve_media_context(
     requested_history_id: Option<&str>,
 ) -> Result<MediaContext, String> {
     if let Some(history_id) = requested_history_id {
+        info!("[media_ctx] Looking up history_id={}", history_id);
         let hist = state.history.read().await;
-        return hist
+        let result = hist
             .get(history_id)
             .map(history_entry_to_media_context)
-            .ok_or_else(|| "Item not found in history".to_string());
+            .ok_or_else(|| format!("Item not found in history: {}", history_id));
+        if result.is_err() {
+            warn!("[media_ctx] history_id={} NOT FOUND (history has {} entries)", history_id, hist.len());
+        }
+        return result;
     }
 
+    info!("[media_ctx] No history_id, checking now_playing...");
     let session_state = state.session_rx.borrow().clone();
     if let Some(np) = session_state.now_playing {
+        info!("[media_ctx] Using now_playing: {} ({})", np.title, np.item_id);
         return Ok(MediaContext {
             server_kind: np.server_kind,
             item_id: np.item_id,
@@ -344,6 +365,7 @@ async fn resolve_media_context(
         });
     }
 
+    info!("[media_ctx] No now_playing, falling back to most recent history...");
     let hist = state.history.read().await;
     hist.values()
         .max_by_key(|entry| entry.last_seen)
@@ -429,6 +451,8 @@ async fn prepare_enrichment_candidate(
     event: NewCardEvent,
 ) -> Option<EnrichmentDialogState> {
     let subtitles = state.subtitles.read().await;
+    let track = subtitles.as_ref()?;
+
     let session_state = state.session_rx.borrow().clone();
     let position_ms = session_state
         .now_playing
@@ -440,12 +464,30 @@ async fn prepare_enrichment_candidate(
         .as_ref()
         .map(|now_playing| now_playing.history_id.clone());
 
-    let matched_line_index = subtitles
-        .as_ref()
-        .and_then(|track| find_matching_line(track, &event.sentence, position_ms, 30_000));
-    drop(subtitles);
+    // Try time-windowed match first (±30s around playback position)
+    let mut matched_line_index =
+        find_matching_line(track, &event.sentence, position_ms, 30_000);
+
+    // Fall back to a global match across the entire subtitle track.
+    // Cards should be accepted whenever we have subs loaded and a match exists,
+    // regardless of playback state or reported position.
+    if matched_line_index.is_none() {
+        let global_matches = find_all_matching_lines(track, &event.sentence);
+        if let Some(&(best_idx, score)) = global_matches.first() {
+            if score > 0.6 {
+                info!(
+                    "No time-windowed match for note {} at position {}ms; \
+                     global fallback matched line {} (score {:.2})",
+                    event.note_id, position_ms, best_idx, score
+                );
+                matched_line_index = Some(best_idx);
+            }
+        }
+    }
 
     let matched_line_index = matched_line_index?;
+    drop(subtitles);
+
     let config = state.config.read().await.clone();
     let anki_client = state.anki_client.read().await.clone();
     let card_ids = anki_client
@@ -551,10 +593,15 @@ async fn enqueue_enhancement_job(
     fallback: Option<EnrichmentDialogState>,
 ) -> Result<(), String> {
     let note_id = req.note_id;
+    info!(
+        "[enqueue] note {} — item_id={:?}, start={}ms, end={}ms, avif={}",
+        note_id, req.item_id, req.start_ms, req.end_ms, req.generate_avif
+    );
 
     {
         let mut queue = state.enhancement_queue.write().await;
         if queue.iter().any(|item| item.note_id == note_id) {
+            warn!("[enqueue] note {} — REJECTED, already in queue", note_id);
             return Err(format!(
                 "Note #{} is already queued for enhancement",
                 note_id
@@ -566,18 +613,140 @@ async fn enqueue_enhancement_job(
             state: EnhancementQueueState::Queued,
             message: enhancement_queue_message(note_id, EnhancementQueueState::Queued),
         });
+        info!("[enqueue] note {} — added to queue (queue size: {})", note_id, queue.len());
     }
 
-    if state
+    state
         .enhancement_tx
         .send(EnhancementJob { req, fallback })
-        .is_err()
-    {
-        remove_enhancement_queue_item(state, note_id).await;
-        return Err("Enhancement worker is unavailable".to_string());
-    }
+        .await
+        .map_err(|_| "Enhancement worker is not running".to_string())?;
 
     Ok(())
+}
+
+pub struct EnhancementJob {
+    pub req: EnrichRequest,
+    pub fallback: Option<EnrichmentDialogState>,
+}
+
+const ENHANCEMENT_TIMEOUT: Duration = Duration::from_secs(120);
+const ENHANCEMENT_WORKERS: usize = 3;
+
+/// Spawns a pool of workers that process enhancement jobs concurrently.
+/// Each worker pulls from the shared channel independently.
+pub async fn run_enhancement_worker_pool(
+    state: Arc<AppState>,
+    rx: mpsc::Receiver<EnhancementJob>,
+) {
+    let shared_rx = Arc::new(tokio::sync::Mutex::new(rx));
+    info!("[pool] Starting {} enhancement workers", ENHANCEMENT_WORKERS);
+
+    let mut handles = Vec::new();
+    for worker_id in 0..ENHANCEMENT_WORKERS {
+        let state = state.clone();
+        let rx = shared_rx.clone();
+        handles.push(tokio::spawn(async move {
+            enhancement_worker_loop(worker_id, state, rx).await;
+        }));
+    }
+
+    // If any worker exits, they all should (channel closed)
+    for handle in handles {
+        let _ = handle.await;
+    }
+    warn!("[pool] All enhancement workers stopped");
+}
+
+async fn enhancement_worker_loop(
+    worker_id: usize,
+    state: Arc<AppState>,
+    rx: Arc<tokio::sync::Mutex<mpsc::Receiver<EnhancementJob>>>,
+) {
+    info!("[worker-{}] Started", worker_id);
+    loop {
+        // Hold the Mutex only long enough to pull the next job
+        let job = {
+            let mut rx = rx.lock().await;
+            rx.recv().await
+        };
+        let Some(job) = job else {
+            info!("[worker-{}] Channel closed, shutting down", worker_id);
+            break;
+        };
+
+        let note_id = job.req.note_id;
+        info!("[worker-{}] Processing note {}", worker_id, note_id);
+        update_enhancement_queue_item(&state, note_id, EnhancementQueueState::Running).await;
+        info!("Starting enhancement for note {}", note_id);
+
+        let fallback_event = job.fallback.as_ref().map(|entry| entry.event.clone());
+        let fallback_card_ids = job
+            .fallback
+            .as_ref()
+            .map(|entry| entry.card_ids.clone())
+            .unwrap_or_default();
+
+        let result = AssertUnwindSafe(tokio::time::timeout(
+            ENHANCEMENT_TIMEOUT,
+            perform_enrichment(&state, &job.req, fallback_event, fallback_card_ids),
+        ))
+        .catch_unwind()
+        .await;
+
+        remove_enhancement_queue_item(&state, note_id).await;
+
+        let enhancement_result = match result {
+            Ok(Ok(Ok(()))) => {
+                info!("Successfully enriched note {}", note_id);
+                EnhancementResult {
+                    note_id,
+                    success: true,
+                    message: format!("Note #{} enhanced successfully", note_id),
+                }
+            }
+            Ok(Ok(Err(error))) => {
+                error!("Enrichment failed for note {}: {}", note_id, error);
+                if let Some(candidate) = job.fallback {
+                    queue_pending_enrichment(&state, candidate).await;
+                }
+                EnhancementResult {
+                    note_id,
+                    success: false,
+                    message: format!("Enhancement failed for note #{}: {}", note_id, error),
+                }
+            }
+            Ok(Err(_)) => {
+                error!(
+                    "Enrichment timed out for note {} after {}s",
+                    note_id,
+                    ENHANCEMENT_TIMEOUT.as_secs()
+                );
+                if let Some(candidate) = job.fallback {
+                    queue_pending_enrichment(&state, candidate).await;
+                }
+                EnhancementResult {
+                    note_id,
+                    success: false,
+                    message: format!("Enhancement timed out for note #{}", note_id),
+                }
+            }
+            Err(_) => {
+                error!("Enhancement task panicked for note {}", note_id);
+                if let Some(candidate) = job.fallback {
+                    queue_pending_enrichment(&state, candidate).await;
+                }
+                EnhancementResult {
+                    note_id,
+                    success: false,
+                    message: format!("Enhancement panicked for note #{}", note_id),
+                }
+            }
+        };
+
+        let _ = state.enhancement_result_tx.send(enhancement_result);
+        info!("[worker-{}] Finished note {}, ready for next job", worker_id, note_id);
+    }
 }
 
 async fn save_mining_history_entry(
@@ -662,12 +831,23 @@ async fn perform_enrichment(
     fallback_event: Option<NewCardEvent>,
     fallback_card_ids: Vec<i64>,
 ) -> Result<(), String> {
+    let note_id = req.note_id;
     let result = async {
+        info!("[enhance {}] Resolving media context (item_id={:?})...", note_id, req.item_id);
         let media_ctx = resolve_media_context(state, req.item_id.as_deref()).await?;
+        info!(
+            "[enhance {}] Media context resolved: {} (server={:?}, item={}, source={})",
+            note_id, media_ctx.title, media_ctx.server_kind, media_ctx.item_id, media_ctx.media_source_id
+        );
+
+        info!("[enhance {}] Reading config...", note_id);
         let config = state.config.read().await.clone();
+        info!("[enhance {}] Getting server...", note_id);
         let server_opt = get_server(state, media_ctx.server_kind).await;
+        info!("[enhance {}] Reading anki client...", note_id);
         let anki_client = state.anki_client.read().await.clone();
 
+        info!("[enhance {}] Resolving media source...", note_id);
         let source = media::resolve_media_source(
             &config,
             server_opt.as_deref(),
@@ -676,12 +856,15 @@ async fn perform_enrichment(
             media_ctx.file_path.as_deref(),
         )
         .map_err(|error| format!("Failed to resolve media source: {}", error))?;
+        info!("[enhance {}] Media source resolved", note_id);
 
+        info!("[enhance {}] Extracting audio ({}ms - {}ms)...", note_id, req.start_ms, req.end_ms);
         let (audio_path, audio_data) = media::extract_audio(&source, req.start_ms, req.end_ms)
             .await
             .map_err(|error| format!("Audio extraction failed: {}", error))?;
         let audio_filename = format!("nagare_{}_{}.opus", media_ctx.item_id, req.start_ms);
         let audio_b64 = media::to_base64(&audio_data);
+        info!("[enhance {}] Audio extracted ({} bytes), storing in Anki as {}...", note_id, audio_data.len(), audio_filename);
 
         if let Err(error) = anki_client
             .store_media_file(&audio_filename, &audio_b64)
@@ -690,14 +873,17 @@ async fn perform_enrichment(
             media::cleanup_temp_file(&audio_path).await;
             return Err(format!("Failed to store audio: {}", error));
         }
+        info!("[enhance {}] Audio stored in Anki", note_id);
 
         let mut picture_html = String::new();
         if req.generate_avif {
+            info!("[enhance {}] Generating AVIF ({}ms - {}ms)...", note_id, req.start_ms, req.end_ms);
             match media::generate_avif(&source, req.start_ms, req.end_ms).await {
                 Ok((avif_path, avif_data)) => {
                     let avif_filename =
                         format!("nagare_{}_{}.avif", media_ctx.item_id, req.start_ms);
                     let avif_b64 = media::to_base64(&avif_data);
+                    info!("[enhance {}] AVIF generated ({} bytes), storing as {}...", note_id, avif_data.len(), avif_filename);
                     if let Err(error) = anki_client
                         .store_media_file(&avif_filename, &avif_b64)
                         .await
@@ -705,12 +891,14 @@ async fn perform_enrichment(
                         warn!("Failed to store AVIF in Anki: {}", error);
                     } else {
                         picture_html = format!("<img src=\"{}\">", avif_filename);
+                        info!("[enhance {}] AVIF stored in Anki", note_id);
                     }
                     media::cleanup_temp_file(&avif_path).await;
                 }
                 Err(error) => {
-                    warn!("AVIF generation failed (continuing without): {}", error);
+                    warn!("[enhance {}] AVIF generation failed (continuing without): {}", note_id, error);
                     let mid_ms = (req.start_ms + req.end_ms) / 2;
+                    info!("[enhance {}] Falling back to screenshot at {}ms...", note_id, mid_ms);
                     if let Ok((ss_path, ss_data)) =
                         media::generate_screenshot(&source, mid_ms).await
                     {
@@ -723,11 +911,14 @@ async fn perform_enrichment(
                             .is_ok()
                         {
                             picture_html = format!("<img src=\"{}\">", ss_filename);
+                            info!("[enhance {}] Screenshot stored in Anki", note_id);
                         }
                         media::cleanup_temp_file(&ss_path).await;
                     }
                 }
             }
+        } else {
+            info!("[enhance {}] AVIF generation skipped (disabled)", note_id);
         }
 
         let mut fields = HashMap::new();
@@ -747,6 +938,7 @@ async fn perform_enrichment(
             }
         }
 
+        info!("[enhance {}] Updating note fields in Anki ({} fields)...", note_id, fields.len());
         if let Err(error) = anki_client
             .update_note_fields(req.note_id, fields, None, None)
             .await
@@ -754,16 +946,20 @@ async fn perform_enrichment(
             media::cleanup_temp_file(&audio_path).await;
             return Err(format!("Failed to update note: {}", error));
         }
+        info!("[enhance {}] Note fields updated", note_id);
 
         if !config.anki.add_tags.is_empty() {
             let tags_str = config.anki.add_tags.join(" ");
+            info!("[enhance {}] Adding tags: {}", note_id, tags_str);
             if let Err(error) = anki_client.add_tags(&[req.note_id], &tags_str).await {
                 warn!("Failed to add tags to note {}: {}", req.note_id, error);
             }
         }
 
         media::cleanup_temp_file(&audio_path).await;
+        info!("[enhance {}] Saving mining history entry...", note_id);
         save_mining_history_entry(state, req, &media_ctx, fallback_event, fallback_card_ids).await;
+        info!("[enhance {}] Enhancement complete", note_id);
         Ok(())
     }
     .await;
@@ -816,12 +1012,18 @@ async fn enrich_card(
     Json(req): Json<EnrichRequest>,
 ) -> Json<EnrichResponse> {
     let note_id = req.note_id;
+    info!(
+        "[REST] enrich_card called: note={}, item_id={:?}, start={}ms, end={}ms",
+        note_id, req.item_id, req.start_ms, req.end_ms
+    );
     let fallback = {
         let pending = state.pending_enrichments.read().await;
-        pending
+        let found = pending
             .iter()
             .find(|entry| entry.event.note_id == note_id)
-            .cloned()
+            .cloned();
+        info!("[REST] note {} — pending fallback: {}", note_id, found.is_some());
+        found
     };
 
     match enqueue_enhancement_job(&state, req, fallback).await {
@@ -844,40 +1046,6 @@ async fn enrich_card(
             })
         }
     }
-}
-
-pub(crate) async fn run_enhancement_worker(
-    state: Arc<AppState>,
-    mut rx: mpsc::UnboundedReceiver<EnhancementJob>,
-) {
-    while let Some(job) = rx.recv().await {
-        let note_id = job.req.note_id;
-        update_enhancement_queue_item(&state, note_id, EnhancementQueueState::Running).await;
-
-        let fallback_event = job.fallback.as_ref().map(|entry| entry.event.clone());
-        let fallback_card_ids = job
-            .fallback
-            .as_ref()
-            .map(|entry| entry.card_ids.clone())
-            .unwrap_or_default();
-
-        let result = perform_enrichment(&state, &job.req, fallback_event, fallback_card_ids).await;
-        remove_enhancement_queue_item(&state, note_id).await;
-
-        match result {
-            Ok(()) => {
-                info!("Successfully enriched note {}", note_id);
-            }
-            Err(error) => {
-                error!("Enrichment failed for note {}: {}", note_id, error);
-                if let Some(candidate) = job.fallback {
-                    queue_pending_enrichment(&state, candidate).await;
-                }
-            }
-        }
-    }
-
-    warn!("Enhancement worker channel closed");
 }
 
 // === Subtitle match search ===
@@ -1057,23 +1225,51 @@ async fn seek_to_line(
         }
     };
 
-    let ticks = req.position_ms * 10_000;
     let Some(server) = get_server(&state, server_kind).await else {
         return Json(
             serde_json::json!({"ok": false, "error": format!("{} is not enabled", server_kind.display_name())}),
         );
     };
 
-    if let Err(e) = server.seek_session(session_id, ticks).await {
-        return Json(serde_json::json!({"ok": false, "error": e.to_string()}));
-    }
-
-    let session_manager = state.session_manager.clone();
+    let ticks = req.position_ms * 10_000;
     let paused = now_playing.is_paused;
-    let session_id = session_id.to_string();
+    let session_id_owned = session_id.to_string();
+    let scoped_session_id_owned = scoped_session_id.clone();
+    let session_manager = state.session_manager.clone();
+    let remote_tx = state.remote_result_tx.clone();
+    let position_ms = req.position_ms;
+
+    // Fire-and-forget: spawn the actual seek command so the handler returns immediately
     tokio::spawn(async move {
-        session_manager
-            .force_refresh_after_remote_command(session_id, Some(req.position_ms), Some(paused))
+        if let Err(e) = server.seek_session(&session_id_owned, ticks).await {
+            let synced = session_manager
+                .force_refresh_after_remote_command(
+                    scoped_session_id_owned.clone(),
+                    Some(position_ms),
+                    Some(paused),
+                )
+                .await;
+            if synced {
+                warn!(
+                    "Seek returned an error for session {}, but playback reached the target state: {}",
+                    session_id_owned, e
+                );
+            } else {
+                warn!("Seek failed for session {}: {}", session_id_owned, e);
+                let _ = remote_tx.send(RemoteControlResult {
+                    action: "seek".to_string(),
+                    success: false,
+                    error: Some(e.to_string()),
+                });
+            }
+            return;
+        }
+        let _ = session_manager
+            .force_refresh_after_remote_command(
+                scoped_session_id_owned,
+                Some(position_ms),
+                Some(paused),
+            )
             .await;
     });
 
@@ -1132,26 +1328,55 @@ async fn play_pause(
         );
     };
 
-    let result = if should_pause {
-        srv.pause_session(session_id).await
-    } else {
-        srv.unpause_session(session_id).await
-    };
+    let session_id_owned = session_id.to_string();
+    let scoped_session_id_owned = scoped_session_id.clone();
+    let session_manager = state.session_manager.clone();
+    let remote_tx = state.remote_result_tx.clone();
 
-    match result {
-        Ok(_) => {
-            let session_manager = state.session_manager.clone();
-            let session_id = session_id.to_string();
-            tokio::spawn(async move {
-                session_manager
-                    .force_refresh_after_remote_command(session_id, None, Some(should_pause))
+    // Fire-and-forget: spawn the actual play/pause command
+    tokio::spawn(async move {
+        let result = if should_pause {
+            srv.pause_session(&session_id_owned).await
+        } else {
+            srv.unpause_session(&session_id_owned).await
+        };
+
+        match result {
+            Ok(_) => {
+                let _ = session_manager
+                    .force_refresh_after_remote_command(
+                        scoped_session_id_owned,
+                        None,
+                        Some(should_pause),
+                    )
                     .await;
-            });
-
-            Json(serde_json::json!({"ok": true, "paused": should_pause}))
+            }
+            Err(e) => {
+                let synced = session_manager
+                    .force_refresh_after_remote_command(
+                        scoped_session_id_owned.clone(),
+                        None,
+                        Some(should_pause),
+                    )
+                    .await;
+                if synced {
+                    warn!(
+                        "Play/pause returned an error for session {}, but playback reached the target state: {}",
+                        session_id_owned, e
+                    );
+                } else {
+                    warn!("Play/pause failed for session {}: {}", session_id_owned, e);
+                    let _ = remote_tx.send(RemoteControlResult {
+                        action: "play_pause".to_string(),
+                        success: false,
+                        error: Some(e.to_string()),
+                    });
+                }
+            }
         }
-        Err(e) => Json(serde_json::json!({"ok": false, "error": e.to_string()})),
-    }
+    });
+
+    Json(serde_json::json!({"ok": true, "paused": should_pause}))
 }
 
 #[derive(Deserialize)]
@@ -1269,6 +1494,10 @@ struct WsMessage {
     anki_status: Option<AnkiStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
     enhancement_queue: Option<Vec<EnhancementQueueItem>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    enhancement_result: Option<EnhancementResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    remote_result: Option<RemoteControlResult>,
 }
 
 #[derive(Serialize)]
@@ -1285,6 +1514,8 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
 
     let mut session_rx = state.session_rx.clone();
     let mut card_rx = state.new_card_tx.subscribe();
+    let mut result_rx = state.enhancement_result_tx.subscribe();
+    let mut remote_rx = state.remote_result_tx.subscribe();
     let subtitles = state.subtitles.clone();
     let subtitle_candidates = state.subtitle_candidates.clone();
     let anki_status = state.anki_status.clone();
@@ -1314,6 +1545,8 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
             new_card: None,
             anki_status: Some(current_anki_status),
             enhancement_queue: Some(current_enhancement_queue),
+            enhancement_result: None,
+            remote_result: None,
         };
 
         if let Ok(json) = serde_json::to_string(&init_msg) {
@@ -1413,6 +1646,8 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
                         } else {
                             None
                         },
+                        enhancement_result: None,
+                        remote_result: None,
                     };
 
                     if let Ok(json) = serde_json::to_string(&msg) {
@@ -1439,6 +1674,64 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
                         new_card: Some(candidate),
                         anki_status: None,
                         enhancement_queue: None,
+                        enhancement_result: None,
+                        remote_result: None,
+                    };
+
+                    if let Ok(json) = serde_json::to_string(&msg) {
+                        if sender.send(Message::Text(json.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+                result = result_rx.recv() => {
+                    let enhancement_result = match result {
+                        Ok(r) => r,
+                        Err(broadcast::error::RecvError::Lagged(n)) => {
+                            warn!("WS enhancement_result receiver lagged, {} message(s) lost", n);
+                            continue;
+                        }
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    };
+
+                    let msg = WsMessage {
+                        msg_type: "enhancement_result".to_string(),
+                        state: None,
+                        subtitles: None,
+                        active_line_index: None,
+                        new_card: None,
+                        anki_status: None,
+                        enhancement_queue: None,
+                        enhancement_result: Some(enhancement_result),
+                        remote_result: None,
+                    };
+
+                    if let Ok(json) = serde_json::to_string(&msg) {
+                        if sender.send(Message::Text(json.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+                remote = remote_rx.recv() => {
+                    let remote_result = match remote {
+                        Ok(r) => r,
+                        Err(broadcast::error::RecvError::Lagged(n)) => {
+                            warn!("WS remote_result receiver lagged, {} message(s) lost", n);
+                            continue;
+                        }
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    };
+
+                    let msg = WsMessage {
+                        msg_type: "remote_result".to_string(),
+                        state: None,
+                        subtitles: None,
+                        active_line_index: None,
+                        new_card: None,
+                        anki_status: None,
+                        enhancement_queue: None,
+                        enhancement_result: None,
+                        remote_result: Some(remote_result),
                     };
 
                     if let Ok(json) = serde_json::to_string(&msg) {

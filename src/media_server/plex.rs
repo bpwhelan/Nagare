@@ -3,14 +3,27 @@ use async_trait::async_trait;
 use reqwest::Client;
 use serde_json::Value;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 use tokio::process::Command;
-use tracing::debug;
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 struct PlexSubtitleStream {
     id: u64,
     codec: Option<String>,
     key: Option<String>,
+}
+
+struct SessionControlInfo {
+    identifiers: Vec<String>,
+    player_address: Option<String>,
+}
+
+/// A companion-capable client discovered via /clients or plex.tv resources.
+struct DiscoveredClient {
+    address: String,
+    port: u16,
+    protocol: String,
 }
 
 pub struct PlexClient {
@@ -255,8 +268,12 @@ impl PlexClient {
         Ok(resp.json().await?)
     }
 
-    async fn resolve_control_identifiers(&self, session_id: &str) -> anyhow::Result<Vec<String>> {
+    async fn resolve_session_control_info(
+        &self,
+        session_id: &str,
+    ) -> anyhow::Result<SessionControlInfo> {
         let mut identifiers = vec![session_id.to_string()];
+        let mut player_address = None;
         let body = self.get_sessions_body().await?;
 
         if let Some(sessions) = body["MediaContainer"]["Metadata"].as_array() {
@@ -289,15 +306,198 @@ impl PlexClient {
                         .as_u64()
                         .map(|value| value.to_string()),
                 );
+
+                player_address = player["address"].as_str().map(String::from);
                 break;
             }
         }
 
-        Ok(identifiers)
+        Ok(SessionControlInfo {
+            identifiers,
+            player_address,
+        })
     }
 
     fn next_command_id(&self) -> u64 {
         self.command_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Query PMS /clients endpoint to discover companion-capable clients.
+    async fn discover_clients_from_pms(&self, machine_identifier: &str) -> Vec<DiscoveredClient> {
+        let resp = match self
+            .with_plex_headers(self.http.get(self.url("/clients")))
+            .header("Accept", "application/json")
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                debug!("Failed to query /clients: {}", e);
+                return Vec::new();
+            }
+        };
+
+        let body: Value = match resp.json().await {
+            Ok(b) => b,
+            Err(e) => {
+                debug!("Failed to parse /clients response: {}", e);
+                return Vec::new();
+            }
+        };
+
+        debug!("/clients response: {}", body);
+
+        // PMS /clients returns Server array (JSON) or <Server> elements (XML).
+        let servers = body["MediaContainer"]["Server"]
+            .as_array()
+            .or_else(|| body["MediaContainer"]["server"].as_array());
+
+        let Some(servers) = servers else {
+            return Vec::new();
+        };
+
+        servers
+            .iter()
+            .filter_map(|v| {
+                let mid = v["machineIdentifier"].as_str()?;
+                if mid != machine_identifier {
+                    return None;
+                }
+                let host = v["host"].as_str().or_else(|| v["address"].as_str())?;
+                let port = Self::value_as_u64(&v["port"]).unwrap_or(32433) as u16;
+                let protocol = v["protocol"].as_str().unwrap_or("http").to_string();
+                debug!(
+                    "Discovered client via /clients: {}://{}:{}",
+                    protocol, host, port
+                );
+                Some(DiscoveredClient {
+                    address: host.to_string(),
+                    port,
+                    protocol,
+                })
+            })
+            .collect()
+    }
+
+    /// Query plex.tv resources API to discover client connection URIs.
+    async fn discover_clients_from_plex_tv(
+        &self,
+        machine_identifier: &str,
+    ) -> Vec<DiscoveredClient> {
+        let resp = match self
+            .http
+            .get("https://plex.tv/api/v2/resources")
+            .query(&[("includeHttps", "1"), ("includeRelay", "1")])
+            .header("X-Plex-Token", &self.token)
+            .header("X-Plex-Client-Identifier", &self.client_identifier)
+            .header("Accept", "application/json")
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                debug!("Failed to query plex.tv resources: {}", e);
+                return Vec::new();
+            }
+        };
+
+        let body: Value = match resp.json().await {
+            Ok(b) => b,
+            Err(e) => {
+                debug!("Failed to parse plex.tv resources response: {}", e);
+                return Vec::new();
+            }
+        };
+
+        let resources = match body.as_array() {
+            Some(arr) => arr,
+            None => return Vec::new(),
+        };
+
+        let mut results = Vec::new();
+        for resource in resources {
+            let client_id = resource["clientIdentifier"].as_str().unwrap_or("");
+            if client_id != machine_identifier {
+                continue;
+            }
+            debug!(
+                "Found matching plex.tv resource: {} ({})",
+                resource["name"], client_id
+            );
+            if let Some(connections) = resource["connections"].as_array() {
+                for conn in connections {
+                    let address = match conn["address"].as_str() {
+                        Some(a) => a,
+                        None => continue,
+                    };
+                    let port = Self::value_as_u64(&conn["port"]).unwrap_or(32433) as u16;
+                    let protocol = conn["protocol"].as_str().unwrap_or("http").to_string();
+                    let uri = conn["uri"].as_str().unwrap_or("");
+                    let is_local = conn["local"].as_bool().unwrap_or(false);
+                    debug!(
+                        "  connection: {}://{}:{} (uri={}, local={})",
+                        protocol, address, port, uri, is_local
+                    );
+                    results.push(DiscoveredClient {
+                        address: address.to_string(),
+                        port,
+                        protocol,
+                    });
+                }
+            }
+        }
+        results
+    }
+
+    /// Send a command directly to the client device's HTTP endpoint,
+    /// bypassing the PMS proxy. This is the non-proxy path from the
+    /// Plex companion protocol.
+    async fn send_direct_command(
+        &self,
+        client: &DiscoveredClient,
+        path: &str,
+        extra_query: &[(&str, String)],
+    ) -> anyhow::Result<()> {
+        let command_id = self.next_command_id();
+        let url = format!(
+            "{}://{}:{}{}",
+            client.protocol, client.address, client.port, path
+        );
+
+        let mut query: Vec<(&str, String)> = vec![
+            ("type", "video".to_string()),
+            ("commandID", command_id.to_string()),
+        ];
+        query.extend(extra_query.iter().map(|(k, v)| (*k, v.clone())));
+
+        let resp = self
+            .http
+            .get(&url)
+            .header("X-Plex-Token", &self.token)
+            .header("X-Plex-Client-Identifier", &self.client_identifier)
+            .header("X-Plex-Product", "Nagare")
+            .header("X-Plex-Version", env!("CARGO_PKG_VERSION"))
+            .header("X-Plex-Platform", std::env::consts::OS)
+            .header("X-Plex-Device", "Nagare")
+            .header("X-Plex-Device-Name", "Nagare")
+            .query(&query)
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await?;
+
+        if resp.status().is_success() {
+            return Ok(());
+        }
+
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        let detail = body.lines().next().unwrap_or_default().trim();
+        if detail.is_empty() {
+            anyhow::bail!("HTTP {status}")
+        } else {
+            anyhow::bail!("HTTP {status}: {detail}")
+        }
     }
 
     async fn send_playback_command(
@@ -306,26 +506,28 @@ impl PlexClient {
         path: &str,
         extra_query: &[(&str, String)],
     ) -> anyhow::Result<()> {
-        let command_id = self.next_command_id();
-        let target_ids = self
-            .resolve_control_identifiers(session_id)
+        let info = self
+            .resolve_session_control_info(session_id)
             .await
-            .unwrap_or_else(|_| vec![session_id.to_string()]);
-        let mut failures = Vec::new();
-        let mut saw_not_found = false;
+            .unwrap_or_else(|_| SessionControlInfo {
+                identifiers: vec![session_id.to_string()],
+                player_address: None,
+            });
 
-        for target_id in target_ids {
+        // --- Try proxy through PMS server first ---
+        let command_id = self.next_command_id();
+        let mut failures = Vec::new();
+
+        for target_id in &info.identifiers {
             let mut query = vec![
                 ("type", "video".to_string()),
                 ("commandID", command_id.to_string()),
-                ("X-Plex-Target-Client-Identifier", target_id.clone()),
-                ("X-Plex-Client-Identifier", self.client_identifier.clone()),
             ];
             query.extend(extra_query.iter().map(|(key, value)| (*key, value.clone())));
 
             let resp = self
                 .with_plex_headers(self.http.get(self.url(path)))
-                .header("X-Plex-Target-Client-Identifier", &target_id)
+                .header("X-Plex-Target-Client-Identifier", target_id)
                 .query(&query)
                 .send()
                 .await?;
@@ -334,22 +536,63 @@ impl PlexClient {
                 return Ok(());
             }
 
-            saw_not_found |= resp.status() == reqwest::StatusCode::NOT_FOUND;
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
             let detail = body.lines().next().unwrap_or_default().trim();
             failures.push(if detail.is_empty() {
-                format!("{target_id} -> HTTP {status}")
+                format!("proxy {target_id} -> HTTP {status}")
             } else {
-                format!("{target_id} -> HTTP {status}: {detail}")
+                format!("proxy {target_id} -> HTTP {status}: {detail}")
             });
         }
 
-        if saw_not_found {
-            anyhow::bail!(
-                "Plex did not expose a controllable player target for this session. Targets tried: {}",
-                failures.join(", ")
+        // --- Proxy failed — discover direct client endpoints ---
+        let machine_id = info
+            .identifiers
+            .first()
+            .map(|s| s.as_str())
+            .unwrap_or(session_id);
+
+        // Collect all candidate direct endpoints: /clients, plex.tv, session address
+        let mut candidates: Vec<DiscoveredClient> = Vec::new();
+        candidates.extend(self.discover_clients_from_pms(machine_id).await);
+        candidates.extend(self.discover_clients_from_plex_tv(machine_id).await);
+
+        // Add the session-reported address as fallback with common companion ports
+        if let Some(ref address) = info.player_address {
+            // Deduplicate: only add if not already covered
+            for (port, protocol) in [(32433, "http"), (32500, "http")] {
+                let dominated = candidates
+                    .iter()
+                    .any(|c| c.address == *address && c.port == port);
+                if !dominated {
+                    candidates.push(DiscoveredClient {
+                        address: address.clone(),
+                        port,
+                        protocol: protocol.to_string(),
+                    });
+                }
+            }
+        }
+
+        if candidates.is_empty() {
+            warn!("No direct client endpoints found for {}", machine_id);
+        }
+
+        for client in &candidates {
+            debug!(
+                "Trying direct {}://{}:{}",
+                client.protocol, client.address, client.port
             );
+            match self.send_direct_command(client, path, extra_query).await {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    failures.push(format!(
+                        "direct {}://{}:{} -> {}",
+                        client.protocol, client.address, client.port, e
+                    ));
+                }
+            }
         }
 
         anyhow::bail!(
@@ -643,21 +886,33 @@ impl MediaServer for PlexClient {
 
     async fn seek_session(&self, session_id: &str, position_ticks: i64) -> anyhow::Result<()> {
         let offset_ms = position_ticks / 10_000;
-        self.send_playback_command(
-            session_id,
-            "/player/playback/seekTo",
-            &[("offset", offset_ms.to_string())],
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            self.send_playback_command(
+                session_id,
+                "/player/playback/seekTo",
+                &[("offset", offset_ms.to_string())],
+            ),
         )
         .await
+        .map_err(|_| anyhow::anyhow!("Plex seek timed out after 5s"))?
     }
 
     async fn pause_session(&self, session_id: &str) -> anyhow::Result<()> {
-        self.send_playback_command(session_id, "/player/playback/pause", &[])
-            .await
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            self.send_playback_command(session_id, "/player/playback/pause", &[]),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("Plex pause timed out after 5s"))?
     }
 
     async fn unpause_session(&self, session_id: &str) -> anyhow::Result<()> {
-        self.send_playback_command(session_id, "/player/playback/play", &[])
-            .await
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            self.send_playback_command(session_id, "/player/playback/play", &[]),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("Plex unpause timed out after 5s"))?
     }
 }

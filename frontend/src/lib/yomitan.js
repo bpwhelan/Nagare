@@ -1,6 +1,6 @@
 import { get } from 'svelte/store';
 import { yomitanPause, isPlaying, setOptimisticPlayState } from './stores.js';
-import { playPause } from './api.js';
+import { firePlayPause } from './api.js';
 
 let bodyObserver = null;
 let iframeObserver = null;
@@ -20,14 +20,14 @@ function onVisibilityChange(iframe) {
     if (get(isPlaying) && !pausedByYomitan) {
       pausedByYomitan = true;
       setOptimisticPlayState(true);
-      playPause(true);
+      firePlayPause(true);
     }
   } else {
     // Yomitan popup hidden — resume if we paused it
     if (pausedByYomitan) {
       pausedByYomitan = false;
       setOptimisticPlayState(false);
-      playPause(false);
+      firePlayPause(false);
     }
   }
 }
@@ -89,7 +89,7 @@ export function stopYomitanObserver() {
   }
   if (pausedByYomitan) {
     pausedByYomitan = false;
-    playPause(false);
+    firePlayPause(false);
   }
   trackedIframe = null;
 }

@@ -1,31 +1,20 @@
 <script>
-  import { subtitles, activeLineIndex, positionMs, isPlaying, pauseOnHover, pauseOnSeek, yomitanPause, durationMs, sessionState, showToast, syncPositionFromSessionState, setOptimisticPosition, setOptimisticPlayState } from './stores.js';
-  import { seekTo, playPause } from './api.js';
+  import { subtitles, activeLineIndex, positionMs, isPlaying, pauseOnHover, pauseOnSeek, yomitanPause, durationMs, sessionState, showToast, setOptimisticPosition, setOptimisticPlayState } from './stores.js';
+  import { fireSeek, firePlayPause } from './api.js';
 
   $: remoteControlAvailable = $sessionState.now_playing?.supports_remote_control ?? false;
 
-  function restorePlaybackState(snapshot) {
-    sessionState.set(snapshot);
-    syncPositionFromSessionState(snapshot);
-  }
-
-  async function runSeek(target) {
+  function runSeek(target) {
     if (!remoteControlAvailable) {
       showToast('error', 'Playback controls are unavailable for this player');
       return;
     }
 
-    const previousState = structuredClone($sessionState);
     setOptimisticPosition(target);
-
-    const result = await seekTo(target);
-    if (result?.ok === false) {
-      restorePlaybackState(previousState);
-      showToast('error', result.error || 'Seek failed');
-    }
+    fireSeek(target);
   }
 
-  async function prevSubtitle() {
+  function prevSubtitle() {
     const idx = $activeLineIndex;
     const subs = $subtitles;
     if (idx == null || subs.length === 0) return;
@@ -33,7 +22,6 @@
     const current = subs[idx];
     if (!current) return;
 
-    // If more than 20% through current line, go to its start; else go to previous
     const duration = current.end_ms - current.start_ms;
     const elapsed = $positionMs - current.start_ms;
     let target;
@@ -44,44 +32,38 @@
     } else {
       target = current.start_ms;
     }
-    await runSeek(target);
+    runSeek(target);
   }
 
-  async function nextSubtitle() {
+  function nextSubtitle() {
     const idx = $activeLineIndex;
     const subs = $subtitles;
     if (idx == null || subs.length === 0) return;
     if (idx < subs.length - 1) {
       const target = subs[idx + 1].start_ms;
-      await runSeek(target);
+      runSeek(target);
     }
   }
 
-  async function back5() {
+  function back5() {
     const target = Math.max(0, $positionMs - 5000);
-    await runSeek(target);
+    runSeek(target);
   }
 
-  async function forward10() {
+  function forward10() {
     const target = Math.min($durationMs || Infinity, $positionMs + 10000);
-    await runSeek(target);
+    runSeek(target);
   }
 
-  async function togglePlayPause() {
+  function togglePlayPause() {
     if (!remoteControlAvailable) {
       showToast('error', 'Playback controls are unavailable for this player');
       return;
     }
 
     const shouldPause = $isPlaying;
-    const previousState = structuredClone($sessionState);
     setOptimisticPlayState(shouldPause);
-
-    const result = await playPause(shouldPause);
-    if (result?.ok === false) {
-      restorePlaybackState(previousState);
-      showToast('error', result.error || 'Play/pause failed');
-    }
+    firePlayPause(shouldPause);
   }
 </script>
 

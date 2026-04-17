@@ -1,7 +1,7 @@
 <script>
   import { onDestroy } from 'svelte';
-  import { subtitles, subtitleCandidates, selectedSubtitleCandidateId, subtitleSelectionMode, activeHistoryItemId, activeLineIndex, positionMs, pauseOnHover, pauseOnSeek, isPlaying, sessionState, showToast, syncPositionFromSessionState, setOptimisticPosition, setOptimisticPlayState, applySubtitlePayload } from './stores.js';
-  import { seekTo, playPause, selectSubtitleTrack } from './api.js';
+  import { subtitles, subtitleCandidates, selectedSubtitleCandidateId, subtitleSelectionMode, activeHistoryItemId, activeLineIndex, positionMs, pauseOnHover, pauseOnSeek, isPlaying, sessionState, showToast, setOptimisticPosition, setOptimisticPlayState, applySubtitlePayload } from './stores.js';
+  import { fireSeek, firePlayPause, selectSubtitleTrack } from './api.js';
   import { formatTime } from './utils.js';
 
   const newLineCharacter = '\n';
@@ -26,11 +26,6 @@
 
   $: if ($activeLineIndex != null && autoScroll && container) {
     scrollToLine($activeLineIndex);
-  }
-
-  function restorePlaybackState(snapshot) {
-    sessionState.set(snapshot);
-    syncPositionFromSessionState(snapshot);
   }
 
   function scrollToLine(index) {
@@ -67,56 +62,33 @@
     }
   }
 
-  async function handleLineClick(line) {
+  function handleLineClick(line) {
     if (!remoteControlAvailable) {
       showToast('error', 'Playback controls are unavailable for this player');
       return;
     }
 
-    const previousState = structuredClone($sessionState);
     setOptimisticPosition(line.start_ms);
-    const seekResult = await seekTo(line.start_ms);
-    if (seekResult?.ok === false) {
-      restorePlaybackState(previousState);
-      showToast('error', seekResult.error || 'Seek failed');
-      return;
-    }
+    fireSeek(line.start_ms);
 
     if ($pauseOnSeek && $isPlaying) {
-      const pauseSnapshot = structuredClone($sessionState);
       setOptimisticPlayState(true);
-      const pauseResult = await playPause(true);
-      if (pauseResult?.ok === false) {
-        restorePlaybackState(pauseSnapshot);
-        showToast('error', pauseResult.error || 'Pause failed');
-      }
+      firePlayPause(true);
     }
   }
 
-  async function handleLineMouseEnter(index) {
+  function handleLineMouseEnter(index) {
     if ($pauseOnHover && remoteControlAvailable && index === $activeLineIndex && $isPlaying) {
-      const previousState = structuredClone($sessionState);
       setOptimisticPlayState(true);
-      const result = await playPause(true);
-      if (result?.ok === false) {
-        restorePlaybackState(previousState);
-        showToast('error', result.error || 'Pause failed');
-        return;
-      }
+      firePlayPause(true);
       pausedByHover = true;
     }
   }
 
-  async function handleLineMouseLeave(index) {
+  function handleLineMouseLeave(index) {
     if (pausedByHover) {
-      const previousState = structuredClone($sessionState);
       setOptimisticPlayState(false);
-      const result = await playPause(false);
-      if (result?.ok === false) {
-        restorePlaybackState(previousState);
-        showToast('error', result.error || 'Resume failed');
-        return;
-      }
+      firePlayPause(false);
       pausedByHover = false;
     }
   }

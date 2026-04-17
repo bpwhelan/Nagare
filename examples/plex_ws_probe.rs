@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-#[path = "../config.rs"]
+#[path = "../src/config.rs"]
 mod config;
 
 use anyhow::{Context, bail};
