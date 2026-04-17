@@ -5,18 +5,18 @@
   import {
     activeHistoryItemId,
     ankiStatus,
+    applySubtitlePayload,
     applyMiningConfig,
     connected,
     currentView,
     dialogCard,
     durationMs,
-    enhancementStatus,
+    enhancementQueue,
     nowPlayingTitle,
     pendingCards,
     positionMs,
     route,
     showToast,
-    subtitles,
     syncRouteFromLocation,
     yomitanPause,
   } from './lib/stores.js';
@@ -63,7 +63,8 @@
 
   $: progressPct = $durationMs > 0 ? ($positionMs / $durationMs) * 100 : 0;
   $: showAnkiWarning = $ankiStatus.state === 'disconnected';
-  $: showEnhancementBanner = Boolean($enhancementStatus);
+  $: showEnhancementBanner = $enhancementQueue.length > 0;
+  $: enhancementBannerTitle = $enhancementQueue.length === 1 ? 'Enhancing card' : 'Enhancing cards';
 
   async function hydrateDialogRoute(routeState) {
     const requestId = ++routeRequestId;
@@ -86,7 +87,7 @@
       if (dialog.history_id) {
         const subData = await getHistorySubtitles(dialog.history_id);
         if (requestId !== routeRequestId) return;
-        subtitles.set(subData.lines || []);
+        applySubtitlePayload(subData);
         activeHistoryItemId.set(dialog.history_id);
       } else {
         activeHistoryItemId.set(null);
@@ -168,8 +169,14 @@
   {#if showEnhancementBanner}
     <div class="status-banner processing-banner" role="status" aria-live="polite">
       <span class="spinner" aria-hidden="true"></span>
-      <strong>Enhancing card</strong>
-      <span>{$enhancementStatus}</span>
+      <div class="processing-copy">
+        <strong>{enhancementBannerTitle}</strong>
+        <ul class="processing-list">
+          {#each $enhancementQueue as item (item.note_id)}
+            <li class:item-running={item.state === 'running'}>{item.message}</li>
+          {/each}
+        </ul>
+      </div>
     </div>
   {/if}
 
@@ -332,7 +339,24 @@
     white-space: nowrap;
   }
 
-  .processing-banner span:last-child {
+  .processing-copy {
+    min-width: 0;
+  }
+
+  .processing-list {
+    margin: 0.15rem 0 0;
+    padding-left: 1rem;
+  }
+
+  .processing-list li {
+    color: var(--text-secondary);
+  }
+
+  .processing-list li.item-running {
+    color: var(--text-primary);
+  }
+
+  .processing-copy:last-child {
     min-width: 0;
   }
 
@@ -471,6 +495,10 @@
 
     .processing-banner strong {
       flex-basis: calc(100% - 1.4rem);
+    }
+
+    .processing-list {
+      margin-top: 0.2rem;
     }
 
     .np-title {

@@ -4,9 +4,12 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag (e.g. v0.1.0)"
+        description: "Release tag (e.g. 0.1.0 or v0.1.0)"
         required: true
         type: string
+  push:
+    branches:
+      - main
 
 permissions:
   contents: write
@@ -16,7 +19,94 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      should_release: ${{ steps.finalize.outputs.should_release }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve release tag
+        id: version
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TAG: ${{ github.event.inputs.tag || '' }}
+        run: |
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            if [ -z "$INPUT_TAG" ]; then
+              echo "inputs.tag is required for manual runs" >&2
+              exit 1
+            fi
+
+            tag="$INPUT_TAG"
+            version="${tag#v}"
+            alt_tag=""
+          else
+            version="$(python -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')"
+            tag="$version"
+            alt_tag="v$version"
+          fi
+
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "alt_tag=$alt_tag" >> "$GITHUB_OUTPUT"
+
+      - name: Check for existing GitHub release
+        id: release_check
+        if: github.event_name == 'push'
+        uses: actions/github-script@v9
+        env:
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+          ALT_RELEASE_TAG: ${{ steps.version.outputs.alt_tag }}
+        with:
+          result-encoding: string
+          script: |
+            const tags = [process.env.RELEASE_TAG, process.env.ALT_RELEASE_TAG].filter(Boolean);
+
+            for (const tag of tags) {
+              try {
+                await github.rest.repos.getReleaseByTag({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  tag,
+                });
+
+                core.info(`Release already exists for ${tag}`);
+                return 'true';
+              } catch (error) {
+                if (error.status !== 404) {
+                  throw error;
+                }
+              }
+            }
+
+            return 'false';
+
+      - name: Decide whether to publish
+        id: finalize
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          RELEASE_EXISTS: ${{ steps.release_check.outputs.result }}
+        run: |
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "$RELEASE_EXISTS" = "true" ]; then
+            echo "Release already exists for ${{ steps.version.outputs.tag }}; skipping."
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "No matching release found; continuing with release."
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+          fi
+
   build:
+    needs: prepare
+    if: needs.prepare.outputs.should_release == 'true'
     strategy:
       matrix:
         include:
@@ -99,6 +189,8 @@ jobs:
             ${{ matrix.artifact }}.zip
 
   docker:
+    needs: prepare
+    if: needs.prepare.outputs.should_release == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -119,7 +211,7 @@ jobs:
         with:
           images: ghcr.io/${{ github.repository }}
           tags: |
-            type=raw,value=${{ inputs.tag }}
+            type=raw,value=${{ needs.prepare.outputs.tag }}
             type=raw,value=latest
 
       - name: Build and push Docker image
@@ -133,7 +225,8 @@ jobs:
           cache-to: type=gha,mode=max
 
   release:
-    needs: [build, docker]
+    needs: [prepare, build, docker]
+    if: needs.prepare.outputs.should_release == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -147,8 +240,9 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ inputs.tag }}
-          name: Nagare ${{ inputs.tag }}
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: Nagare ${{ needs.prepare.outputs.tag }}
           generate_release_notes: true
           files: |
             artifacts/**/*.tar.gz

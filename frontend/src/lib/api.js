@@ -27,6 +27,14 @@ export async function getSubtitles() {
   return api('/api/subtitles');
 }
 
+export async function selectSubtitleTrack(candidateId = null) {
+  const body = { candidate_id: candidateId };
+  return api('/api/subtitles/select', {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
+}
+
 export async function enrichCard({
   noteId,
   sentence,

@@ -15,12 +15,15 @@ function localStorageStore(key, defaultValue) {
 }
 
 /** @typedef {{ id: string, server_kind: 'emby'|'jellyfin'|'plex', client: string, device_name: string, user_name: string|null, title: string|null, is_target_language: boolean }} SessionSummary */
-/** @typedef {{ history_id: string, server_kind: 'emby'|'jellyfin'|'plex', item_id: string, title: string, position_ms: number, duration_ms: number|null, is_paused: boolean, supports_remote_control: boolean, subtitle_stream_index: number|null, media_source_id: string, file_path: string|null }} NowPlayingState */
+/** @typedef {{ history_id: string, server_kind: 'emby'|'jellyfin'|'plex', item_id: string, title: string, position_ms: number, duration_ms: number|null, is_paused: boolean, supports_remote_control: boolean, subtitle_stream_index: number|null, subtitle_candidate_id: string|null, subtitle_selection_mode: 'auto'|'manual', media_source_id: string, file_path: string|null }} NowPlayingState */
 /** @typedef {{ sessions: SessionSummary[], active_session_id: string|null, now_playing: NowPlayingState|null }} SessionState */
 /** @typedef {{ index: number, start_ms: number, end_ms: number, text: string }} SubtitleLine */
+/** @typedef {{ id: string, source: 'server'|'sidecar', stream_index: number|null, language: string|null, label: string, codec: string|null, is_default: boolean, is_external: boolean, is_selected_in_session: boolean }} SubtitleCandidate */
+/** @typedef {{ lines: SubtitleLine[], count: number, candidates: SubtitleCandidate[], selected_candidate_id: string|null, selection_mode: 'auto'|'manual' }} SubtitlePayload */
 /** @typedef {{ note_id: number, sentence: string, fields: Object, model_name: string, tags: string[] }} NewCardEvent */
 /** @typedef {{ event: NewCardEvent, matched_line_index: number|null, history_id?: string|null, start_ms?: number|null, end_ms?: number|null, generate_avif?: boolean|null, included_line_first?: number|null, included_line_last?: number|null, card_ids?: number[], source?: 'pending'|'mining_history', updated_at?: string|null }} NewCardWithMatch */
 /** @typedef {{ state: 'unknown'|'connected'|'disconnected', message: string|null }} AnkiStatus */
+/** @typedef {{ note_id: number, state: 'queued'|'running', message: string }} EnhancementQueueItem */
 
 export const sessionState = writable(/** @type {SessionState} */ ({
   sessions: [],
@@ -29,6 +32,9 @@ export const sessionState = writable(/** @type {SessionState} */ ({
 }));
 
 export const subtitles = writable(/** @type {SubtitleLine[]} */ ([]));
+export const subtitleCandidates = writable(/** @type {SubtitleCandidate[]} */ ([]));
+export const selectedSubtitleCandidateId = writable(/** @type {string|null} */ (null));
+export const subtitleSelectionMode = writable(/** @type {'auto'|'manual'} */ ('auto'));
 export const activeLineIndex = writable(/** @type {number|null} */ (null));
 export const pendingCards = writable(/** @type {NewCardWithMatch[]} */ ([]));
 export const connected = writable(false);
@@ -36,7 +42,7 @@ export const ankiStatus = writable(/** @type {AnkiStatus} */ ({
   state: 'unknown',
   message: null,
 }));
-export const enhancementStatus = writable(/** @type {string|null} */ (null));
+export const enhancementQueue = writable(/** @type {EnhancementQueueItem[]} */ ([]));
 export const currentView = writable('timeline'); // 'timeline' | 'history' | 'config'
 export const pauseOnHover = localStorageStore('opt_pauseOnHover', false);
 export const pauseOnSeek = localStorageStore('opt_pauseOnSeek', false);
@@ -88,6 +94,16 @@ export function applyMiningConfig(mining = {}) {
   audioEndOffset.set(mining.audio_end_offset_ms ?? 500);
   defaultGenerateAvif.set(mining.generate_avif ?? true);
   autoApprove.set(Boolean(mining.auto_approve));
+}
+
+/**
+ * @param {SubtitlePayload | null | undefined} payload
+ */
+export function applySubtitlePayload(payload) {
+  subtitles.set(payload?.lines || []);
+  subtitleCandidates.set(payload?.candidates || []);
+  selectedSubtitleCandidateId.set(payload?.selected_candidate_id ?? null);
+  subtitleSelectionMode.set(payload?.selection_mode || 'auto');
 }
 
 // Toasts

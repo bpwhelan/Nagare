@@ -1,6 +1,6 @@
 [package]
 name = "nagare"
-version = "0.1.0"
+version = "0.1.2"
 edition = "2024"
 
 [dependencies]# Web framework
@@ -35,3 +35,4 @@ chrono = { version = "0.4", features = ["serde"] }
 futures-util = "0.3"
 async-trait = "0.1"
 rusqlite = { version = "0.32", features = ["bundled"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }

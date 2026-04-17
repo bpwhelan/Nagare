@@ -282,7 +282,9 @@
     cleanupAudio();
     cleanupScreenshot();
     removeCardFromQueue(noteId);
-    closeRouteDialog(returnToHistory);
+    if (isRouteCard) {
+      closeRouteDialog(returnToHistory);
+    }
     submitting = false;
   }
 
@@ -290,7 +292,6 @@
     if (!card || submitting) return;
     submitting = true;
     const noteId = card.event.note_id;
-    const closeImmediately = isRouteCard && isHistoryCard;
     const payload = {
       noteId,
       sentence: editedSentence,
@@ -303,44 +304,18 @@
       includedLineLast,
     };
 
-    const request = enrichCard(payload);
-
-    if (closeImmediately) {
-      closeDialogAfterDispatch(noteId, true);
-      try {
-        const result = await request;
-        if (!result.success) {
-          showToast('error', result.error || 'Enrichment failed');
-          return;
-        }
-        showToast('success', 'Card enriched successfully');
-      } catch (e) {
-        showToast('error', e.message || 'Enrichment failed');
-      }
-      return;
-    }
-
     try {
-      const result = await request;
+      const result = await enrichCard(payload);
       if (!result.success) {
-        showToast('error', result.error || 'Enrichment failed');
+        showToast('error', result.error || 'Could not queue enhancement');
         submitting = false;
         return;
       }
 
-      if (pausedByDialog) {
-        playPause(false);
-        pausedByDialog = false;
-      }
-      cleanupAudio();
-      cleanupScreenshot();
-      removeCardFromQueue(noteId);
-      if (isRouteCard) {
-        closeRouteDialog(isHistoryCard);
-      }
-      showToast('success', 'Card enriched successfully');
+      closeDialogAfterDispatch(noteId, isHistoryCard);
+      showToast('success', isHistoryCard ? 'Save queued in background' : 'Enhancement queued');
     } catch (e) {
-      showToast('error', e.message || 'Enrichment failed');
+      showToast('error', e.message || 'Could not queue enhancement');
       submitting = false;
     }
   }
