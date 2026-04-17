@@ -825,6 +825,47 @@ async fn save_mining_history_entry(
     }
 }
 
+async fn generate_and_store_screenshot(
+    anki_client: &Arc<AnkiClient>,
+    source: &str,
+    item_id: &str,
+    time_ms: i64,
+    note_id: i64,
+) -> Option<String> {
+    info!(
+        "[enhance {}] Capturing screenshot fallback at {}ms...",
+        note_id, time_ms
+    );
+    match media::generate_screenshot(source, time_ms).await {
+        Ok((ss_path, ss_data)) => {
+            let ss_filename = format!("nagare_{}_{}_ss.webp", item_id, time_ms);
+            let ss_b64 = media::to_base64(&ss_data);
+            let picture_html = match anki_client.store_media_file(&ss_filename, &ss_b64).await {
+                Ok(_) => {
+                    info!("[enhance {}] Screenshot stored in Anki", note_id);
+                    Some(format!("<img src=\"{}\">", ss_filename))
+                }
+                Err(error) => {
+                    warn!(
+                        "[enhance {}] Failed to store screenshot in Anki: {}",
+                        note_id, error
+                    );
+                    None
+                }
+            };
+            media::cleanup_temp_file(&ss_path).await;
+            picture_html
+        }
+        Err(error) => {
+            warn!(
+                "[enhance {}] Screenshot generation failed (continuing without): {}",
+                note_id, error
+            );
+            None
+        }
+    }
+}
+
 async fn perform_enrichment(
     state: &Arc<AppState>,
     req: &EnrichRequest,
@@ -876,6 +917,7 @@ async fn perform_enrichment(
         info!("[enhance {}] Audio stored in Anki", note_id);
 
         let mut picture_html = String::new();
+        let mid_ms = (req.start_ms + req.end_ms) / 2;
         if req.generate_avif {
             info!("[enhance {}] Generating AVIF ({}ms - {}ms)...", note_id, req.start_ms, req.end_ms);
             match media::generate_avif(&source, req.start_ms, req.end_ms).await {
@@ -897,28 +939,27 @@ async fn perform_enrichment(
                 }
                 Err(error) => {
                     warn!("[enhance {}] AVIF generation failed (continuing without): {}", note_id, error);
-                    let mid_ms = (req.start_ms + req.end_ms) / 2;
-                    info!("[enhance {}] Falling back to screenshot at {}ms...", note_id, mid_ms);
-                    if let Ok((ss_path, ss_data)) =
-                        media::generate_screenshot(&source, mid_ms).await
-                    {
-                        let ss_filename =
-                            format!("nagare_{}_{}_ss.webp", media_ctx.item_id, mid_ms);
-                        let ss_b64 = media::to_base64(&ss_data);
-                        if anki_client
-                            .store_media_file(&ss_filename, &ss_b64)
-                            .await
-                            .is_ok()
-                        {
-                            picture_html = format!("<img src=\"{}\">", ss_filename);
-                            info!("[enhance {}] Screenshot stored in Anki", note_id);
-                        }
-                        media::cleanup_temp_file(&ss_path).await;
-                    }
                 }
             }
         } else {
             info!("[enhance {}] AVIF generation skipped (disabled)", note_id);
+        }
+
+        if picture_html.is_empty() {
+            if req.generate_avif {
+                info!("[enhance {}] No AVIF stored, falling back to screenshot...", note_id);
+            }
+            if let Some(screenshot_html) = generate_and_store_screenshot(
+                &anki_client,
+                &source,
+                &media_ctx.item_id,
+                mid_ms,
+                note_id,
+            )
+            .await
+            {
+                picture_html = screenshot_html;
+            }
         }
 
         let mut fields = HashMap::new();
