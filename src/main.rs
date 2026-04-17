@@ -4,6 +4,7 @@ mod config;
 mod media;
 mod media_server;
 mod mining;
+mod plex_websocket;
 mod session;
 mod subtitle;
 
@@ -153,6 +154,7 @@ async fn main() -> anyhow::Result<()> {
     // New card events are processed centrally, then broadcast as prepared dialog payloads.
     let (raw_card_tx, raw_card_rx) = mpsc::channel::<NewCardEvent>(64);
     let (card_tx, _) = broadcast::channel::<EnrichmentDialogState>(64);
+    let (enhancement_tx, enhancement_rx) = mpsc::unbounded_channel();
 
     // Create session manager
     let session_manager = Arc::new(
@@ -167,6 +169,7 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let subtitles = session_manager.subtitles();
+    let subtitle_candidates = session_manager.subtitle_candidates();
     let subtitle_history = session_manager.subtitle_history();
     let history = session_manager.history();
 
@@ -178,10 +181,12 @@ async fn main() -> anyhow::Result<()> {
         servers: session_manager.servers(),
         anki_client: Arc::new(RwLock::new(anki_client)),
         anki_status: anki_status.clone(),
-        enhancement_status: Arc::new(RwLock::new(None)),
+        enhancement_queue: Arc::new(RwLock::new(Vec::new())),
+        enhancement_tx,
         session_rx,
         new_card_tx: card_tx.clone(),
         subtitles,
+        subtitle_candidates,
         subtitle_history,
         history,
         pending_enrichments: Arc::new(RwLock::new(Vec::new())),
@@ -191,6 +196,12 @@ async fn main() -> anyhow::Result<()> {
     let sm = session_manager.clone();
     tokio::spawn(async move {
         session::run_session_poller(sm).await;
+    });
+
+    let plex_ws_config = config.clone();
+    let plex_ws_manager = session_manager.clone();
+    tokio::spawn(async move {
+        plex_websocket::run_plex_websocket_listener(plex_ws_config, plex_ws_manager).await;
     });
 
     let poller_config = config.clone();
@@ -204,6 +215,11 @@ async fn main() -> anyhow::Result<()> {
     let processor_state = app_state.clone();
     tokio::spawn(async move {
         api::run_new_card_processor(processor_state, raw_card_rx).await;
+    });
+
+    let enhancement_state = app_state.clone();
+    tokio::spawn(async move {
+        api::run_enhancement_worker(enhancement_state, enhancement_rx).await;
     });
 
     // Build router

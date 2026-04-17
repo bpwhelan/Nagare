@@ -6,7 +6,8 @@ use crate::mining::{
     AppDatabase, EnrichmentDialogState, EnrichmentSource, MiningHistoryEntry, MiningHistorySummary,
 };
 use crate::session::{
-    HistoryEntry, SessionManager, SessionState, scoped_history_id, split_scoped_id,
+    HistoryEntry, SessionManager, SessionState, SubtitleCandidate, SubtitleSelectionMode,
+    scoped_history_id, split_scoped_id,
 };
 use crate::subtitle::{SubtitleTrack, find_all_matching_lines, find_matching_line};
 use axum::extract::State;
@@ -33,10 +34,12 @@ pub struct AppState {
     pub servers: Arc<RwLock<ServerMap>>,
     pub anki_client: Arc<RwLock<Arc<AnkiClient>>>,
     pub anki_status: Arc<RwLock<AnkiStatus>>,
-    pub enhancement_status: Arc<RwLock<Option<String>>>,
+    pub enhancement_queue: Arc<RwLock<Vec<EnhancementQueueItem>>>,
+    pub enhancement_tx: mpsc::UnboundedSender<EnhancementJob>,
     pub session_rx: watch::Receiver<SessionState>,
     pub new_card_tx: broadcast::Sender<EnrichmentDialogState>,
     pub subtitles: Arc<RwLock<Option<SubtitleTrack>>>,
+    pub subtitle_candidates: Arc<RwLock<Vec<SubtitleCandidate>>>,
     pub subtitle_history: Arc<RwLock<HashMap<String, SubtitleTrack>>>,
     pub history: Arc<RwLock<HashMap<String, HistoryEntry>>>,
     /// Queue of pending enrichment requests from the frontend.
@@ -49,6 +52,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/sessions", get(get_sessions))
         .route("/api/sessions/select", post(select_session))
         .route("/api/subtitles", get(get_subtitles))
+        .route("/api/subtitles/select", post(select_subtitle_track))
         .route("/api/history", get(get_history))
         .route(
             "/api/history/{item_id}/subtitles",
@@ -100,16 +104,69 @@ async fn select_session(
     Json(serde_json::json!({"ok": true}))
 }
 
-async fn get_subtitles(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    let subs = state.subtitles.read().await;
-    match subs.as_ref() {
-        Some(track) => Json(serde_json::json!({
-            "lines": track.lines,
-            "count": track.lines.len(),
+async fn active_subtitle_data(state: &Arc<AppState>) -> SubtitleData {
+    let track = state.subtitles.read().await.clone();
+    let candidates = state.subtitle_candidates.read().await.clone();
+    let session_state = state.session_rx.borrow().clone();
+    let selected_candidate_id = session_state
+        .now_playing
+        .as_ref()
+        .and_then(|now_playing| now_playing.subtitle_candidate_id.clone());
+    let selection_mode = session_state
+        .now_playing
+        .as_ref()
+        .map(|now_playing| now_playing.subtitle_selection_mode)
+        .unwrap_or(SubtitleSelectionMode::Auto);
+    let lines = track.map(|track| track.lines).unwrap_or_default();
+    let count = lines.len();
+
+    SubtitleData {
+        lines,
+        count,
+        candidates,
+        selected_candidate_id,
+        selection_mode,
+    }
+}
+
+fn history_subtitle_data(track: Option<SubtitleTrack>) -> SubtitleData {
+    let lines = track.map(|track| track.lines).unwrap_or_default();
+    let count = lines.len();
+
+    SubtitleData {
+        lines,
+        count,
+        candidates: Vec::new(),
+        selected_candidate_id: None,
+        selection_mode: SubtitleSelectionMode::Auto,
+    }
+}
+
+async fn get_subtitles(State(state): State<Arc<AppState>>) -> Json<SubtitleData> {
+    Json(active_subtitle_data(&state).await)
+}
+
+#[derive(Deserialize)]
+struct SelectSubtitleTrack {
+    candidate_id: Option<String>,
+}
+
+async fn select_subtitle_track(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<SelectSubtitleTrack>,
+) -> Json<serde_json::Value> {
+    match state
+        .session_manager
+        .select_subtitle_candidate(body.candidate_id)
+        .await
+    {
+        Ok(()) => Json(serde_json::json!({
+            "ok": true,
+            "subtitles": active_subtitle_data(&state).await,
         })),
-        None => Json(serde_json::json!({
-            "lines": [],
-            "count": 0,
+        Err(error) => Json(serde_json::json!({
+            "ok": false,
+            "error": error.to_string(),
         })),
     }
 }
@@ -133,18 +190,9 @@ async fn get_history(State(state): State<Arc<AppState>>) -> Json<Vec<HistoryEntr
 async fn get_history_subtitles(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(history_id): axum::extract::Path<String>,
-) -> Json<serde_json::Value> {
+) -> Json<SubtitleData> {
     let sh = state.subtitle_history.read().await;
-    match sh.get(&history_id) {
-        Some(track) => Json(serde_json::json!({
-            "lines": track.lines,
-            "count": track.lines.len(),
-        })),
-        None => Json(serde_json::json!({
-            "lines": [],
-            "count": 0,
-        })),
-    }
+    Json(history_subtitle_data(sh.get(&history_id).cloned()))
 }
 
 /// Load a history item as the active item for mining (load its subtitles into the main view).
@@ -209,7 +257,7 @@ async fn get_dialog_by_card_id(
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 struct EnrichRequest {
     note_id: i64,
     sentence: Option<String>,
@@ -228,6 +276,26 @@ struct EnrichRequest {
 struct EnrichResponse {
     success: bool,
     error: Option<String>,
+}
+
+#[derive(Clone)]
+pub(crate) struct EnhancementJob {
+    req: EnrichRequest,
+    fallback: Option<EnrichmentDialogState>,
+}
+
+#[derive(Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum EnhancementQueueState {
+    Queued,
+    Running,
+}
+
+#[derive(Clone, Serialize, PartialEq, Eq)]
+pub(crate) struct EnhancementQueueItem {
+    note_id: i64,
+    state: EnhancementQueueState,
+    message: String,
 }
 
 #[derive(Clone)]
@@ -444,9 +512,72 @@ async fn queue_pending_enrichment(state: &Arc<AppState>, candidate: EnrichmentDi
     let _ = state.new_card_tx.send(candidate);
 }
 
-async fn set_enhancement_status(state: &Arc<AppState>, message: Option<String>) {
-    let mut status = state.enhancement_status.write().await;
-    *status = message;
+fn enhancement_queue_message(note_id: i64, queue_state: EnhancementQueueState) -> String {
+    match queue_state {
+        EnhancementQueueState::Queued => format!("Queued note #{}", note_id),
+        EnhancementQueueState::Running => format!("Enhancing note #{}...", note_id),
+    }
+}
+
+async fn update_enhancement_queue_item(
+    state: &Arc<AppState>,
+    note_id: i64,
+    queue_state: EnhancementQueueState,
+) {
+    let mut queue = state.enhancement_queue.write().await;
+    let message = enhancement_queue_message(note_id, queue_state);
+
+    if let Some(item) = queue.iter_mut().find(|item| item.note_id == note_id) {
+        item.state = queue_state;
+        item.message = message;
+        return;
+    }
+
+    queue.push(EnhancementQueueItem {
+        note_id,
+        state: queue_state,
+        message,
+    });
+}
+
+async fn remove_enhancement_queue_item(state: &Arc<AppState>, note_id: i64) {
+    let mut queue = state.enhancement_queue.write().await;
+    queue.retain(|item| item.note_id != note_id);
+}
+
+async fn enqueue_enhancement_job(
+    state: &Arc<AppState>,
+    req: EnrichRequest,
+    fallback: Option<EnrichmentDialogState>,
+) -> Result<(), String> {
+    let note_id = req.note_id;
+
+    {
+        let mut queue = state.enhancement_queue.write().await;
+        if queue.iter().any(|item| item.note_id == note_id) {
+            return Err(format!(
+                "Note #{} is already queued for enhancement",
+                note_id
+            ));
+        }
+
+        queue.push(EnhancementQueueItem {
+            note_id,
+            state: EnhancementQueueState::Queued,
+            message: enhancement_queue_message(note_id, EnhancementQueueState::Queued),
+        });
+    }
+
+    if state
+        .enhancement_tx
+        .send(EnhancementJob { req, fallback })
+        .is_err()
+    {
+        remove_enhancement_queue_item(state, note_id).await;
+        return Err("Enhancement worker is unavailable".to_string());
+    }
+
+    Ok(())
 }
 
 async fn save_mining_history_entry(
@@ -531,8 +662,6 @@ async fn perform_enrichment(
     fallback_event: Option<NewCardEvent>,
     fallback_card_ids: Vec<i64>,
 ) -> Result<(), String> {
-    set_enhancement_status(state, Some(format!("Enhancing note #{}...", req.note_id))).await;
-
     let result = async {
         let media_ctx = resolve_media_context(state, req.item_id.as_deref()).await?;
         let config = state.config.read().await.clone();
@@ -639,7 +768,6 @@ async fn perform_enrichment(
     }
     .await;
 
-    set_enhancement_status(state, None).await;
     result
 }
 
@@ -660,21 +788,17 @@ pub async fn run_new_card_processor(state: Arc<AppState>, mut rx: mpsc::Receiver
             if let Some(track) = track {
                 let config = state.config.read().await.clone();
                 if let Some(req) = default_request_from_candidate(&candidate, &config, &track) {
-                    match perform_enrichment(
-                        &state,
-                        &req,
-                        Some(candidate.event.clone()),
-                        candidate.card_ids.clone(),
-                    )
-                    .await
-                    {
+                    match enqueue_enhancement_job(&state, req, Some(candidate.clone())).await {
                         Ok(()) => {
-                            info!("Auto-approved note {}", candidate.event.note_id);
+                            info!(
+                                "Auto-approved note {} and queued enhancement",
+                                candidate.event.note_id
+                            );
                             continue;
                         }
                         Err(error) => {
                             warn!(
-                                "Auto-approve failed for note {}: {}. Falling back to manual review.",
+                                "Auto-approve queue failed for note {}: {}. Falling back to manual review.",
                                 candidate.event.note_id, error
                             );
                         }
@@ -691,41 +815,69 @@ async fn enrich_card(
     State(state): State<Arc<AppState>>,
     Json(req): Json<EnrichRequest>,
 ) -> Json<EnrichResponse> {
+    let note_id = req.note_id;
     let fallback = {
         let pending = state.pending_enrichments.read().await;
         pending
             .iter()
-            .find(|entry| entry.event.note_id == req.note_id)
+            .find(|entry| entry.event.note_id == note_id)
             .cloned()
     };
 
-    match perform_enrichment(
-        &state,
-        &req,
-        fallback.as_ref().map(|entry| entry.event.clone()),
-        fallback
-            .as_ref()
-            .map(|entry| entry.card_ids.clone())
-            .unwrap_or_default(),
-    )
-    .await
-    {
+    match enqueue_enhancement_job(&state, req, fallback).await {
         Ok(()) => {
-            remove_pending_enrichment(&state, req.note_id).await;
-            info!("Successfully enriched note {}", req.note_id);
+            remove_pending_enrichment(&state, note_id).await;
+            info!("Queued enhancement for note {}", note_id);
             Json(EnrichResponse {
                 success: true,
                 error: None,
             })
         }
         Err(error) => {
-            error!("Enrichment failed for note {}: {}", req.note_id, error);
+            error!(
+                "Failed to queue enhancement for note {}: {}",
+                note_id, error
+            );
             Json(EnrichResponse {
                 success: false,
                 error: Some(error),
             })
         }
     }
+}
+
+pub(crate) async fn run_enhancement_worker(
+    state: Arc<AppState>,
+    mut rx: mpsc::UnboundedReceiver<EnhancementJob>,
+) {
+    while let Some(job) = rx.recv().await {
+        let note_id = job.req.note_id;
+        update_enhancement_queue_item(&state, note_id, EnhancementQueueState::Running).await;
+
+        let fallback_event = job.fallback.as_ref().map(|entry| entry.event.clone());
+        let fallback_card_ids = job
+            .fallback
+            .as_ref()
+            .map(|entry| entry.card_ids.clone())
+            .unwrap_or_default();
+
+        let result = perform_enrichment(&state, &job.req, fallback_event, fallback_card_ids).await;
+        remove_enhancement_queue_item(&state, note_id).await;
+
+        match result {
+            Ok(()) => {
+                info!("Successfully enriched note {}", note_id);
+            }
+            Err(error) => {
+                error!("Enrichment failed for note {}: {}", note_id, error);
+                if let Some(candidate) = job.fallback {
+                    queue_pending_enrichment(&state, candidate).await;
+                }
+            }
+        }
+    }
+
+    warn!("Enhancement worker channel closed");
 }
 
 // === Subtitle match search ===
@@ -1116,12 +1268,16 @@ struct WsMessage {
     #[serde(skip_serializing_if = "Option::is_none")]
     anki_status: Option<AnkiStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    enhancement_status: Option<Option<String>>,
+    enhancement_queue: Option<Vec<EnhancementQueueItem>>,
 }
 
 #[derive(Serialize)]
 struct SubtitleData {
     lines: Vec<crate::subtitle::SubtitleLine>,
+    count: usize,
+    candidates: Vec<SubtitleCandidate>,
+    selected_candidate_id: Option<String>,
+    selection_mode: SubtitleSelectionMode,
 }
 
 async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
@@ -1130,15 +1286,17 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
     let mut session_rx = state.session_rx.clone();
     let mut card_rx = state.new_card_tx.subscribe();
     let subtitles = state.subtitles.clone();
+    let subtitle_candidates = state.subtitle_candidates.clone();
     let anki_status = state.anki_status.clone();
-    let enhancement_status = state.enhancement_status.clone();
+    let enhancement_queue = state.enhancement_queue.clone();
 
     // Send initial state
     {
         let subs = subtitles.read().await;
         let session_state = session_rx.borrow().clone();
         let current_anki_status = anki_status.read().await.clone();
-        let current_enhancement_status = enhancement_status.read().await.clone();
+        let current_enhancement_queue = enhancement_queue.read().await.clone();
+        let subtitle_data = active_subtitle_data(&state).await;
         let active_line =
             if let (Some(track), Some(np)) = (subs.as_ref(), &session_state.now_playing) {
                 track
@@ -1151,13 +1309,11 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
         let init_msg = WsMessage {
             msg_type: "init".to_string(),
             state: Some(session_state),
-            subtitles: subs.as_ref().map(|t| SubtitleData {
-                lines: t.lines.clone(),
-            }),
+            subtitles: Some(subtitle_data),
             active_line_index: active_line,
             new_card: None,
             anki_status: Some(current_anki_status),
-            enhancement_status: Some(current_enhancement_status),
+            enhancement_queue: Some(current_enhancement_queue),
         };
 
         if let Ok(json) = serde_json::to_string(&init_msg) {
@@ -1168,33 +1324,67 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
     let send_task = tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_millis(50));
         let mut last_item_id: Option<String> = None;
+        let mut last_subtitle_signature: Option<(
+            Option<String>,
+            Option<String>,
+            SubtitleSelectionMode,
+            usize,
+            Vec<SubtitleCandidate>,
+        )> = None;
         let mut last_anki_status: Option<AnkiStatus> = None;
-        let mut last_enhancement_status: Option<String> = None;
-        let mut sent_card_ids: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        let mut last_enhancement_queue: Vec<EnhancementQueueItem> = Vec::new();
 
         loop {
             tokio::select! {
                 _ = interval.tick() => {
                     let session_state = session_rx.borrow_and_update().clone();
                     let subs = subtitles.read().await;
+                    let current_candidates = subtitle_candidates.read().await.clone();
 
                     let current_item_id = session_state
                         .now_playing
                         .as_ref()
                         .map(|np| np.history_id.clone());
                     let current_anki_status = anki_status.read().await.clone();
-                    let current_enhancement_status = enhancement_status.read().await.clone();
+                    let current_enhancement_queue = enhancement_queue.read().await.clone();
+                    let selected_candidate_id = session_state
+                        .now_playing
+                        .as_ref()
+                        .and_then(|np| np.subtitle_candidate_id.clone());
+                    let selection_mode = session_state
+                        .now_playing
+                        .as_ref()
+                        .map(|np| np.subtitle_selection_mode)
+                        .unwrap_or(SubtitleSelectionMode::Auto);
+                    let subtitle_lines = subs.as_ref().map(|track| track.lines.clone()).unwrap_or_default();
+                    let subtitle_data = SubtitleData {
+                        count: subtitle_lines.len(),
+                        lines: subtitle_lines,
+                        candidates: current_candidates.clone(),
+                        selected_candidate_id,
+                        selection_mode,
+                    };
+                    let current_subtitle_signature = (
+                        current_item_id.clone(),
+                        subtitle_data.selected_candidate_id.clone(),
+                        subtitle_data.selection_mode,
+                        subtitle_data.count,
+                        subtitle_data.candidates.clone(),
+                    );
 
-                    // If item changed, send full subtitles
-                    let send_subs = current_item_id != last_item_id;
+                    let send_subs = current_item_id != last_item_id
+                        || last_subtitle_signature.as_ref() != Some(&current_subtitle_signature);
                     last_item_id = current_item_id;
+                    if send_subs {
+                        last_subtitle_signature = Some(current_subtitle_signature);
+                    }
                     let send_anki_status = last_anki_status.as_ref() != Some(&current_anki_status);
                     if send_anki_status {
                         last_anki_status = Some(current_anki_status.clone());
                     }
-                    let send_enhancement_status = last_enhancement_status != current_enhancement_status;
-                    if send_enhancement_status {
-                        last_enhancement_status = current_enhancement_status.clone();
+                    let send_enhancement_queue = last_enhancement_queue != current_enhancement_queue;
+                    if send_enhancement_queue {
+                        last_enhancement_queue = current_enhancement_queue.clone();
                     }
 
                     let active_line = if let (Some(track), Some(np)) = (subs.as_ref(), &session_state.now_playing) {
@@ -1207,7 +1397,7 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
                         msg_type: if send_subs { "full_update".to_string() } else { "position".to_string() },
                         state: Some(session_state),
                         subtitles: if send_subs {
-                            subs.as_ref().map(|t| SubtitleData { lines: t.lines.clone() })
+                            Some(subtitle_data)
                         } else {
                             None
                         },
@@ -1218,8 +1408,8 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
                         } else {
                             None
                         },
-                        enhancement_status: if send_enhancement_status {
-                            Some(current_enhancement_status)
+                        enhancement_queue: if send_enhancement_queue {
+                            Some(current_enhancement_queue)
                         } else {
                             None
                         },
@@ -1241,11 +1431,6 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
                         Err(broadcast::error::RecvError::Closed) => break,
                     };
 
-                    if sent_card_ids.contains(&candidate.event.note_id) {
-                        continue;
-                    }
-                    sent_card_ids.insert(candidate.event.note_id);
-
                     let msg = WsMessage {
                         msg_type: "new_card".to_string(),
                         state: None,
@@ -1253,7 +1438,7 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
                         active_line_index: None,
                         new_card: Some(candidate),
                         anki_status: None,
-                        enhancement_status: None,
+                        enhancement_queue: None,
                     };
 
                     if let Ok(json) = serde_json::to_string(&msg) {

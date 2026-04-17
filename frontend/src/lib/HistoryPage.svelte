@@ -1,6 +1,6 @@
 <script>
   import { onMount } from 'svelte';
-  import { historyItems, minedHistoryItems, subtitles, activeHistoryItemId, currentView, navigate } from './stores.js';
+  import { historyItems, minedHistoryItems, activeHistoryItemId, currentView, navigate, applySubtitlePayload } from './stores.js';
   import { getHistory, getMinedHistory, activateHistoryItem, getHistorySubtitles } from './api.js';
   import { formatTime } from './utils.js';
 
@@ -27,7 +27,7 @@
       // The WS only pushes subtitles on now_playing item changes; after activating
       // a history item we must pull the subtitle lines ourselves and update the store.
       const subData = await getHistorySubtitles(item.history_id);
-      subtitles.set(subData.lines || []);
+      applySubtitlePayload(subData);
       activeHistoryItemId.set(item.history_id);
       currentView.set('timeline');
     }

@@ -1,5 +1,5 @@
 import { get } from 'svelte/store';
-import { activeHistoryItemId, sessionState, subtitles, pendingCards, connected, ankiStatus, enhancementStatus, syncPositionFromSessionState, isSeekLocked, isPlayLocked } from './stores.js';
+import { activeHistoryItemId, sessionState, pendingCards, connected, ankiStatus, enhancementQueue, syncPositionFromSessionState, isSeekLocked, isPlayLocked, applySubtitlePayload } from './stores.js';
 
 let ws = null;
 let reconnectTimer = null;
@@ -24,7 +24,7 @@ export function connectWebSocket() {
   ws.onclose = () => {
     connected.set(false);
     ankiStatus.set({ state: 'unknown', message: null });
-    enhancementStatus.set(null);
+    enhancementQueue.set([]);
     console.log('WebSocket disconnected, reconnecting in 2s...');
     reconnectTimer = setTimeout(connectWebSocket, 2000);
   };
@@ -47,8 +47,8 @@ function handleMessage(msg) {
   if (msg.anki_status) {
     ankiStatus.set(msg.anki_status);
   }
-  if (Object.prototype.hasOwnProperty.call(msg, 'enhancement_status')) {
-    enhancementStatus.set(msg.enhancement_status || null);
+  if (Object.prototype.hasOwnProperty.call(msg, 'enhancement_queue')) {
+    enhancementQueue.set(msg.enhancement_queue || []);
   }
 
   switch (msg.type) {
@@ -59,7 +59,7 @@ function handleMessage(msg) {
         syncPositionFromSessionState(msg.state);
       }
       if (msg.subtitles && !get(activeHistoryItemId)) {
-        subtitles.set(msg.subtitles.lines || []);
+        applySubtitlePayload(msg.subtitles);
       }
       break;
 
@@ -99,7 +99,7 @@ export function disconnect() {
     ws.close();
     ws = null;
   }
-  enhancementStatus.set(null);
+  enhancementQueue.set([]);
   if (reconnectTimer) {
     clearTimeout(reconnectTimer);
     reconnectTimer = null;
