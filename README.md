@@ -1,6 +1,6 @@
 # Nagare (流れ)
 
-Pronounced "Nah-gah-reh". Subtitle mining companion for Emby, Jellyfin, and Plex (Semi-support for Plex). Watches live playback sessions, displays a subtitle timeline in the browser, and enriches Anki cards with sentence audio, screenshots, and source metadata.
+Pronounced "Nah-gah-reh". Subtitle mining companion for Emby, Jellyfin, and Plex. Watches live playback sessions, displays a subtitle timeline in the browser, and enriches Anki cards with sentence audio, screenshots, and source metadata.
 
 NOTE: This project is my most vibe-coded yet, so YMMV. It's really a problem that I seeked out to solve for myself, but I believe/hope it can be useful for others.
 
