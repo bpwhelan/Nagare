@@ -21,7 +21,7 @@ NOTE: This project is my most vibe-coded yet, so YMMV. It's really a problem tha
 - [x] Add Jellyfin support
 - [x] Add Plex support
 - [x] AnkiConnect integration
-- [ ] Support for subtitles even when player has none (listening practice while maintaining mineability).
+- [x] Support for subtitles even when player has none (listening practice while maintaining mineability).
 - [ ] Automatic Subtitle Sync? IDK if this is even feasible, the ability to press a button, Nagare syncs with alass or subplz, and then sends the updated sub to the media server would be the idea.
 - [ ] More Active Subtitle Sync? If you change subtitle timing in media player, Nagare will not adjust.
 - [ ] More options for audio/ss formats
