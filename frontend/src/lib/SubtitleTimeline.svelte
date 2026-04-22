@@ -1,8 +1,9 @@
 <script>
   import { onDestroy } from 'svelte';
-  import { subtitles, subtitleCandidates, selectedSubtitleCandidateId, subtitleSelectionMode, activeHistoryItemId, activeLineIndex, positionMs, pauseOnHover, pauseOnSeek, isPlaying, sessionState, showToast, setOptimisticPosition, setOptimisticPlayState, applySubtitlePayload } from './stores.js';
-  import { fireSeek, firePlayPause, selectSubtitleTrack } from './api.js';
+  import { subtitles, subtitleCandidates, selectedSubtitleCandidateId, subtitleSelectionMode, activeHistoryItemId, activeLineIndex, positionMs, pauseOnHover, pauseOnSeek, isPlaying, sessionState, showToast, setOptimisticPosition, setOptimisticPlayState, applySubtitlePayload, yomitanPopupVisible } from './stores.js';
+  import { fireSeek, firePlayPause, playPause, selectSubtitleTrack } from './api.js';
   import { formatTime } from './utils.js';
+  import AudioTrackSelector from './AudioTrackSelector.svelte';
 
   const newLineCharacter = '\n';
 
@@ -10,6 +11,9 @@
   let autoScroll = true;
   let userScrolling = false;
   let scrollTimeout;
+  let controlsExpanded = false;
+  let dismissingPopupPointerId = null;
+  let consumeNextLineClick = false;
 
   // Track whether we paused due to hover so we can resume on leave
   let pausedByHover = false;
@@ -32,7 +36,10 @@
     if (!container || userScrolling) return;
     const el = container.querySelector(`[data-index="${index}"]`);
     if (el) {
-      el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      const containerRect = container.getBoundingClientRect();
+      const elRect = el.getBoundingClientRect();
+      const offset = elRect.top - containerRect.top - (containerRect.height / 2) + (elRect.height / 2);
+      container.scrollTo({ top: container.scrollTop + offset, behavior: 'smooth' });
     }
   }
 
@@ -62,7 +69,39 @@
     }
   }
 
+  function handleLinePointerDown(event) {
+    if ($yomitanPopupVisible) {
+      dismissingPopupPointerId = event.pointerId;
+    } else {
+      dismissingPopupPointerId = null;
+    }
+  }
+
+  function handleLinePointerUp(event) {
+    if (dismissingPopupPointerId === event.pointerId) {
+      consumeNextLineClick = true;
+      dismissingPopupPointerId = null;
+    }
+  }
+
+  function clearLinePointer(event) {
+    if (dismissingPopupPointerId === event.pointerId) {
+      dismissingPopupPointerId = null;
+    }
+  }
+
+  function shouldIgnoreLineInteraction() {
+    if (consumeNextLineClick) {
+      consumeNextLineClick = false;
+      return true;
+    }
+
+    return $yomitanPopupVisible;
+  }
+
   function handleLineClick(line) {
+    if (shouldIgnoreLineInteraction()) return;
+
     if (!remoteControlAvailable) {
       showToast('error', 'Playback controls are unavailable for this player');
       return;
@@ -78,6 +117,8 @@
   }
 
   function handleLineMouseEnter(index) {
+    if ($yomitanPopupVisible || consumeNextLineClick) return;
+
     if ($pauseOnHover && remoteControlAvailable && index === $activeLineIndex && $isPlaying) {
       setOptimisticPlayState(true);
       firePlayPause(true);
@@ -120,14 +161,20 @@
   }
 </script>
 
-<div class="timeline-container" bind:this={container} on:scroll={handleScroll}>
+<div class="timeline-container" class:navigation-disabled={$yomitanPopupVisible} bind:this={container} on:scroll={handleScroll}>
   {#if showSubtitleSelector || $subtitles.length > 0}
-    <div class="controls">
-      <div class="controls-left">
+    <div class="controls" class:controls-collapsed={!controlsExpanded}>
+      <div class="controls-summary">
+        <button class="controls-toggle" on:click={() => controlsExpanded = !controlsExpanded} title={controlsExpanded ? 'Collapse track options' : 'Expand track options'}>
+          {controlsExpanded ? '▾' : '▸'}
+        </button>
         <label class="auto-scroll-toggle">
           <input type="checkbox" bind:checked={autoScroll} />
           Auto-scroll
         </label>
+        <span class="line-count">{$subtitles.length} lines</span>
+      </div>
+      <div class="controls-detail">
         {#if showSubtitleSelector}
           <label class="track-picker">
             <span class="track-picker-label">Track</span>
@@ -139,8 +186,10 @@
             </select>
           </label>
         {/if}
+        {#if !$activeHistoryItemId}
+          <AudioTrackSelector />
+        {/if}
       </div>
-      <span class="line-count">{$subtitles.length} lines</span>
     </div>
   {/if}
 
@@ -161,7 +210,11 @@
           data-index={i}
           data-ts={formatTime(line.start_ms)}
           role="button"
+          aria-disabled={$yomitanPopupVisible}
           tabindex="0"
+          on:pointerdown={handleLinePointerDown}
+          on:pointerup={handleLinePointerUp}
+          on:pointercancel={clearLinePointer}
           on:click={() => handleLineClick(line)}
           on:keyup={(e) => e.key === 'Enter' && handleLineClick(line)}
           on:mouseenter={() => handleLineMouseEnter(i)}
@@ -201,9 +254,8 @@
 
   .controls {
     display: flex;
-    justify-content: space-between;
-    align-items: center;
-    gap: 0.75rem;
+    flex-direction: column;
+    gap: 0.5rem;
     position: sticky;
     top: 0;
     z-index: 5;
@@ -214,7 +266,17 @@
     box-shadow: 0 1px 0 rgba(0, 0, 0, 0.18);
   }
 
-  .controls-left {
+  .controls-summary {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+  }
+
+  .controls-toggle {
+    display: none;
+  }
+
+  .controls-detail {
     display: flex;
     align-items: center;
     gap: 0.75rem;
@@ -296,6 +358,10 @@
     background: var(--bg-hover);
   }
 
+  .timeline-container.navigation-disabled .line {
+    cursor: default;
+  }
+
   .line .text {
     font-size: 1.1rem;
     line-height: 1.5;
@@ -320,11 +386,34 @@
   @media (max-width: 768px) {
     .controls {
       align-items: flex-start;
-      flex-direction: column;
+      gap: 0;
     }
 
-    .controls-left {
+    .controls-toggle {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      width: 1.6rem;
+      height: 1.6rem;
+      flex-shrink: 0;
+      border-radius: 4px;
+      font-size: 0.8rem;
+      background: transparent;
+      border: 1px solid var(--border);
+      color: var(--text-secondary);
+      padding: 0;
+      cursor: pointer;
+    }
+
+    .controls-collapsed .controls-detail {
+      display: none;
+    }
+
+    .controls-detail {
       width: 100%;
+      padding-top: 0.4rem;
+      flex-direction: column;
+      align-items: flex-start;
     }
 
     .track-picker {

@@ -181,6 +181,28 @@ export async function updateConfig(config) {
   });
 }
 
+// === Audio track management ===
+
+export async function getAudioTracks() {
+  return api('/api/audio-tracks');
+}
+
+export async function selectAudioTrack(streamIndex) {
+  return api('/api/audio-tracks/select', {
+    method: 'POST',
+    body: JSON.stringify({ stream_index: streamIndex }),
+  });
+}
+
+export async function previewAudioTrack(streamIndex, itemId = null) {
+  const body = { stream_index: streamIndex };
+  if (itemId) body.item_id = itemId;
+  return api('/api/audio-tracks/preview', {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
+}
+
 // === Sequential enrichment queue ===
 // Serializes enrichCard API calls so rapid confirms don't exhaust
 // the browser's connection pool (which starves subsequent requests).

@@ -4,6 +4,7 @@
     activeHistoryItemId,
     audioEndOffset,
     audioStartOffset,
+    autoApprove,
     currentView,
     defaultGenerateAvif,
     dialogCard,
@@ -20,6 +21,7 @@
   $: card = $dialogCard || $pendingCards[0] || null;
   $: isRouteCard = $dialogCard != null;
   $: isHistoryCard = card?.source === 'mining_history';
+  $: shouldAutoApprovePending = Boolean(card && !isRouteCard && card.source === 'pending' && $autoApprove);
   $: mediaItemId = card?.history_id || $activeHistoryItemId || null;
   $: matchedIndex = card?.matched_line_index;
   $: matchedLine = matchedIndex != null ? $subtitles[matchedIndex] : null;
@@ -39,6 +41,7 @@
   let selectedHistoryMatch = null;
   let lastCardKey = null;
   let submitting = false;
+  let lastAutoApprovedCardKey = null;
 
   // Track which subtitle lines are included in the current selection
   // (the original matched line index + any appended prev/next lines)
@@ -171,7 +174,7 @@
     cleanupScreenshot();
     if ($activeHistoryItemId && matchedIndex == null && includedLineFirst == null) {
       fetchHistoryMatches(card.event.sentence);
-    } else if ($isPlaying) {
+    } else if ($isPlaying && !shouldAutoApprovePending) {
       firePlayPause(true);
       pausedByDialog = true;
     }
@@ -193,6 +196,16 @@
     includedLineLast = anchorLineIndex;
     setRangeFromInclusion();
     editedSentence = buildSelectedSentence();
+  }
+
+  $: autoApproveReady = shouldAutoApprovePending
+    && includedLineFirst != null
+    && includedLineLast != null
+    && endMs > startMs;
+
+  $: if (autoApproveReady && cardKey !== lastAutoApprovedCardKey && !submitting) {
+    lastAutoApprovedCardKey = cardKey;
+    handleConfirm();
   }
 
   function rebuildSentence() {
@@ -508,7 +521,7 @@
   });
 </script>
 
-{#if card}
+{#if card && !shouldAutoApprovePending}
   <div class="overlay">
     <div class="dialog">
       <div class="dialog-header">

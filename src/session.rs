@@ -61,6 +61,33 @@ pub struct SubtitleCandidate {
     local_path: Option<PathBuf>,
 }
 
+/// Describes an available audio track in the current media.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AudioTrack {
+    /// Absolute stream index (for ffmpeg `-map 0:{index}`).
+    pub index: u32,
+    pub codec: Option<String>,
+    pub language: Option<String>,
+    pub display_title: Option<String>,
+    pub title: Option<String>,
+    pub is_default: bool,
+    pub channels: Option<String>,
+}
+
+/// How the active audio track was chosen.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AudioTrackResolution {
+    /// Only one audio track exists — nothing to choose.
+    Single,
+    /// Auto-selected because it matches the target language.
+    AutoLanguage,
+    /// User explicitly selected this track.
+    Manual,
+    /// Multiple tracks exist and none match the target language — user must pick.
+    NeedsSelection,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NowPlayingState {
     pub history_id: String,
@@ -76,6 +103,7 @@ pub struct NowPlayingState {
     pub subtitle_selection_mode: SubtitleSelectionMode,
     pub media_source_id: String,
     pub file_path: Option<String>,
+    pub audio_stream_index: Option<u32>,
 }
 
 /// A snapshot of a previously-watched item, kept so the user can mine it later.
@@ -131,6 +159,12 @@ pub struct SessionManager {
     subtitle_history: Arc<RwLock<HashMap<String, SubtitleTrack>>>,
     /// Metadata for previously-watched items
     history: Arc<RwLock<HashMap<String, HistoryEntry>>>,
+    /// Audio tracks for the current media item.
+    audio_tracks: Arc<RwLock<Vec<AudioTrack>>>,
+    /// The currently selected audio stream index (absolute).
+    selected_audio_track: Arc<RwLock<Option<u32>>>,
+    /// How the audio track was resolved.
+    audio_track_resolution: Arc<RwLock<AudioTrackResolution>>,
     /// Shared persistence layer for config, session state, and mined-note history.
     db: Arc<AppDatabase>,
     /// Prevent overlapping poll cycles when the API forces immediate refreshes.
@@ -185,6 +219,9 @@ impl SessionManager {
             loaded_subtitle_candidate_id: Arc::new(RwLock::new(None)),
             subtitle_history: Arc::new(RwLock::new(subtitle_history)),
             history: Arc::new(RwLock::new(history)),
+            audio_tracks: Arc::new(RwLock::new(Vec::new())),
+            selected_audio_track: Arc::new(RwLock::new(None)),
+            audio_track_resolution: Arc::new(RwLock::new(AudioTrackResolution::Single)),
             db,
             poll_lock: Mutex::new(()),
             last_save,
@@ -200,6 +237,18 @@ impl SessionManager {
         self.subtitle_candidates.clone()
     }
 
+    pub fn audio_tracks(&self) -> Arc<RwLock<Vec<AudioTrack>>> {
+        self.audio_tracks.clone()
+    }
+
+    pub fn selected_audio_track(&self) -> Arc<RwLock<Option<u32>>> {
+        self.selected_audio_track.clone()
+    }
+
+    pub fn audio_track_resolution(&self) -> Arc<RwLock<AudioTrackResolution>> {
+        self.audio_track_resolution.clone()
+    }
+
     pub fn subtitle_history(&self) -> Arc<RwLock<HashMap<String, SubtitleTrack>>> {
         self.subtitle_history.clone()
     }
@@ -211,6 +260,88 @@ impl SessionManager {
     /// Get a reference to the shared server map RwLock.
     pub fn servers(&self) -> Arc<RwLock<ServerMap>> {
         self.servers.clone()
+    }
+
+    /// Build [`AudioTrack`] list from the media server's stream metadata.
+    fn audio_tracks_from_streams(streams: &[MediaStream]) -> Vec<AudioTrack> {
+        streams
+            .iter()
+            .filter(|s| s.stream_type == StreamType::Audio)
+            .map(|s| {
+                // Try to extract channel info from display_title (e.g. "Japanese - 2.0 - AAC")
+                let channels = s.display_title.as_ref().and_then(|dt| {
+                    // Look for patterns like "2.0", "5.1", "7.1"
+                    dt.split(|c: char| c == '-' || c == '(' || c == ')')
+                        .map(str::trim)
+                        .find(|part| {
+                            part.contains('.')
+                                && part.len() <= 4
+                                && part.chars().all(|c| c.is_ascii_digit() || c == '.')
+                        })
+                        .map(String::from)
+                });
+                AudioTrack {
+                    index: s.index,
+                    codec: s.codec.clone(),
+                    language: s.language.clone(),
+                    display_title: s.display_title.clone(),
+                    title: s.title.clone(),
+                    is_default: s.is_default,
+                    channels,
+                }
+            })
+            .collect()
+    }
+
+    /// Resolve which audio track to select and how.
+    fn resolve_audio_track(
+        tracks: &[AudioTrack],
+        target_lang: &str,
+        user_override: Option<u32>,
+    ) -> (Option<u32>, AudioTrackResolution) {
+        if let Some(idx) = user_override {
+            if tracks.iter().any(|t| t.index == idx) {
+                return (Some(idx), AudioTrackResolution::Manual);
+            }
+        }
+
+        if tracks.len() <= 1 {
+            return (tracks.first().map(|t| t.index), AudioTrackResolution::Single);
+        }
+
+        // Multiple tracks — try target language match.
+        if let Some(track) = tracks.iter().find(|t| {
+            Self::language_matches_target(t.language.as_deref(), target_lang)
+        }) {
+            return (Some(track.index), AudioTrackResolution::AutoLanguage);
+        }
+
+        // No language match — user needs to pick.
+        (None, AudioTrackResolution::NeedsSelection)
+    }
+
+    /// User-initiated audio track selection.
+    pub async fn select_audio_track(&self, stream_index: u32) {
+        let tracks = self.audio_tracks.read().await;
+        if tracks.iter().any(|t| t.index == stream_index) {
+            let mut sel = self.selected_audio_track.write().await;
+            *sel = Some(stream_index);
+            let mut res = self.audio_track_resolution.write().await;
+            *res = AudioTrackResolution::Manual;
+
+            // Update NowPlayingState
+            let mut state = self.state.write().await;
+            if let Some(np) = state.now_playing.as_mut() {
+                np.audio_stream_index = Some(stream_index);
+            }
+            drop(state);
+            drop(sel);
+            drop(res);
+            drop(tracks);
+
+            let snapshot = self.state.read().await.clone();
+            let _ = self.state_tx.send(snapshot);
+        }
     }
 
     /// Persist history to SQLite.
@@ -925,8 +1056,8 @@ impl SessionManager {
                     .cloned()
             })
         } else {
-            // Auto-select: prefer target language sessions
-            sessions
+            // Auto-select: prefer target-language sessions, fall back to any playing session
+            let target_match = sessions
                 .iter()
                 .find(|s| {
                     s.session
@@ -935,7 +1066,14 @@ impl SessionManager {
                         .map(|np| np.has_audio_language(&target_lang))
                         .unwrap_or(false)
                 })
-                .cloned()
+                .cloned();
+
+            target_match.or_else(|| {
+                sessions
+                    .iter()
+                    .find(|s| s.session.now_playing.is_some())
+                    .cloned()
+            })
         };
 
         // Collect info we need while holding the lock, then release
@@ -960,7 +1098,10 @@ impl SessionManager {
             let mut state = self.state.write().await;
             state.sessions = summaries;
 
-            if let Some(active) = active_session.clone() {
+            if let Some(active) = active_session
+                .clone()
+                .filter(|s| s.session.now_playing.is_some())
+            {
                 let prev_history_id = state.now_playing.as_ref().map(|np| np.history_id.clone());
 
                 let session = &active.session;
@@ -1000,6 +1141,22 @@ impl SessionManager {
                     None
                 };
 
+                // ── Audio track resolution ──
+                let audio_user_override = if item_changed {
+                    None
+                } else {
+                    *self.selected_audio_track.read().await
+                };
+                let audio_tracks_list = Self::audio_tracks_from_streams(&np.media_streams);
+                let (resolved_audio_index, audio_resolution) =
+                    Self::resolve_audio_track(&audio_tracks_list, &target_lang, audio_user_override);
+
+                if item_changed {
+                    *self.audio_tracks.write().await = audio_tracks_list;
+                    *self.selected_audio_track.write().await = resolved_audio_index;
+                    *self.audio_track_resolution.write().await = audio_resolution;
+                }
+
                 state.active_session_id = Some(scoped_session_id(active.kind, &session.id));
                 state.now_playing = Some(NowPlayingState {
                     history_id: history_id.clone(),
@@ -1015,6 +1172,7 @@ impl SessionManager {
                     subtitle_selection_mode: selection_mode,
                     media_source_id: media_source_id.clone(),
                     file_path: np.path.clone(),
+                    audio_stream_index: resolved_audio_index,
                 });
 
                 if item_changed || selected_candidate_id != previous_loaded_candidate_id {

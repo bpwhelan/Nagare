@@ -12,13 +12,13 @@
     dialogCard,
     durationMs,
     enhancementQueue,
+    isPlaying,
     nowPlayingTitle,
     pendingCards,
     positionMs,
     route,
     showToast,
     syncRouteFromLocation,
-    yomitanPause,
   } from './lib/stores.js';
   import { formatTimeFull } from './lib/utils.js';
   import { startYomitanObserver, stopYomitanObserver } from './lib/yomitan.js';
@@ -29,11 +29,29 @@
   import HistoryPage from './lib/HistoryPage.svelte';
   import ToastContainer from './lib/ToastContainer.svelte';
   import MediaRemote from './lib/MediaRemote.svelte';
+  import AudioTrackModal from './lib/AudioTrackModal.svelte';
 
   let lastRouteKey = null;
   let routeRequestId = 0;
 
+  // Mobile: show full chrome when paused, auto-hide when playing resumes
+  let mobileChrome = true;
+  let mobileChromeTimer = null;
+
+  $: {
+    if ($isPlaying) {
+      // When playback starts, hide chrome after a short delay
+      clearTimeout(mobileChromeTimer);
+      mobileChromeTimer = setTimeout(() => { mobileChrome = false; }, 1500);
+    } else {
+      // When paused, show chrome immediately
+      clearTimeout(mobileChromeTimer);
+      mobileChrome = true;
+    }
+  }
+
   onMount(async () => {
+    startYomitanObserver();
     connectWebSocket();
     syncRouteFromLocation();
 
@@ -53,13 +71,6 @@
     disconnect();
     stopYomitanObserver();
   });
-
-  // Start/stop Yomitan observer reactively
-  $: if ($yomitanPause) {
-    startYomitanObserver();
-  } else {
-    stopYomitanObserver();
-  }
 
   $: progressPct = $durationMs > 0 ? ($positionMs / $durationMs) * 100 : 0;
   $: showAnkiWarning = $ankiStatus.state === 'disconnected';
@@ -122,9 +133,10 @@
 
 <svelte:window on:popstate={syncRouteFromLocation} />
 
-<div class="app">
+<div class="app" class:mobile-playing={$isPlaying && !mobileChrome}>
   <!-- Top bar -->
   <header class="topbar">
+    <!-- Desktop: full topbar always. Mobile-playing: compact. Mobile-paused: compact. -->
     <div class="topbar-left">
       <h1 class="logo">⛏ Nagare</h1>
       <div class="connection" class:online={$connected}>
@@ -136,7 +148,7 @@
       {#if $pendingCards.length > 0}
         <span class="badge">{$pendingCards.length}</span>
       {/if}
-      <nav>
+      <nav class="desktop-nav">
         <button
           class:active={$currentView === 'timeline'}
           on:click={() => currentView.set('timeline')}
@@ -156,6 +168,11 @@
           ⚙
         </button>
       </nav>
+    </div>
+    <!-- Mobile compact: show title + time inline when playing -->
+    <div class="topbar-np">
+      <span class="topbar-np-title">{$nowPlayingTitle}</span>
+      <span class="topbar-np-time">{formatTimeFull($positionMs)} / {formatTimeFull($durationMs)}</span>
     </div>
   </header>
 
@@ -180,7 +197,7 @@
     </div>
   {/if}
 
-  <!-- Now playing bar -->
+  <!-- Now playing bar (desktop only) -->
   <div class="now-playing">
     <div class="np-info">
       <MediaRemote />
@@ -191,6 +208,36 @@
     </div>
     <div class="np-progress">
       <div class="np-progress-fill" style="width: {progressPct}%"></div>
+    </div>
+  </div>
+
+  <!-- Mobile paused overlay: nav + settings, overlays on top of content -->
+  <div class="mobile-chrome-overlay" class:visible={mobileChrome}>
+    <nav class="mobile-chrome-nav">
+      <button
+        class:active={$currentView === 'timeline'}
+        on:click={() => currentView.set('timeline')}
+      >
+        Subtitles
+        {#if $pendingCards.length > 0}
+          <span class="badge">{$pendingCards.length}</span>
+        {/if}
+      </button>
+      <button
+        class:active={$currentView === 'history'}
+        on:click={() => currentView.set('history')}
+      >
+        History
+      </button>
+      <button
+        class:active={$currentView === 'config'}
+        on:click={() => currentView.set('config')}
+      >
+        Settings
+      </button>
+    </nav>
+    <div class="mobile-chrome-settings">
+      <MediaRemote settingsOnly />
     </div>
   </div>
 
@@ -205,14 +252,30 @@
     {/if}
   </main>
 
+  <!-- Mobile bottom bar: media controls when playing, nav handles when paused (via overlay) -->
+  <div class="mobile-bottom-bar">
+    <div class="mobile-bottom-remote">
+      <MediaRemote compact />
+    </div>
+    <div class="np-progress mobile-progress">
+      <div class="np-progress-fill" style="width: {progressPct}%"></div>
+    </div>
+  </div>
+
   <!-- Enrichment dialog (modal overlay) -->
   <EnrichDialog />
+
+  <!-- Audio track selection modal -->
+  <AudioTrackModal />
 
   <!-- Toast notifications -->
   <ToastContainer />
 </div>
 
 <style>
+  /* ══════════════════════════════════════
+     Desktop layout (unchanged)
+     ══════════════════════════════════════ */
   .app {
     display: flex;
     flex-direction: column;
@@ -241,6 +304,11 @@
     gap: 0.75rem;
   }
 
+  /* Hidden on desktop — only shows on mobile during playback */
+  .topbar-np {
+    display: none;
+  }
+
   .logo {
     font-size: 1.1rem;
     font-weight: 700;
@@ -257,12 +325,12 @@
     color: var(--success);
   }
 
-  nav {
+  .desktop-nav {
     display: flex;
     gap: 0.25rem;
   }
 
-  nav button {
+  .desktop-nav button {
     font-size: 0.85rem;
     padding: 0.3rem 0.75rem;
     background: transparent;
@@ -270,12 +338,12 @@
     color: var(--text-secondary);
   }
 
-  nav button:hover {
+  .desktop-nav button:hover {
     color: var(--text-primary);
     background: var(--bg-hover);
   }
 
-  nav button.active {
+  .desktop-nav button.active {
     color: var(--accent);
     border-bottom: 2px solid var(--accent);
   }
@@ -356,10 +424,6 @@
     color: var(--text-primary);
   }
 
-  .processing-copy:last-child {
-    min-width: 0;
-  }
-
   .spinner {
     width: 0.85rem;
     height: 0.85rem;
@@ -371,9 +435,7 @@
   }
 
   @keyframes spin {
-    to {
-      transform: rotate(360deg);
-    }
+    to { transform: rotate(360deg); }
   }
 
   .np-info {
@@ -415,23 +477,37 @@
     overflow: hidden;
     display: flex;
     flex-direction: column;
+    min-height: 0;
   }
 
-  /* ── Mobile ── */
+  /* Hidden on desktop */
+  .mobile-chrome-overlay {
+    display: none;
+  }
+  .mobile-bottom-bar {
+    display: none;
+  }
+
+  /* ══════════════════════════════════════
+     Mobile layout
+     ══════════════════════════════════════ */
   @media (max-width: 768px) {
-    .topbar {
-      flex-wrap: wrap;
-      padding: 0.4rem 0.5rem 0;
-      gap: 0;
+    .app {
+      padding-bottom: 0;
     }
 
-    /* Row 1: logo + dot + session selector */
+    /* ── Topbar: always visible, compact ── */
+    .topbar {
+      padding: 0.35rem 0.5rem;
+      gap: 0.4rem;
+      flex-wrap: wrap;
+    }
+
     .topbar-left {
       gap: 0.4rem;
       min-width: 0;
-      flex: 1 1 100%;
       overflow: hidden;
-      padding-bottom: 0.3rem;
+      flex: 1;
     }
 
     .logo {
@@ -439,46 +515,129 @@
       flex-shrink: 0;
     }
 
-    /* Row 2: badge + nav tabs — full width, tabs fill evenly */
+    /* Hide desktop nav + now-playing bar on mobile */
     .topbar-right {
-      flex: 1 1 100%;
-      gap: 0;
-      border-top: 1px solid var(--border);
-      position: relative;
+      display: none;
+    }
+    .now-playing {
+      display: none;
     }
 
-    .badge {
+    /* Compact now-playing info in topbar */
+    .topbar-np {
+      display: flex;
+      align-items: center;
+      gap: 0.4rem;
+      flex-basis: 100%;
+      min-width: 0;
+      padding-top: 0.2rem;
+      border-top: 1px solid var(--border);
+    }
+
+    .topbar-np-title {
+      flex: 1;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-size: 0.78rem;
+      font-weight: 500;
+      color: var(--text-primary);
+    }
+
+    .topbar-np-time {
+      font-variant-numeric: tabular-nums;
+      font-size: 0.7rem;
+      color: var(--text-secondary);
+      flex-shrink: 0;
+    }
+
+    /* ── Mobile chrome overlay: slides down when paused ── */
+    .mobile-chrome-overlay {
+      display: block;
       position: absolute;
-      top: 0.3rem;
+      top: 0;
+      left: 0;
       right: 0;
-      z-index: 2;
+      z-index: 50;
+      background: var(--bg-secondary);
+      border-bottom: 1px solid var(--border);
+      transform: translateY(-100%);
+      transition: transform 0.25s ease-out, opacity 0.25s ease-out;
+      opacity: 0;
       pointer-events: none;
     }
 
-    nav {
-      flex: 1;
-      gap: 0;
+    .mobile-chrome-overlay.visible {
+      transform: translateY(0);
+      opacity: 1;
+      pointer-events: auto;
       position: relative;
     }
 
-    nav button {
+    .mobile-chrome-nav {
+      display: flex;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .mobile-chrome-nav button {
       flex: 1;
       padding: 0.55rem 0.25rem;
-      font-size: 0.85rem;
-      min-height: 40px;
+      background: transparent;
+      border: none;
       border-radius: 0;
-      text-align: center;
       border-bottom: 2px solid transparent;
+      color: var(--text-secondary);
+      font-size: 0.82rem;
+      min-height: 38px;
+      text-align: center;
+      -webkit-tap-highlight-color: transparent;
     }
 
-    nav button.active {
-      border-bottom: 2px solid var(--accent);
+    .mobile-chrome-nav button:hover {
+      background: var(--bg-hover);
     }
 
-    .np-info {
-      flex-wrap: wrap;
-      padding: 0.4rem 0.5rem;
-      gap: 0.3rem;
+    .mobile-chrome-nav button.active {
+      color: var(--accent);
+      border-bottom-color: var(--accent);
+    }
+
+    .mobile-chrome-settings {
+      padding: 0.3rem 0.5rem;
+      border-top: 1px solid var(--border);
+    }
+
+    /* ── Bottom bar: always fixed at bottom on mobile ── */
+    .mobile-bottom-bar {
+      display: flex;
+      flex-direction: column;
+      position: fixed;
+      bottom: 0;
+      left: 0;
+      right: 0;
+      z-index: 100;
+      background: var(--bg-secondary);
+      border-top: 1px solid var(--border);
+      padding-bottom: env(safe-area-inset-bottom, 0);
+    }
+
+    .mobile-bottom-remote {
+      padding: 0.25rem 0;
+    }
+
+    .mobile-progress {
+      height: 3px;
+    }
+
+    /* Content needs bottom padding to not be hidden behind bottom bar */
+    .content {
+      padding-bottom: 56px;
+    }
+
+    /* Playing mode: hide session selector, hide topbar-np border separation */
+    .mobile-playing .topbar-np {
+      border-top: none;
+      padding-top: 0;
     }
 
     .warning-banner {
@@ -499,17 +658,6 @@
 
     .processing-list {
       margin-top: 0.2rem;
-    }
-
-    .np-title {
-      flex-basis: 100%;
-      order: 2;
-    }
-
-    .np-time {
-      font-size: 0.75rem;
-      order: 3;
-      margin-left: auto;
     }
   }
 </style>
