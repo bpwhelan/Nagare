@@ -1,7 +1,9 @@
 <script>
   import { onMount } from 'svelte';
   import { getConfig, updateConfig } from './api.js';
-  import { applyMiningConfig, showToast } from './stores.js';
+  import { applyMiningConfig, autoApprove, showToast } from './stores.js';
+
+  const AUTO_APPROVE_STORAGE_KEY = 'opt_autoApprove';
 
   let config = null;
   let loading = true;
@@ -10,6 +12,7 @@
   onMount(async () => {
     try {
       config = await getConfig();
+      migrateAutoApprove(config?.mining?.auto_approve);
       normalizeConfig();
     } catch (e) {
       console.error('Failed to load config:', e);
@@ -40,8 +43,14 @@
     if (config.mining.audio_start_offset_ms == null) config.mining.audio_start_offset_ms = 100;
     if (config.mining.audio_end_offset_ms == null) config.mining.audio_end_offset_ms = 500;
     if (config.mining.generate_avif == null) config.mining.generate_avif = true;
-    if (config.mining.auto_approve == null) config.mining.auto_approve = false;
+    delete config.mining.auto_approve;
     applyMiningConfig(config.mining);
+  }
+
+  function migrateAutoApprove(serverValue) {
+    if (serverValue == null) return;
+    if (localStorage.getItem(AUTO_APPROVE_STORAGE_KEY) != null) return;
+    autoApprove.set(Boolean(serverValue));
   }
 
   function updateServerField(kind, field, value) {
@@ -94,10 +103,17 @@
   async function save() {
     saving = true;
     try {
-      const result = await updateConfig(config);
+      const payload = {
+        ...config,
+        mining: { ...config.mining },
+      };
+      delete payload.mining.auto_approve;
+
+      const result = await updateConfig(payload);
       if (result.ok) {
-        applyMiningConfig(config.mining);
-        showToast('success', 'Configuration saved');
+        applyMiningConfig(payload.mining);
+        config = payload;
+        showToast('success', 'Server configuration saved');
       } else {
         showToast('error', result.error || 'Failed to save');
       }
@@ -127,6 +143,11 @@
   {#if loading}
     <p>Loading configuration...</p>
   {:else if config}
+    <section class="settings-part">
+      <h2>Server Settings</h2>
+      <p class="hint">Saved to the Nagare server and shared across clients.</p>
+    </section>
+
     <!-- ── Media Servers ────────────────────────────── -->
     <section class="section">
       <h2>Media Servers</h2>
@@ -412,9 +433,19 @@
           <label for="default-avif">Generate animated screenshot by default</label>
         </div>
       </div>
+    </section>
+
+    <section class="settings-part">
+      <h2>Client Settings</h2>
+      <p class="hint">Saved only in this browser.</p>
+    </section>
+
+    <section class="section">
+      <h2>Mining Options</h2>
       <div class="field">
+        <p class="hint">This setting is stored locally and applies only on this device.</p>
         <div class="checkbox-row">
-          <input id="auto-approve" type="checkbox" bind:checked={config.mining.auto_approve} />
+          <input id="auto-approve" type="checkbox" bind:checked={$autoApprove} />
           <label for="auto-approve">Auto-approve new cards with the default matched subtitle range</label>
         </div>
       </div>
@@ -423,7 +454,7 @@
     <!-- ── Save Button ──────────────────────────────── -->
     <div class="save-bar">
       <button class="btn-save" on:click={save} disabled={saving}>
-        {saving ? 'Saving...' : 'Save Configuration'}
+        {saving ? 'Saving...' : 'Save Server Settings'}
       </button>
     </div>
   {:else}
@@ -445,6 +476,16 @@
     background: var(--bg-card);
     border-radius: 8px;
     border: 1px solid var(--border);
+  }
+
+  .settings-part {
+    margin-bottom: 1rem;
+  }
+
+  .settings-part h2 {
+    margin: 0 0 0.25rem;
+    font-size: 1.2rem;
+    color: var(--text-primary);
   }
 
   .section h2 {

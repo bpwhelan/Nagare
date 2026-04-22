@@ -1,10 +1,48 @@
 <script>
-  import { subtitles, activeLineIndex, positionMs, isPlaying, pauseOnHover, pauseOnSeek, yomitanPause, durationMs, sessionState, showToast, setOptimisticPosition, setOptimisticPlayState } from './stores.js';
+  import { subtitles, activeLineIndex, positionMs, isPlaying, pauseOnHover, pauseOnSeek, yomitanPause, yomitanPopupVisible, durationMs, sessionState, showToast, setOptimisticPosition, setOptimisticPlayState } from './stores.js';
   import { fireSeek, firePlayPause } from './api.js';
+
+  export let compact = false;
+  export let settingsOnly = false;
+
+  let dismissingPopupPointerId = null;
+  let consumeNextSeekClick = false;
 
   $: remoteControlAvailable = $sessionState.now_playing?.supports_remote_control ?? false;
 
+  function handleSeekPointerDown(event) {
+    if ($yomitanPopupVisible) {
+      dismissingPopupPointerId = event.pointerId;
+    } else {
+      dismissingPopupPointerId = null;
+    }
+  }
+
+  function handleSeekPointerUp(event) {
+    if (dismissingPopupPointerId === event.pointerId) {
+      consumeNextSeekClick = true;
+      dismissingPopupPointerId = null;
+    }
+  }
+
+  function clearSeekPointer(event) {
+    if (dismissingPopupPointerId === event.pointerId) {
+      dismissingPopupPointerId = null;
+    }
+  }
+
+  function shouldIgnoreSeekAction() {
+    if (consumeNextSeekClick) {
+      consumeNextSeekClick = false;
+      return true;
+    }
+
+    return $yomitanPopupVisible;
+  }
+
   function runSeek(target) {
+    if (shouldIgnoreSeekAction()) return;
+
     if (!remoteControlAvailable) {
       showToast('error', 'Playback controls are unavailable for this player');
       return;
@@ -68,29 +106,33 @@
 </script>
 
 <div class="remote">
-  <button class="remote-btn" on:click={prevSubtitle} title="Previous subtitle" disabled={!remoteControlAvailable}>⏮</button>
-  <button class="remote-btn" on:click={back5} title="Back 5s" disabled={!remoteControlAvailable}>−5</button>
-  <button class="remote-btn play" on:click={togglePlayPause} title={$isPlaying ? 'Pause' : 'Play'} disabled={!remoteControlAvailable}>
-    {$isPlaying ? '⏸' : '▶'}
-  </button>
-  <button class="remote-btn" on:click={forward10} title="Forward 10s" disabled={!remoteControlAvailable}>+10</button>
-  <button class="remote-btn" on:click={nextSubtitle} title="Next subtitle" disabled={!remoteControlAvailable}>⏭</button>
+  {#if !settingsOnly}
+    <button class="remote-btn" aria-disabled={$yomitanPopupVisible} on:pointerdown={handleSeekPointerDown} on:pointerup={handleSeekPointerUp} on:pointercancel={clearSeekPointer} on:click={prevSubtitle} title={$yomitanPopupVisible ? 'Dismiss the Yomitan popup first' : 'Previous subtitle'} disabled={!remoteControlAvailable}>⏮</button>
+    <button class="remote-btn" aria-disabled={$yomitanPopupVisible} on:pointerdown={handleSeekPointerDown} on:pointerup={handleSeekPointerUp} on:pointercancel={clearSeekPointer} on:click={back5} title={$yomitanPopupVisible ? 'Dismiss the Yomitan popup first' : 'Back 5s'} disabled={!remoteControlAvailable}>−5</button>
+    <button class="remote-btn play" on:click={togglePlayPause} title={$isPlaying ? 'Pause' : 'Play'} disabled={!remoteControlAvailable}>
+      {$isPlaying ? '⏸' : '▶'}
+    </button>
+    <button class="remote-btn" aria-disabled={$yomitanPopupVisible} on:pointerdown={handleSeekPointerDown} on:pointerup={handleSeekPointerUp} on:pointercancel={clearSeekPointer} on:click={forward10} title={$yomitanPopupVisible ? 'Dismiss the Yomitan popup first' : 'Forward 10s'} disabled={!remoteControlAvailable}>+10</button>
+    <button class="remote-btn" aria-disabled={$yomitanPopupVisible} on:pointerdown={handleSeekPointerDown} on:pointerup={handleSeekPointerUp} on:pointercancel={clearSeekPointer} on:click={nextSubtitle} title={$yomitanPopupVisible ? 'Dismiss the Yomitan popup first' : 'Next subtitle'} disabled={!remoteControlAvailable}>⏭</button>
+  {/if}
 
-  <label class="hover-pause" title="Pause video while hovering the active subtitle line">
-    <input type="checkbox" bind:checked={$pauseOnHover} />
-    <span>Hover-pause</span>
-  </label>
-  <label class="hover-pause" title="Pause video when clicking a subtitle line">
-    <input type="checkbox" bind:checked={$pauseOnSeek} />
-    <span>Click-pause</span>
-  </label>
-  <label class="hover-pause" title="Pause when Yomitan popup appears, resume when it closes">
-    <input type="checkbox" bind:checked={$yomitanPause} />
-    <span>Yomitan-pause</span>
-  </label>
+  {#if !compact}
+    <label class="hover-pause" title="Pause video while hovering the active subtitle line">
+      <input type="checkbox" bind:checked={$pauseOnHover} />
+      <span>Hover-pause</span>
+    </label>
+    <label class="hover-pause" title="Pause video when clicking a subtitle line">
+      <input type="checkbox" bind:checked={$pauseOnSeek} />
+      <span>Click-pause</span>
+    </label>
+    <label class="hover-pause" title="Pause when Yomitan popup appears, resume when it closes">
+      <input type="checkbox" bind:checked={$yomitanPause} />
+      <span>Yomitan-pause</span>
+    </label>
 
-  {#if $sessionState.now_playing && !remoteControlAvailable}
-    <span class="warning">This player is not exposing server-side remote control.</span>
+    {#if $sessionState.now_playing && !remoteControlAvailable}
+      <span class="warning">This player is not exposing server-side remote control.</span>
+    {/if}
   {/if}
 </div>
 

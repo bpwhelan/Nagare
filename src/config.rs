@@ -165,6 +165,9 @@ pub struct MiningConfig {
     #[serde(default = "default_true")]
     pub generate_avif: bool,
 
+    /// Legacy server-side setting kept temporarily so existing configs can be
+    /// migrated into client-side local storage. It is ignored by the backend
+    /// and stripped when the config is written back to disk.
     #[serde(default)]
     pub auto_approve: bool,
 }
@@ -198,8 +201,17 @@ impl Config {
     pub fn load_or_default(path: &Path) -> Self {
         if path.exists() {
             match std::fs::read_to_string(path) {
-                Ok(content) => match serde_json::from_str(&content) {
-                    Ok(config) => return config,
+                Ok(content) => match serde_json::from_str::<Config>(&content) {
+                    Ok(config) => {
+                        if config.mining.auto_approve {
+                            tracing::warn!(
+                                "Legacy server-side mining.auto_approve is set in {:?}; \
+                                 this setting is now client-local and will be ignored by the backend",
+                                path
+                            );
+                        }
+                        return config;
+                    }
                     Err(e) => {
                         tracing::warn!("Failed to parse config from {:?}: {}", path, e);
                     }
@@ -214,7 +226,11 @@ impl Config {
 
     /// Save config to a JSON file (atomic write).
     pub fn save_to(&self, path: &Path) -> anyhow::Result<()> {
-        let json = serde_json::to_string_pretty(self)?;
+        let mut json_value = serde_json::to_value(self)?;
+        if let Some(mining) = json_value.get_mut("mining").and_then(|value| value.as_object_mut()) {
+            mining.remove("auto_approve");
+        }
+        let json = serde_json::to_string_pretty(&json_value)?;
         // Write to temp file then rename for atomicity
         let tmp_path = path.with_extension("json.tmp");
         std::fs::write(&tmp_path, &json)?;

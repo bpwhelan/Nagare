@@ -171,6 +171,9 @@ async fn main() -> anyhow::Result<()> {
     let subtitle_candidates = session_manager.subtitle_candidates();
     let subtitle_history = session_manager.subtitle_history();
     let history = session_manager.history();
+    let audio_tracks = session_manager.audio_tracks();
+    let selected_audio_track = session_manager.selected_audio_track();
+    let audio_track_resolution = session_manager.audio_track_resolution();
 
     // Build shared app state
     let (enhancement_result_tx, _) = tokio::sync::broadcast::channel(16);
@@ -194,6 +197,9 @@ async fn main() -> anyhow::Result<()> {
         pending_enrichments: Arc::new(RwLock::new(Vec::new())),
         enhancement_result_tx,
         remote_result_tx,
+        audio_tracks,
+        selected_audio_track,
+        audio_track_resolution,
     });
 
     // Start background tasks

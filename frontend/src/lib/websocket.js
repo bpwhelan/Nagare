@@ -1,5 +1,5 @@
 import { get } from 'svelte/store';
-import { activeHistoryItemId, sessionState, pendingCards, connected, ankiStatus, enhancementQueue, syncPositionFromSessionState, isSeekLocked, isPlayLocked, applySubtitlePayload, showToast } from './stores.js';
+import { activeHistoryItemId, sessionState, pendingCards, connected, ankiStatus, enhancementQueue, syncPositionFromSessionState, isSeekLocked, isPlayLocked, applySubtitlePayload, applyAudioTracksPayload, showToast } from './stores.js';
 
 let ws = null;
 let reconnectTimer = null;
@@ -60,6 +60,9 @@ function handleMessage(msg) {
       }
       if (msg.subtitles && !get(activeHistoryItemId)) {
         applySubtitlePayload(msg.subtitles);
+      }
+      if (msg.audio_tracks) {
+        applyAudioTracksPayload(msg.audio_tracks);
       }
       break;
 

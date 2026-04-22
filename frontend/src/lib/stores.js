@@ -47,10 +47,11 @@ export const currentView = writable('timeline'); // 'timeline' | 'history' | 'co
 export const pauseOnHover = localStorageStore('opt_pauseOnHover', false);
 export const pauseOnSeek = localStorageStore('opt_pauseOnSeek', false);
 export const yomitanPause = localStorageStore('opt_yomitanPause', false);
+export const yomitanPopupVisible = writable(false);
 export const audioStartOffset = writable(100);
 export const audioEndOffset = writable(500);
 export const defaultGenerateAvif = writable(true);
-export const autoApprove = writable(false);
+export const autoApprove = localStorageStore('opt_autoApprove', false);
 
 // History
 export const historyItems = writable(/** @type {any[]} */ ([]));
@@ -58,6 +59,28 @@ export const minedHistoryItems = writable(/** @type {any[]} */ ([]));
 /// When mining from history, the active history item_id
 export const activeHistoryItemId = writable(/** @type {string|null} */ (null));
 export const dialogCard = writable(/** @type {NewCardWithMatch|null} */ (null));
+
+// Audio tracks
+/** @typedef {{ index: number, codec: string|null, language: string|null, display_title: string|null, title: string|null, is_default: boolean, channels: string|null }} AudioTrack */
+/** @typedef {{ tracks: AudioTrack[], selected_index: number|null, resolution: 'single'|'auto_language'|'manual'|'needs_selection' }} AudioTracksPayload */
+export const audioTracks = writable(/** @type {AudioTrack[]} */ ([]));
+export const selectedAudioTrackIndex = writable(/** @type {number|null} */ (null));
+export const audioTrackResolution = writable(/** @type {'single'|'auto_language'|'manual'|'needs_selection'} */ ('single'));
+export const showAudioTrackModal = writable(false);
+
+/**
+ * @param {AudioTracksPayload | null | undefined} payload
+ */
+export function applyAudioTracksPayload(payload) {
+  audioTracks.set(payload?.tracks || []);
+  selectedAudioTrackIndex.set(payload?.selected_index ?? null);
+  const resolution = payload?.resolution || 'single';
+  audioTrackResolution.set(resolution);
+  // Auto-show modal when user must choose
+  if (resolution === 'needs_selection') {
+    showAudioTrackModal.set(true);
+  }
+}
 
 function parseRoute(pathname = location.pathname) {
   const noteMatch = pathname.match(/^\/mine\/note\/(\d+)$/);
@@ -93,7 +116,6 @@ export function applyMiningConfig(mining = {}) {
   audioStartOffset.set(mining.audio_start_offset_ms ?? 100);
   audioEndOffset.set(mining.audio_end_offset_ms ?? 500);
   defaultGenerateAvif.set(mining.generate_avif ?? true);
-  autoApprove.set(Boolean(mining.auto_approve));
 }
 
 /**

@@ -50,6 +50,12 @@ pub struct AppState {
     pub enhancement_result_tx: broadcast::Sender<EnhancementResult>,
     /// Broadcast channel for remote control results (seek/play/pause).
     pub remote_result_tx: broadcast::Sender<RemoteControlResult>,
+    /// Audio tracks for the current media item.
+    pub audio_tracks: Arc<RwLock<Vec<crate::session::AudioTrack>>>,
+    /// The currently selected audio stream index (absolute).
+    pub selected_audio_track: Arc<RwLock<Option<u32>>>,
+    /// How the audio track was resolved.
+    pub audio_track_resolution: Arc<RwLock<crate::session::AudioTrackResolution>>,
 }
 
 pub fn create_router(state: Arc<AppState>) -> Router {
@@ -81,6 +87,9 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/subtitle/matches", post(subtitle_matches))
         .route("/api/preview-audio", post(preview_audio_url))
         .route("/api/preview-screenshot", post(preview_screenshot))
+        .route("/api/audio-tracks", get(get_audio_tracks))
+        .route("/api/audio-tracks/select", post(select_audio_track))
+        .route("/api/audio-tracks/preview", post(preview_audio_track))
         .route("/ws", get(ws_handler))
         .with_state(state)
 }
@@ -516,29 +525,6 @@ async fn prepare_enrichment_candidate(
     })
 }
 
-fn default_request_from_candidate(
-    candidate: &EnrichmentDialogState,
-    config: &Config,
-    track: &SubtitleTrack,
-) -> Option<EnrichRequest> {
-    let matched_line_index = candidate.matched_line_index?;
-    let line = track
-        .lines
-        .iter()
-        .find(|line| line.index == matched_line_index)?;
-    Some(EnrichRequest {
-        note_id: candidate.event.note_id,
-        sentence: Some(candidate.event.sentence.clone()),
-        start_ms: (line.start_ms - config.mining.audio_start_offset_ms).max(0),
-        end_ms: line.end_ms + config.mining.audio_end_offset_ms,
-        generate_avif: config.mining.generate_avif,
-        matched_line_index: Some(matched_line_index),
-        included_line_first: Some(matched_line_index),
-        included_line_last: Some(matched_line_index),
-        item_id: candidate.history_id.clone(),
-    })
-}
-
 async fn queue_pending_enrichment(state: &Arc<AppState>, candidate: EnrichmentDialogState) {
     {
         let mut pending = state.pending_enrichments.write().await;
@@ -900,7 +886,8 @@ async fn perform_enrichment(
         info!("[enhance {}] Media source resolved", note_id);
 
         info!("[enhance {}] Extracting audio ({}ms - {}ms)...", note_id, req.start_ms, req.end_ms);
-        let (audio_path, audio_data) = media::extract_audio(&source, req.start_ms, req.end_ms)
+        let audio_track_index = *state.selected_audio_track.read().await;
+        let (audio_path, audio_data) = media::extract_audio(&source, req.start_ms, req.end_ms, audio_track_index)
             .await
             .map_err(|error| format!("Audio extraction failed: {}", error))?;
         let audio_filename = format!("nagare_{}_{}.opus", media_ctx.item_id, req.start_ms);
@@ -1013,36 +1000,6 @@ pub async fn run_new_card_processor(state: Arc<AppState>, mut rx: mpsc::Receiver
         let Some(candidate) = prepare_enrichment_candidate(&state, event).await else {
             continue;
         };
-
-        let auto_approve = state.config.read().await.mining.auto_approve;
-        if auto_approve {
-            let track = if let Some(history_id) = candidate.history_id.as_deref() {
-                state.subtitle_history.read().await.get(history_id).cloned()
-            } else {
-                state.subtitles.read().await.clone()
-            };
-
-            if let Some(track) = track {
-                let config = state.config.read().await.clone();
-                if let Some(req) = default_request_from_candidate(&candidate, &config, &track) {
-                    match enqueue_enhancement_job(&state, req, Some(candidate.clone())).await {
-                        Ok(()) => {
-                            info!(
-                                "Auto-approved note {} and queued enhancement",
-                                candidate.event.note_id
-                            );
-                            continue;
-                        }
-                        Err(error) => {
-                            warn!(
-                                "Auto-approve queue failed for note {}: {}. Falling back to manual review.",
-                                candidate.event.note_id, error
-                            );
-                        }
-                    }
-                }
-            }
-        }
 
         queue_pending_enrichment(&state, candidate).await;
     }
@@ -1453,7 +1410,8 @@ async fn preview_audio_url(
         }
     };
 
-    match media::extract_audio(&source, req.start_ms, req.end_ms).await {
+    let audio_track_index = *state.selected_audio_track.read().await;
+    match media::extract_audio(&source, req.start_ms, req.end_ms, audio_track_index).await {
         Ok((path, data)) => {
             let b64 = media::to_base64(&data);
             media::cleanup_temp_file(&path).await;
@@ -1513,6 +1471,94 @@ async fn preview_screenshot(
     }
 }
 
+// === Audio Track Management ===
+
+async fn get_audio_tracks(
+    State(state): State<Arc<AppState>>,
+) -> Json<serde_json::Value> {
+    let data = audio_tracks_data(&state).await;
+    Json(serde_json::json!(data))
+}
+
+#[derive(Deserialize)]
+struct SelectAudioTrackRequest {
+    stream_index: u32,
+}
+
+async fn select_audio_track(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<SelectAudioTrackRequest>,
+) -> Json<serde_json::Value> {
+    state.session_manager.select_audio_track(req.stream_index).await;
+    let data = audio_tracks_data(&state).await;
+    Json(serde_json::json!({"ok": true, "audio_tracks": data}))
+}
+
+/// Extract a short audio snippet (~5 s) from a specific track for preview purposes.
+/// The snippet is taken from approximately 15 minutes (900 000 ms) into the media,
+/// or from the mid-point of the duration if the media is shorter than 15 minutes.
+#[derive(Deserialize)]
+struct PreviewAudioTrackRequest {
+    stream_index: u32,
+    item_id: Option<String>,
+}
+
+async fn preview_audio_track(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<PreviewAudioTrackRequest>,
+) -> Json<serde_json::Value> {
+    let media_ctx = match resolve_media_context(&state, req.item_id.as_deref()).await {
+        Ok(ctx) => ctx,
+        Err(error) => return Json(serde_json::json!({"error": error})),
+    };
+    let config = state.config.read().await.clone();
+    let server_opt = get_server(&state, media_ctx.server_kind).await;
+
+    let source = match media::resolve_media_source(
+        &config,
+        server_opt.as_deref(),
+        &media_ctx.item_id,
+        &media_ctx.media_source_id,
+        media_ctx.file_path.as_deref(),
+    ) {
+        Ok(source) => source,
+        Err(e) => {
+            return Json(serde_json::json!({
+                "error": format!("Failed to resolve media source: {}", e)
+            }));
+        }
+    };
+
+    // Pick a sample point: prefer ~15 min in, else mid-point of known duration, else 60 s.
+    let session_state = state.session_rx.borrow().clone();
+    let duration_ms = session_state
+        .now_playing
+        .as_ref()
+        .and_then(|np| np.duration_ms)
+        .unwrap_or(0);
+    let sample_start_ms = if duration_ms > 900_000 {
+        900_000i64
+    } else if duration_ms > 10_000 {
+        duration_ms / 2
+    } else {
+        0
+    };
+    let snippet_duration_ms = 5_000i64;
+    let end_ms = (sample_start_ms + snippet_duration_ms).min(duration_ms.max(snippet_duration_ms));
+
+    match media::extract_audio(&source, sample_start_ms, end_ms, Some(req.stream_index)).await {
+        Ok((path, data)) => {
+            let b64 = media::to_base64(&data);
+            media::cleanup_temp_file(&path).await;
+            Json(serde_json::json!({
+                "audio_base64": b64,
+                "format": "opus",
+            }))
+        }
+        Err(e) => Json(serde_json::json!({"error": e.to_string()})),
+    }
+}
+
 // === WebSocket Handler ===
 
 async fn ws_handler(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -1539,6 +1585,15 @@ struct WsMessage {
     enhancement_result: Option<EnhancementResult>,
     #[serde(skip_serializing_if = "Option::is_none")]
     remote_result: Option<RemoteControlResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    audio_tracks: Option<AudioTracksData>,
+}
+
+#[derive(Serialize, Clone, PartialEq)]
+struct AudioTracksData {
+    tracks: Vec<crate::session::AudioTrack>,
+    selected_index: Option<u32>,
+    resolution: crate::session::AudioTrackResolution,
 }
 
 #[derive(Serialize)]
@@ -1548,6 +1603,17 @@ struct SubtitleData {
     candidates: Vec<SubtitleCandidate>,
     selected_candidate_id: Option<String>,
     selection_mode: SubtitleSelectionMode,
+}
+
+async fn audio_tracks_data(state: &Arc<AppState>) -> AudioTracksData {
+    let tracks = state.audio_tracks.read().await.clone();
+    let selected_index = *state.selected_audio_track.read().await;
+    let resolution = *state.audio_track_resolution.read().await;
+    AudioTracksData {
+        tracks,
+        selected_index,
+        resolution,
+    }
 }
 
 async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
@@ -1588,6 +1654,7 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
             enhancement_queue: Some(current_enhancement_queue),
             enhancement_result: None,
             remote_result: None,
+            audio_tracks: Some(audio_tracks_data(&state).await),
         };
 
         if let Ok(json) = serde_json::to_string(&init_msg) {
@@ -1607,6 +1674,10 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
         )> = None;
         let mut last_anki_status: Option<AnkiStatus> = None;
         let mut last_enhancement_queue: Vec<EnhancementQueueItem> = Vec::new();
+        let mut last_audio_tracks: Option<AudioTracksData> = None;
+        let audio_tracks_arc = state.audio_tracks.clone();
+        let selected_audio_arc = state.selected_audio_track.clone();
+        let audio_resolution_arc = state.audio_track_resolution.clone();
 
         loop {
             tokio::select! {
@@ -1661,14 +1732,27 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
                         last_enhancement_queue = current_enhancement_queue.clone();
                     }
 
+                    // Audio tracks change detection
+                    let current_audio_data = AudioTracksData {
+                        tracks: audio_tracks_arc.read().await.clone(),
+                        selected_index: *selected_audio_arc.read().await,
+                        resolution: *audio_resolution_arc.read().await,
+                    };
+                    let send_audio = last_audio_tracks.as_ref() != Some(&current_audio_data);
+                    if send_audio {
+                        last_audio_tracks = Some(current_audio_data.clone());
+                    }
+
                     let active_line = if let (Some(track), Some(np)) = (subs.as_ref(), &session_state.now_playing) {
                         track.line_at_time(np.position_ms).or_else(|| track.nearest_line(np.position_ms))
                     } else {
                         None
                     };
 
+                    let is_full_update = send_subs || send_audio;
+
                     let msg = WsMessage {
-                        msg_type: if send_subs { "full_update".to_string() } else { "position".to_string() },
+                        msg_type: if is_full_update { "full_update".to_string() } else { "position".to_string() },
                         state: Some(session_state),
                         subtitles: if send_subs {
                             Some(subtitle_data)
@@ -1689,6 +1773,11 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
                         },
                         enhancement_result: None,
                         remote_result: None,
+                        audio_tracks: if send_audio {
+                            Some(current_audio_data)
+                        } else {
+                            None
+                        },
                     };
 
                     if let Ok(json) = serde_json::to_string(&msg) {
@@ -1717,6 +1806,7 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
                         enhancement_queue: None,
                         enhancement_result: None,
                         remote_result: None,
+                        audio_tracks: None,
                     };
 
                     if let Ok(json) = serde_json::to_string(&msg) {
@@ -1745,6 +1835,7 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
                         enhancement_queue: None,
                         enhancement_result: Some(enhancement_result),
                         remote_result: None,
+                        audio_tracks: None,
                     };
 
                     if let Ok(json) = serde_json::to_string(&msg) {
@@ -1773,6 +1864,7 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
                         enhancement_queue: None,
                         enhancement_result: None,
                         remote_result: Some(remote_result),
+                        audio_tracks: None,
                     };
 
                     if let Ok(json) = serde_json::to_string(&msg) {
