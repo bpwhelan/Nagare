@@ -227,7 +227,10 @@ impl Config {
     /// Save config to a JSON file (atomic write).
     pub fn save_to(&self, path: &Path) -> anyhow::Result<()> {
         let mut json_value = serde_json::to_value(self)?;
-        if let Some(mining) = json_value.get_mut("mining").and_then(|value| value.as_object_mut()) {
+        if let Some(mining) = json_value
+            .get_mut("mining")
+            .and_then(|value| value.as_object_mut())
+        {
             mining.remove("auto_approve");
         }
         let json = serde_json::to_string_pretty(&json_value)?;

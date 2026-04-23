@@ -356,7 +356,11 @@ async fn resolve_media_context(
             .map(history_entry_to_media_context)
             .ok_or_else(|| format!("Item not found in history: {}", history_id));
         if result.is_err() {
-            warn!("[media_ctx] history_id={} NOT FOUND (history has {} entries)", history_id, hist.len());
+            warn!(
+                "[media_ctx] history_id={} NOT FOUND (history has {} entries)",
+                history_id,
+                hist.len()
+            );
         }
         return result;
     }
@@ -364,7 +368,10 @@ async fn resolve_media_context(
     info!("[media_ctx] No history_id, checking now_playing...");
     let session_state = state.session_rx.borrow().clone();
     if let Some(np) = session_state.now_playing {
-        info!("[media_ctx] Using now_playing: {} ({})", np.title, np.item_id);
+        info!(
+            "[media_ctx] Using now_playing: {} ({})",
+            np.title, np.item_id
+        );
         return Ok(MediaContext {
             server_kind: np.server_kind,
             item_id: np.item_id,
@@ -455,6 +462,20 @@ async fn remove_pending_enrichment(state: &Arc<AppState>, note_id: i64) {
     pending.retain(|entry| entry.event.note_id != note_id);
 }
 
+async fn resolve_audio_mapping(
+    state: &Arc<AppState>,
+    stream_index: Option<u32>,
+) -> (Option<u32>, Option<usize>) {
+    let audio_ordinal = if let Some(index) = stream_index {
+        let tracks = state.audio_tracks.read().await;
+        tracks.iter().position(|track| track.index == index)
+    } else {
+        None
+    };
+
+    (stream_index, audio_ordinal)
+}
+
 async fn prepare_enrichment_candidate(
     state: &Arc<AppState>,
     event: NewCardEvent,
@@ -474,8 +495,7 @@ async fn prepare_enrichment_candidate(
         .map(|now_playing| now_playing.history_id.clone());
 
     // Try time-windowed match first (±30s around playback position)
-    let mut matched_line_index =
-        find_matching_line(track, &event.sentence, position_ms, 30_000);
+    let mut matched_line_index = find_matching_line(track, &event.sentence, position_ms, 30_000);
 
     // Fall back to a global match across the entire subtitle track.
     // Cards should be accepted whenever we have subs loaded and a match exists,
@@ -599,7 +619,11 @@ async fn enqueue_enhancement_job(
             state: EnhancementQueueState::Queued,
             message: enhancement_queue_message(note_id, EnhancementQueueState::Queued),
         });
-        info!("[enqueue] note {} — added to queue (queue size: {})", note_id, queue.len());
+        info!(
+            "[enqueue] note {} — added to queue (queue size: {})",
+            note_id,
+            queue.len()
+        );
     }
 
     state
@@ -621,12 +645,12 @@ const ENHANCEMENT_WORKERS: usize = 3;
 
 /// Spawns a pool of workers that process enhancement jobs concurrently.
 /// Each worker pulls from the shared channel independently.
-pub async fn run_enhancement_worker_pool(
-    state: Arc<AppState>,
-    rx: mpsc::Receiver<EnhancementJob>,
-) {
+pub async fn run_enhancement_worker_pool(state: Arc<AppState>, rx: mpsc::Receiver<EnhancementJob>) {
     let shared_rx = Arc::new(tokio::sync::Mutex::new(rx));
-    info!("[pool] Starting {} enhancement workers", ENHANCEMENT_WORKERS);
+    info!(
+        "[pool] Starting {} enhancement workers",
+        ENHANCEMENT_WORKERS
+    );
 
     let mut handles = Vec::new();
     for worker_id in 0..ENHANCEMENT_WORKERS {
@@ -731,7 +755,10 @@ async fn enhancement_worker_loop(
         };
 
         let _ = state.enhancement_result_tx.send(enhancement_result);
-        info!("[worker-{}] Finished note {}, ready for next job", worker_id, note_id);
+        info!(
+            "[worker-{}] Finished note {}, ready for next job",
+            worker_id, note_id
+        );
     }
 }
 
@@ -860,11 +887,18 @@ async fn perform_enrichment(
 ) -> Result<(), String> {
     let note_id = req.note_id;
     let result = async {
-        info!("[enhance {}] Resolving media context (item_id={:?})...", note_id, req.item_id);
+        info!(
+            "[enhance {}] Resolving media context (item_id={:?})...",
+            note_id, req.item_id
+        );
         let media_ctx = resolve_media_context(state, req.item_id.as_deref()).await?;
         info!(
             "[enhance {}] Media context resolved: {} (server={:?}, item={}, source={})",
-            note_id, media_ctx.title, media_ctx.server_kind, media_ctx.item_id, media_ctx.media_source_id
+            note_id,
+            media_ctx.title,
+            media_ctx.server_kind,
+            media_ctx.item_id,
+            media_ctx.media_source_id
         );
 
         info!("[enhance {}] Reading config...", note_id);
@@ -885,14 +919,30 @@ async fn perform_enrichment(
         .map_err(|error| format!("Failed to resolve media source: {}", error))?;
         info!("[enhance {}] Media source resolved", note_id);
 
-        info!("[enhance {}] Extracting audio ({}ms - {}ms)...", note_id, req.start_ms, req.end_ms);
-        let audio_track_index = *state.selected_audio_track.read().await;
-        let (audio_path, audio_data) = media::extract_audio(&source, req.start_ms, req.end_ms, audio_track_index)
-            .await
-            .map_err(|error| format!("Audio extraction failed: {}", error))?;
+        info!(
+            "[enhance {}] Extracting audio ({}ms - {}ms)...",
+            note_id, req.start_ms, req.end_ms
+        );
+        let selected_audio_track = *state.selected_audio_track.read().await;
+        let (audio_track_index, audio_track_ordinal) =
+            resolve_audio_mapping(&state, selected_audio_track).await;
+        let (audio_path, audio_data) = media::extract_audio(
+            &source,
+            req.start_ms,
+            req.end_ms,
+            audio_track_index,
+            audio_track_ordinal,
+        )
+        .await
+        .map_err(|error| format!("Audio extraction failed: {}", error))?;
         let audio_filename = format!("nagare_{}_{}.opus", media_ctx.item_id, req.start_ms);
         let audio_b64 = media::to_base64(&audio_data);
-        info!("[enhance {}] Audio extracted ({} bytes), storing in Anki as {}...", note_id, audio_data.len(), audio_filename);
+        info!(
+            "[enhance {}] Audio extracted ({} bytes), storing in Anki as {}...",
+            note_id,
+            audio_data.len(),
+            audio_filename
+        );
 
         if let Err(error) = anki_client
             .store_media_file(&audio_filename, &audio_b64)
@@ -906,13 +956,21 @@ async fn perform_enrichment(
         let mut picture_html = String::new();
         let mid_ms = (req.start_ms + req.end_ms) / 2;
         if req.generate_avif {
-            info!("[enhance {}] Generating AVIF ({}ms - {}ms)...", note_id, req.start_ms, req.end_ms);
+            info!(
+                "[enhance {}] Generating AVIF ({}ms - {}ms)...",
+                note_id, req.start_ms, req.end_ms
+            );
             match media::generate_avif(&source, req.start_ms, req.end_ms).await {
                 Ok((avif_path, avif_data)) => {
                     let avif_filename =
                         format!("nagare_{}_{}.avif", media_ctx.item_id, req.start_ms);
                     let avif_b64 = media::to_base64(&avif_data);
-                    info!("[enhance {}] AVIF generated ({} bytes), storing as {}...", note_id, avif_data.len(), avif_filename);
+                    info!(
+                        "[enhance {}] AVIF generated ({} bytes), storing as {}...",
+                        note_id,
+                        avif_data.len(),
+                        avif_filename
+                    );
                     if let Err(error) = anki_client
                         .store_media_file(&avif_filename, &avif_b64)
                         .await
@@ -925,7 +983,10 @@ async fn perform_enrichment(
                     media::cleanup_temp_file(&avif_path).await;
                 }
                 Err(error) => {
-                    warn!("[enhance {}] AVIF generation failed (continuing without): {}", note_id, error);
+                    warn!(
+                        "[enhance {}] AVIF generation failed (continuing without): {}",
+                        note_id, error
+                    );
                 }
             }
         } else {
@@ -934,7 +995,10 @@ async fn perform_enrichment(
 
         if picture_html.is_empty() {
             if req.generate_avif {
-                info!("[enhance {}] No AVIF stored, falling back to screenshot...", note_id);
+                info!(
+                    "[enhance {}] No AVIF stored, falling back to screenshot...",
+                    note_id
+                );
             }
             if let Some(screenshot_html) = generate_and_store_screenshot(
                 &anki_client,
@@ -966,7 +1030,11 @@ async fn perform_enrichment(
             }
         }
 
-        info!("[enhance {}] Updating note fields in Anki ({} fields)...", note_id, fields.len());
+        info!(
+            "[enhance {}] Updating note fields in Anki ({} fields)...",
+            note_id,
+            fields.len()
+        );
         if let Err(error) = anki_client
             .update_note_fields(req.note_id, fields, None, None)
             .await
@@ -1020,7 +1088,11 @@ async fn enrich_card(
             .iter()
             .find(|entry| entry.event.note_id == note_id)
             .cloned();
-        info!("[REST] note {} — pending fallback: {}", note_id, found.is_some());
+        info!(
+            "[REST] note {} — pending fallback: {}",
+            note_id,
+            found.is_some()
+        );
         found
     };
 
@@ -1410,8 +1482,18 @@ async fn preview_audio_url(
         }
     };
 
-    let audio_track_index = *state.selected_audio_track.read().await;
-    match media::extract_audio(&source, req.start_ms, req.end_ms, audio_track_index).await {
+    let selected_audio_track = *state.selected_audio_track.read().await;
+    let (audio_track_index, audio_track_ordinal) =
+        resolve_audio_mapping(&state, selected_audio_track).await;
+    match media::extract_audio(
+        &source,
+        req.start_ms,
+        req.end_ms,
+        audio_track_index,
+        audio_track_ordinal,
+    )
+    .await
+    {
         Ok((path, data)) => {
             let b64 = media::to_base64(&data);
             media::cleanup_temp_file(&path).await;
@@ -1473,9 +1555,7 @@ async fn preview_screenshot(
 
 // === Audio Track Management ===
 
-async fn get_audio_tracks(
-    State(state): State<Arc<AppState>>,
-) -> Json<serde_json::Value> {
+async fn get_audio_tracks(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let data = audio_tracks_data(&state).await;
     Json(serde_json::json!(data))
 }
@@ -1489,7 +1569,10 @@ async fn select_audio_track(
     State(state): State<Arc<AppState>>,
     Json(req): Json<SelectAudioTrackRequest>,
 ) -> Json<serde_json::Value> {
-    state.session_manager.select_audio_track(req.stream_index).await;
+    state
+        .session_manager
+        .select_audio_track(req.stream_index)
+        .await;
     let data = audio_tracks_data(&state).await;
     Json(serde_json::json!({"ok": true, "audio_tracks": data}))
 }
@@ -1546,7 +1629,17 @@ async fn preview_audio_track(
     let snippet_duration_ms = 5_000i64;
     let end_ms = (sample_start_ms + snippet_duration_ms).min(duration_ms.max(snippet_duration_ms));
 
-    match media::extract_audio(&source, sample_start_ms, end_ms, Some(req.stream_index)).await {
+    let (audio_track_index, audio_track_ordinal) =
+        resolve_audio_mapping(&state, Some(req.stream_index)).await;
+    match media::extract_audio(
+        &source,
+        sample_start_ms,
+        end_ms,
+        audio_track_index,
+        audio_track_ordinal,
+    )
+    .await
+    {
         Ok((path, data)) => {
             let b64 = media::to_base64(&data);
             media::cleanup_temp_file(&path).await;

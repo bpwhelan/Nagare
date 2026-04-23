@@ -50,13 +50,16 @@ async fn run_ffmpeg(mut cmd: Command) -> Result<()> {
 
 /// Extract audio from a video source to Opus format.
 ///
-/// When `audio_stream_index` is `Some(idx)`, ffmpeg is told to use that specific
-/// stream (by absolute index).  Otherwise the container's default audio track is used.
+/// When `audio_stream_ordinal` is `Some(idx)`, ffmpeg is told to use that specific
+/// audio stream (`-map 0:a:{idx}`), which is more reliable than server-provided
+/// absolute stream ids. If only `audio_stream_index` is available, it is used as
+/// a fallback absolute map. Otherwise the container's default audio track is used.
 pub async fn extract_audio(
     source: &str,
     start_ms: i64,
     end_ms: i64,
     audio_stream_index: Option<u32>,
+    audio_stream_ordinal: Option<usize>,
 ) -> Result<(PathBuf, Vec<u8>)> {
     let id = Uuid::new_v4();
     let output_path = temp_dir().join(format!("{}.opus", id));
@@ -78,7 +81,14 @@ pub async fn extract_audio(
         &format!("{:.3}", duration_secs),
     ]);
 
-    if let Some(idx) = audio_stream_index {
+    if let Some(ordinal) = audio_stream_ordinal {
+        debug!("Mapping ffmpeg audio output using ordinal 0:a:{}", ordinal);
+        cmd.args(["-map", &format!("0:a:{}", ordinal)]);
+    } else if let Some(idx) = audio_stream_index {
+        warn!(
+            "Falling back to absolute ffmpeg stream mapping 0:{} because no audio ordinal was available",
+            idx
+        );
         cmd.args(["-map", &format!("0:{}", idx)]);
     }
 

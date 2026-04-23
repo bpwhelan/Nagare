@@ -306,13 +306,17 @@ impl SessionManager {
         }
 
         if tracks.len() <= 1 {
-            return (tracks.first().map(|t| t.index), AudioTrackResolution::Single);
+            return (
+                tracks.first().map(|t| t.index),
+                AudioTrackResolution::Single,
+            );
         }
 
         // Multiple tracks — try target language match.
-        if let Some(track) = tracks.iter().find(|t| {
-            Self::language_matches_target(t.language.as_deref(), target_lang)
-        }) {
+        if let Some(track) = tracks
+            .iter()
+            .find(|t| Self::language_matches_target(t.language.as_deref(), target_lang))
+        {
             return (Some(track.index), AudioTrackResolution::AutoLanguage);
         }
 
@@ -1148,8 +1152,11 @@ impl SessionManager {
                     *self.selected_audio_track.read().await
                 };
                 let audio_tracks_list = Self::audio_tracks_from_streams(&np.media_streams);
-                let (resolved_audio_index, audio_resolution) =
-                    Self::resolve_audio_track(&audio_tracks_list, &target_lang, audio_user_override);
+                let (resolved_audio_index, audio_resolution) = Self::resolve_audio_track(
+                    &audio_tracks_list,
+                    &target_lang,
+                    audio_user_override,
+                );
 
                 if item_changed {
                     *self.audio_tracks.write().await = audio_tracks_list;

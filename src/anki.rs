@@ -4,10 +4,11 @@ use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::{RwLock, mpsc, watch};
 use tracing::{debug, info, warn};
 
 use crate::config::{AnkiConfig, Config};
+use crate::session::SessionState;
 
 pub struct AnkiClient {
     url: String,
@@ -258,6 +259,24 @@ pub struct AnkiMedia {
     pub fields: Vec<String>,
 }
 
+fn has_live_session(state: &SessionState) -> bool {
+    !state.sessions.is_empty() || state.now_playing.is_some()
+}
+
+fn grace_remaining_since(last_live_session_at: Option<std::time::Instant>) -> Option<Duration> {
+    const SESSION_POLL_GRACE: Duration = Duration::from_secs(600);
+
+    last_live_session_at.map(|last_seen| SESSION_POLL_GRACE.saturating_sub(last_seen.elapsed()))
+}
+
+async fn set_idle_anki_status(status: &Arc<RwLock<AnkiStatus>>) {
+    let mut current_status = status.write().await;
+    *current_status = AnkiStatus {
+        state: AnkiConnectionState::Unknown,
+        message: Some("Waiting for an active playback session before polling AnkiConnect.".into()),
+    };
+}
+
 /// Determine whether a note should be filtered out before surfacing it to the user.
 ///
 /// Mirrors GSM's filter chain in `update_new_cards`:
@@ -342,9 +361,16 @@ pub async fn run_anki_poller(
     config: Arc<RwLock<Config>>,
     status: Arc<RwLock<AnkiStatus>>,
     tx: mpsc::Sender<NewCardEvent>,
+    mut session_rx: watch::Receiver<SessionState>,
 ) {
     let mut known_ids: HashSet<i64> = HashSet::new();
     let mut initialized = false;
+    let mut poller_idle = false;
+    let mut last_live_session_at = if has_live_session(&session_rx.borrow()) {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
 
     // Connection-state tracking
     let mut consecutive_errors: u32 = 0;
@@ -354,12 +380,33 @@ pub async fn run_anki_poller(
     let max_interval = std::time::Duration::from_secs(5);
 
     loop {
+        let session_state = session_rx.borrow().clone();
+        let live_session = has_live_session(&session_state);
+        if live_session {
+            last_live_session_at = Some(std::time::Instant::now());
+            poller_idle = false;
+        } else if grace_remaining_since(last_live_session_at).is_none() {
+            if !poller_idle {
+                known_ids.clear();
+                initialized = false;
+                consecutive_errors = 0;
+                final_warning_shown = false;
+                set_idle_anki_status(&status).await;
+                poller_idle = true;
+            }
+
+            if session_rx.changed().await.is_err() {
+                return;
+            }
+            continue;
+        }
+
         let client = anki_client.read().await.clone();
         let anki_config = config.read().await.anki.clone();
         let sentence_field = anki_config.fields.sentence.clone();
         let base_interval = std::time::Duration::from_millis(anki_config.polling_rate_ms);
 
-        match client.find_notes("added:1").await {
+        let wait_after_poll = match client.find_notes("added:1").await {
             Ok(current_ids) => {
                 {
                     let mut current_status = status.write().await;
@@ -450,7 +497,7 @@ pub async fn run_anki_poller(
                     known_ids = current_set;
                 }
 
-                tokio::time::sleep(base_interval).await;
+                base_interval
             }
             Err(e) => {
                 consecutive_errors += 1;
@@ -489,7 +536,28 @@ pub async fn run_anki_poller(
                     base_interval * 2u32.pow(consecutive_errors.min(10)),
                     max_interval,
                 );
-                tokio::time::sleep(backoff).await;
+                backoff
+            }
+        };
+
+        let wait_duration = if live_session {
+            wait_after_poll
+        } else if let Some(remaining_grace) = grace_remaining_since(last_live_session_at) {
+            wait_after_poll.min(remaining_grace)
+        } else {
+            Duration::ZERO
+        };
+
+        if wait_duration.is_zero() {
+            continue;
+        }
+
+        tokio::select! {
+            _ = tokio::time::sleep(wait_duration) => {}
+            changed = session_rx.changed() => {
+                if changed.is_err() {
+                    return;
+                }
             }
         }
     }

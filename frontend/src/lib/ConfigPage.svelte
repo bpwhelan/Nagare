@@ -1,7 +1,7 @@
 <script>
   import { onMount } from 'svelte';
   import { getConfig, updateConfig } from './api.js';
-  import { applyMiningConfig, autoApprove, showToast } from './stores.js';
+  import { applyMiningConfig, autoApprove, pauseOnEnhance, showToast } from './stores.js';
 
   const AUTO_APPROVE_STORAGE_KEY = 'opt_autoApprove';
 
@@ -447,6 +447,12 @@
         <div class="checkbox-row">
           <input id="auto-approve" type="checkbox" bind:checked={$autoApprove} />
           <label for="auto-approve">Auto-approve new cards with the default matched subtitle range</label>
+        </div>
+      </div>
+      <div class="field">
+        <div class="checkbox-row">
+          <input id="pause-on-enhance" type="checkbox" bind:checked={$pauseOnEnhance} />
+          <label for="pause-on-enhance">Pause playback when the Anki enhance screen opens</label>
         </div>
       </div>
     </section>

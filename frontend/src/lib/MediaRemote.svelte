@@ -1,5 +1,5 @@
 <script>
-  import { subtitles, activeLineIndex, positionMs, isPlaying, pauseOnHover, pauseOnSeek, yomitanPause, yomitanPopupVisible, durationMs, sessionState, showToast, setOptimisticPosition, setOptimisticPlayState } from './stores.js';
+  import { subtitles, activeLineIndex, positionMs, isPlaying, pauseOnHover, pauseOnSeek, disableSubtitleSeeking, yomitanPause, yomitanPopupVisible, durationMs, sessionState, showToast, setOptimisticPosition, setOptimisticPlayState } from './stores.js';
   import { fireSeek, firePlayPause } from './api.js';
 
   export let compact = false;
@@ -124,6 +124,10 @@
     <label class="hover-pause" title="Pause video when clicking a subtitle line">
       <input type="checkbox" bind:checked={$pauseOnSeek} />
       <span>Click-pause</span>
+    </label>
+    <label class="hover-pause" title="Do not seek playback when clicking a subtitle line">
+      <input type="checkbox" bind:checked={$disableSubtitleSeeking} />
+      <span>No line-seek</span>
     </label>
     <label class="hover-pause" title="Pause when Yomitan popup appears, resume when it closes">
       <input type="checkbox" bind:checked={$yomitanPause} />

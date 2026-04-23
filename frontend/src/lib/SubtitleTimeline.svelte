@@ -1,6 +1,6 @@
 <script>
   import { onDestroy } from 'svelte';
-  import { subtitles, subtitleCandidates, selectedSubtitleCandidateId, subtitleSelectionMode, activeHistoryItemId, activeLineIndex, positionMs, pauseOnHover, pauseOnSeek, isPlaying, sessionState, showToast, setOptimisticPosition, setOptimisticPlayState, applySubtitlePayload, yomitanPopupVisible } from './stores.js';
+  import { subtitles, subtitleCandidates, selectedSubtitleCandidateId, subtitleSelectionMode, activeHistoryItemId, activeLineIndex, positionMs, pauseOnHover, pauseOnSeek, disableSubtitleSeeking, isPlaying, sessionState, showToast, setOptimisticPosition, setOptimisticPlayState, applySubtitlePayload, yomitanPopupVisible } from './stores.js';
   import { fireSeek, firePlayPause, playPause, selectSubtitleTrack } from './api.js';
   import { formatTime } from './utils.js';
   import AudioTrackSelector from './AudioTrackSelector.svelte';
@@ -102,15 +102,24 @@
   function handleLineClick(line) {
     if (shouldIgnoreLineInteraction()) return;
 
+    const shouldSeek = !$disableSubtitleSeeking;
+    const shouldPause = $pauseOnSeek && $isPlaying;
+
+    if (!shouldSeek && !shouldPause) {
+      return;
+    }
+
     if (!remoteControlAvailable) {
       showToast('error', 'Playback controls are unavailable for this player');
       return;
     }
 
-    setOptimisticPosition(line.start_ms);
-    fireSeek(line.start_ms);
+    if (shouldSeek) {
+      setOptimisticPosition(line.start_ms);
+      fireSeek(line.start_ms);
+    }
 
-    if ($pauseOnSeek && $isPlaying) {
+    if (shouldPause) {
       setOptimisticPlayState(true);
       firePlayPause(true);
     }

@@ -150,6 +150,7 @@ async fn main() -> anyhow::Result<()> {
         now_playing: None,
     };
     let (session_tx, session_rx) = watch::channel(initial_state);
+    let anki_session_rx = session_rx.clone();
 
     // New card events are processed centrally, then broadcast as prepared dialog payloads.
     let (raw_card_tx, raw_card_rx) = mpsc::channel::<NewCardEvent>(64);
@@ -219,7 +220,14 @@ async fn main() -> anyhow::Result<()> {
     let poller_status = anki_status.clone();
     let poller_card_tx = raw_card_tx;
     tokio::spawn(async move {
-        anki::run_anki_poller(poller_anki, poller_config, poller_status, poller_card_tx).await;
+        anki::run_anki_poller(
+            poller_anki,
+            poller_config,
+            poller_status,
+            poller_card_tx,
+            anki_session_rx,
+        )
+        .await;
     });
 
     let processor_state = app_state.clone();

@@ -8,6 +8,7 @@
     currentView,
     defaultGenerateAvif,
     dialogCard,
+    pauseOnEnhance,
     pendingCards,
     positionMs,
     replaceRoute,
@@ -174,7 +175,7 @@
     cleanupScreenshot();
     if ($activeHistoryItemId && matchedIndex == null && includedLineFirst == null) {
       fetchHistoryMatches(card.event.sentence);
-    } else if ($isPlaying && !shouldAutoApprovePending) {
+    } else if ($pauseOnEnhance && $isPlaying && !shouldAutoApprovePending) {
       firePlayPause(true);
       pausedByDialog = true;
     }
