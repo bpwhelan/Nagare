@@ -1,7 +1,7 @@
 <script>
   import { onMount } from 'svelte';
   import { getConfig, updateConfig } from './api.js';
-  import { applyMiningConfig, autoApprove, pauseOnEnhance, showToast } from './stores.js';
+  import { applyMiningConfig, autoApprove, pauseOnEnhance, showErrorToast, showToast } from './stores.js';
 
   const AUTO_APPROVE_STORAGE_KEY = 'opt_autoApprove';
 
@@ -115,10 +115,10 @@
         config = payload;
         showToast('success', 'Server configuration saved');
       } else {
-        showToast('error', result.error || 'Failed to save');
+        showErrorToast(result.error || 'Failed to save');
       }
     } catch (e) {
-      showToast('error', 'Failed to save: ' + e.message);
+      showErrorToast('Failed to save: ' + e.message);
     } finally {
       saving = false;
     }

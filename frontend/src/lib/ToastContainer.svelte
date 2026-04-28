@@ -1,5 +1,5 @@
 <script>
-  import { toasts, showToast } from './stores.js';
+  import { toasts } from './stores.js';
 </script>
 
 <div class="toast-container">

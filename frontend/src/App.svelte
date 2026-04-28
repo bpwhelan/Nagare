@@ -17,7 +17,7 @@
     pendingCards,
     positionMs,
     route,
-    showToast,
+    showErrorToast,
     syncRouteFromLocation,
   } from './lib/stores.js';
   import { formatTimeFull } from './lib/utils.js';
@@ -88,7 +88,7 @@
 
       if (!result?.ok || !result.dialog) {
         dialogCard.set(null);
-        showToast('error', result?.error || 'Could not load that note');
+        showErrorToast(result?.error || 'Could not load that note');
         history.replaceState({}, '', '/');
         syncRouteFromLocation();
         return;
@@ -109,7 +109,7 @@
     } catch (e) {
       if (requestId !== routeRequestId) return;
       dialogCard.set(null);
-      showToast('error', e.message || 'Could not load that note');
+      showErrorToast(e.message || 'Could not load that note');
       history.replaceState({}, '', '/');
       syncRouteFromLocation();
     }
