@@ -1,6 +1,6 @@
 <script>
   import { onDestroy } from 'svelte';
-  import { subtitles, subtitleCandidates, selectedSubtitleCandidateId, subtitleSelectionMode, activeHistoryItemId, activeLineIndex, positionMs, pauseOnHover, pauseOnSeek, disableSubtitleSeeking, isPlaying, sessionState, showToast, setOptimisticPosition, setOptimisticPlayState, applySubtitlePayload, yomitanPopupVisible } from './stores.js';
+  import { subtitles, subtitleCandidates, selectedSubtitleCandidateId, subtitleSelectionMode, activeHistoryItemId, activeLineIndex, positionMs, pauseOnHover, pauseOnSeek, disableSubtitleSeeking, isPlaying, sessionState, showErrorToast, setOptimisticPosition, setOptimisticPlayState, applySubtitlePayload, yomitanPopupVisible } from './stores.js';
   import { fireSeek, firePlayPause, playPause, selectSubtitleTrack } from './api.js';
   import { formatTime } from './utils.js';
   import AudioTrackSelector from './AudioTrackSelector.svelte';
@@ -65,7 +65,7 @@
       applySubtitlePayload(result?.subtitles);
     } catch (error) {
       select.value = previousValue;
-      showToast('error', error?.message || 'Could not switch subtitle track');
+      showErrorToast(error?.message || 'Could not switch subtitle track');
     }
   }
 
@@ -110,7 +110,6 @@
     }
 
     if (!remoteControlAvailable) {
-      showToast('error', 'Playback controls are unavailable for this player');
       return;
     }
 
@@ -148,7 +147,7 @@
     setOptimisticPlayState(false);
     playPause(false).then(result => {
       if (result?.ok === false) {
-        showToast('error', result.error || 'Resume failed');
+        showErrorToast(result.error || 'Resume failed');
       }
     });
     pausedByHover = false;

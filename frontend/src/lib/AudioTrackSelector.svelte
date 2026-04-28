@@ -1,5 +1,5 @@
 <script>
-  import { audioTracks, selectedAudioTrackIndex, audioTrackResolution, showAudioTrackModal, showToast, applyAudioTracksPayload } from './stores.js';
+  import { audioTracks, selectedAudioTrackIndex, audioTrackResolution, showAudioTrackModal, showErrorToast, applyAudioTracksPayload } from './stores.js';
   import { selectAudioTrack } from './api.js';
 
   $: visible = $audioTracks.length > 1;
@@ -21,10 +21,10 @@
       if (result?.ok && result.audio_tracks) {
         applyAudioTracksPayload(result.audio_tracks);
       } else if (result?.error) {
-        showToast('error', result.error);
+        showErrorToast(result.error);
       }
     } catch (e) {
-      showToast('error', e.message || 'Failed to select audio track');
+      showErrorToast(e.message || 'Failed to select audio track');
     }
   }
 </script>

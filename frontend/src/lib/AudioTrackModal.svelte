@@ -1,5 +1,5 @@
 <script>
-  import { audioTracks, selectedAudioTrackIndex, showAudioTrackModal, showToast, applyAudioTracksPayload } from './stores.js';
+  import { audioTracks, selectedAudioTrackIndex, showAudioTrackModal, showErrorToast, applyAudioTracksPayload } from './stores.js';
   import { selectAudioTrack, previewAudioTrack } from './api.js';
 
   let previewingIndex = null;
@@ -32,12 +32,12 @@
     try {
       const result = await previewAudioTrack(track.index);
       if (result.error) {
-        showToast('error', result.error);
+        showErrorToast(result.error);
         previewLoading = false;
         return;
       }
       if (!result.audio_base64) {
-        showToast('error', 'No audio returned');
+        showErrorToast('No audio returned');
         previewLoading = false;
         return;
       }
@@ -50,7 +50,7 @@
       previewAudioEl.addEventListener('ended', () => { previewingIndex = null; });
       await previewAudioEl.play();
     } catch (e) {
-      showToast('error', e.message || 'Preview failed');
+      showErrorToast(e.message || 'Preview failed');
     } finally {
       previewLoading = false;
     }
@@ -63,12 +63,12 @@
       if (result?.ok && result.audio_tracks) {
         applyAudioTracksPayload(result.audio_tracks);
       } else if (result?.error) {
-        showToast('error', result.error);
+        showErrorToast(result.error);
         return;
       }
       close();
     } catch (e) {
-      showToast('error', e.message || 'Selection failed');
+      showErrorToast(e.message || 'Selection failed');
     }
   }
 </script>

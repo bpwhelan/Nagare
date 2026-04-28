@@ -1,5 +1,5 @@
 <script>
-  import { subtitles, activeLineIndex, positionMs, isPlaying, pauseOnHover, pauseOnSeek, disableSubtitleSeeking, yomitanPause, yomitanPopupVisible, durationMs, sessionState, showToast, setOptimisticPosition, setOptimisticPlayState } from './stores.js';
+  import { subtitles, activeLineIndex, positionMs, isPlaying, pauseOnHover, pauseOnSeek, disableSubtitleSeeking, yomitanPause, yomitanPopupVisible, durationMs, sessionState, setOptimisticPosition, setOptimisticPlayState } from './stores.js';
   import { fireSeek, firePlayPause } from './api.js';
 
   export let compact = false;
@@ -44,7 +44,6 @@
     if (shouldIgnoreSeekAction()) return;
 
     if (!remoteControlAvailable) {
-      showToast('error', 'Playback controls are unavailable for this player');
       return;
     }
 
@@ -95,7 +94,6 @@
 
   function togglePlayPause() {
     if (!remoteControlAvailable) {
-      showToast('error', 'Playback controls are unavailable for this player');
       return;
     }
 

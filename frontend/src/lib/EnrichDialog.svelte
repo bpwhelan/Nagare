@@ -12,6 +12,7 @@
     pendingCards,
     positionMs,
     replaceRoute,
+    showErrorToast,
     showToast,
     subtitles,
     isPlaying,
@@ -223,7 +224,7 @@
       }
     } catch (e) {
       historyMatches = [];
-      showToast('error', 'Match search failed: ' + e.message);
+      showErrorToast('Match search failed: ' + e.message);
     } finally {
       fetchingMatches = false;
     }
@@ -417,7 +418,7 @@
       audioElement.currentTime = 0;
       await audioElement.play();
     } catch (e) {
-      showToast('error', e.message);
+      showErrorToast(e.message);
     } finally {
       audioLoading = false;
     }
@@ -445,7 +446,7 @@
     try {
       const midMs = Math.round((startMs + endMs) / 2);
       const result = await previewScreenshot(midMs, mediaItemId);
-      if (result.error) { showToast('error', result.error); screenshotLoading = false; return; }
+      if (result.error) { showErrorToast(result.error); screenshotLoading = false; return; }
       if (result.image_base64) {
         const bytes = atob(result.image_base64);
         const arr = new Uint8Array(bytes.length);
@@ -454,7 +455,7 @@
         screenshotUrl = URL.createObjectURL(blob);
       }
     } catch (e) {
-      showToast('error', e.message);
+      showErrorToast(e.message);
     } finally {
       screenshotLoading = false;
     }

@@ -133,6 +133,22 @@ export function applySubtitlePayload(payload) {
 // Toasts
 let _toastId = 0;
 export const toasts = writable(/** @type {{ id: number, type: 'success'|'error', message: string }[]} */ ([]));
+const NON_ACTIONABLE_ERROR_SUBSTRINGS = [
+  'playback controls are unavailable for this player',
+  'remote control is unavailable for the active session',
+  'plex web is not exposing companion control through plex media server',
+  'media player does not support controls',
+  'does not support controls',
+  'seek request failed',
+  'play/pause request failed',
+  'remote control command failed',
+];
+const NON_ACTIONABLE_ERROR_PATTERNS = [
+  /\bremote control\b.*\btimeout\b/i,
+  /\btimeout\b.*\bremote control\b/i,
+  /\bdeadline has elapsed\b/i,
+  /\btargets tried:\b/i,
+];
 
 /**
  * Show a toast notification that auto-dismisses after `duration` ms.
@@ -144,6 +160,27 @@ export function showToast(type, message, duration = 4000) {
   const id = ++_toastId;
   toasts.update(ts => [...ts, { id, type, message }]);
   setTimeout(() => toasts.update(ts => ts.filter(t => t.id !== id)), duration);
+}
+
+/**
+ * Only surface errors the user can reasonably act on.
+ * @param {string | null | undefined} message
+ * @param {number} [duration]
+ * @param {{ force?: boolean }} [options]
+ */
+export function showErrorToast(message, duration = 4000, options = {}) {
+  const text = `${message ?? ''}`.trim();
+  if (!text) return;
+  if (!options.force) {
+    const normalized = text.toLowerCase();
+    if (NON_ACTIONABLE_ERROR_SUBSTRINGS.some(fragment => normalized.includes(fragment))) {
+      return;
+    }
+    if (NON_ACTIONABLE_ERROR_PATTERNS.some(pattern => pattern.test(text))) {
+      return;
+    }
+  }
+  showToast('error', text, duration);
 }
 
 // Derived

@@ -1,6 +1,6 @@
 const BASE = '';
 
-import { showToast } from './stores.js';
+import { showErrorToast } from './stores.js';
 
 async function api(path, options = {}) {
   const resp = await fetch(`${BASE}${path}`, {
@@ -106,7 +106,7 @@ export async function seekTo(positionMs) {
 export function fireSeek(positionMs) {
   seekTo(positionMs).catch(e => {
     console.warn('[fireSeek] network error:', e);
-    showToast('error', 'Seek request failed');
+    showErrorToast('Seek request failed');
   });
 }
 
@@ -131,7 +131,7 @@ export async function playPause(paused) {
 export function firePlayPause(paused) {
   playPause(paused).catch(e => {
     console.warn('[firePlayPause] network error:', e);
-    showToast('error', 'Play/pause request failed');
+    showErrorToast('Play/pause request failed');
   });
 }
 
@@ -225,11 +225,11 @@ async function _drainEnrichQueue() {
       const result = await enrichCard(payload);
       console.log('[enrich-queue] Response for note', payload.noteId, result);
       if (!result.success) {
-        showToast('error', result.error || 'Could not queue enhancement');
+        showErrorToast(result.error || 'Could not queue enhancement');
       }
     } catch (e) {
       console.error('[enrich-queue] Error for note', payload.noteId, e);
-      showToast('error', e.message || 'Could not queue enhancement');
+      showErrorToast(e.message || 'Could not queue enhancement');
     }
   }
   _enrichDraining = false;

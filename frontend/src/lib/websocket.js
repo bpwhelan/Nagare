@@ -1,5 +1,5 @@
 import { get } from 'svelte/store';
-import { activeHistoryItemId, sessionState, pendingCards, connected, ankiStatus, enhancementQueue, syncPositionFromSessionState, isSeekLocked, isPlayLocked, applySubtitlePayload, applyAudioTracksPayload, showToast } from './stores.js';
+import { activeHistoryItemId, sessionState, pendingCards, connected, ankiStatus, enhancementQueue, syncPositionFromSessionState, isSeekLocked, isPlayLocked, applySubtitlePayload, applyAudioTracksPayload, showErrorToast, showToast } from './stores.js';
 
 let ws = null;
 let reconnectTimer = null;
@@ -99,14 +99,18 @@ function handleMessage(msg) {
       if (msg.enhancement_result) {
         const r = msg.enhancement_result;
         console.log('[WS] enhancement_result:', r);
-        showToast(r.success ? 'success' : 'error', r.message);
+        if (r.success) {
+          showToast('success', r.message);
+        } else {
+          showErrorToast(r.message);
+        }
       }
       break;
 
     case 'remote_result':
       if (msg.remote_result && !msg.remote_result.success) {
         console.warn('[WS] remote_result error:', msg.remote_result);
-        showToast('error', msg.remote_result.error || 'Remote control command failed');
+        showErrorToast(msg.remote_result.error || 'Remote control command failed');
       }
       break;
   }
