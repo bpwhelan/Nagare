@@ -104,6 +104,10 @@ pub struct NowPlayingState {
     pub media_source_id: String,
     pub file_path: Option<String>,
     pub audio_stream_index: Option<u32>,
+    /// Accumulated user timing offset for the loaded subtitle track (ms).
+    /// Mirrors `SubtitleTrack::offset_ms` for the active item.
+    #[serde(default)]
+    pub subtitle_offset_ms: i64,
 }
 
 /// A snapshot of a previously-watched item, kept so the user can mine it later.
@@ -348,7 +352,109 @@ impl SessionManager {
         }
     }
 
-    /// Persist history to SQLite.
+    /// Apply a subtitle timing offset (absolute, in ms).
+    ///
+    /// If `history_id` is `None` or matches the active item, the in-memory
+    /// active subtitle track is shifted and `NowPlayingState` is updated.
+    /// In all cases the cached `subtitle_history` track for the matching
+    /// history entry is also shifted (so re-mining from history sees the
+    /// adjusted timings) and persisted to SQLite.
+    ///
+    /// After loading a fresh subtitle track for `history_id`, look up any
+    /// previously persisted offset stored in `subtitle_history` and re-apply
+    /// it to the newly loaded track so timing corrections survive across
+    /// sessions, server restarts, and track switches.
+    async fn restore_subtitle_offset(&self, history_id: &str) {
+        let saved_offset = self
+            .subtitle_history
+            .read()
+            .await
+            .get(history_id)
+            .map(|t| t.offset_ms)
+            .unwrap_or(0);
+
+        if saved_offset == 0 {
+            return;
+        }
+
+        {
+            let mut subs = self.subtitles.write().await;
+            if let Some(track) = subs.as_mut() {
+                // Fresh track starts at offset 0; apply the saved delta directly.
+                track.shift_by(saved_offset);
+            }
+        }
+
+        let mut state = self.state.write().await;
+        if let Some(np) = state.now_playing.as_mut() {
+            if np.history_id == history_id {
+                np.subtitle_offset_ms = saved_offset;
+            }
+        }
+    }
+
+    /// Returns the new accumulated offset.
+    pub async fn set_subtitle_offset(
+        &self,
+        history_id: Option<&str>,
+        absolute_offset_ms: i64,
+    ) -> anyhow::Result<i64> {
+        let active_history_id = self
+            .state
+            .read()
+            .await
+            .now_playing
+            .as_ref()
+            .map(|np| np.history_id.clone());
+
+        let target_history_id = match history_id {
+            Some(id) => id.to_string(),
+            None => active_history_id
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("No active item and no history_id provided"))?,
+        };
+
+        let is_active = active_history_id.as_deref() == Some(target_history_id.as_str());
+
+        // Shift the active in-memory track if applicable.
+        if is_active {
+            let mut subs = self.subtitles.write().await;
+            if let Some(track) = subs.as_mut() {
+                let delta = absolute_offset_ms - track.offset_ms;
+                track.shift_by(delta);
+            }
+        }
+
+        // Shift the cached history copy too, so future re-loads/mining match.
+        {
+            let mut subtitle_history = self.subtitle_history.write().await;
+            if let Some(track) = subtitle_history.get_mut(&target_history_id) {
+                let delta = absolute_offset_ms - track.offset_ms;
+                track.shift_by(delta);
+            } else if is_active {
+                // Snapshot the active track into history so the offset survives.
+                if let Some(track) = self.subtitles.read().await.clone() {
+                    subtitle_history.insert(target_history_id.clone(), track);
+                }
+            }
+        }
+
+        if is_active {
+            let mut state = self.state.write().await;
+            if let Some(np) = state.now_playing.as_mut() {
+                np.subtitle_offset_ms = absolute_offset_ms;
+            }
+            drop(state);
+            let snapshot = self.state.read().await.clone();
+            let _ = self.state_tx.send(snapshot);
+        }
+
+        // Persist (force=true → writes both history + subtitle_history maps).
+        self.save_history(true).await;
+
+        Ok(absolute_offset_ms)
+    }
+
     ///
     /// `force = true`  → write immediately (used on new-item events).
     /// `force = false` → write only if more than 30 s have elapsed since the
@@ -975,6 +1081,8 @@ impl SessionManager {
         )
         .await;
 
+        self.restore_subtitle_offset(&history_id).await;
+
         {
             let mut state = self.state.write().await;
             if let Some(now_playing_state) = state.now_playing.as_mut() {
@@ -1180,6 +1288,7 @@ impl SessionManager {
                     media_source_id: media_source_id.clone(),
                     file_path: np.path.clone(),
                     audio_stream_index: resolved_audio_index,
+                    subtitle_offset_ms: 0,
                 });
 
                 if item_changed || selected_candidate_id != previous_loaded_candidate_id {
@@ -1245,6 +1354,8 @@ impl SessionManager {
                 candidate.as_ref(),
             )
             .await;
+
+            self.restore_subtitle_offset(&history_id).await;
 
             let sub_count = self.snapshot_active_track_into_history(&history_id).await;
 

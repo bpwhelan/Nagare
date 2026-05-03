@@ -12,6 +12,11 @@ pub struct SubtitleLine {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubtitleTrack {
     pub lines: Vec<SubtitleLine>,
+    /// Accumulated user-applied timing offset in ms (already baked into [`SubtitleLine`] times).
+    /// Positive shifts the displayed subtitle later in the timeline.
+    /// Stored only for display/reset purposes — `lines` are the source of truth.
+    #[serde(default)]
+    pub offset_ms: i64,
 }
 
 impl SubtitleTrack {
@@ -19,6 +24,18 @@ impl SubtitleTrack {
         self.lines
             .iter()
             .position(|l| time_ms >= l.start_ms && time_ms <= l.end_ms)
+    }
+
+    /// Shift every line's start/end by `delta_ms` and update the accumulated offset.
+    pub fn shift_by(&mut self, delta_ms: i64) {
+        if delta_ms == 0 {
+            return;
+        }
+        for line in &mut self.lines {
+            line.start_ms = line.start_ms.saturating_add(delta_ms);
+            line.end_ms = line.end_ms.saturating_add(delta_ms);
+        }
+        self.offset_ms = self.offset_ms.saturating_add(delta_ms);
     }
 
     pub fn nearest_line(&self, time_ms: i64) -> Option<usize> {
@@ -80,7 +97,10 @@ pub fn parse_vtt(content: &str) -> SubtitleTrack {
         }
     }
 
-    SubtitleTrack { lines }
+    SubtitleTrack {
+        lines,
+        offset_ms: 0,
+    }
 }
 
 /// Parse SRT subtitle content into a SubtitleTrack.
@@ -132,7 +152,10 @@ pub fn parse_srt(content: &str) -> SubtitleTrack {
         }
     }
 
-    SubtitleTrack { lines }
+    SubtitleTrack {
+        lines,
+        offset_ms: 0,
+    }
 }
 
 /// Parse ASS/SSA subtitle content into a SubtitleTrack.
@@ -197,7 +220,10 @@ pub fn parse_ass(content: &str) -> SubtitleTrack {
         line.index = i;
     }
 
-    SubtitleTrack { lines }
+    SubtitleTrack {
+        lines,
+        offset_ms: 0,
+    }
 }
 
 /// Auto-detect format and parse subtitle content.
@@ -525,6 +551,7 @@ Dialogue: 0,0:00:05.00,0:00:08.00,Default,,0,0,0,,これはテストです
                     text: "さようなら".to_string(),
                 },
             ],
+            offset_ms: 0,
         };
 
         let result = find_matching_line(&track, "こんにちは世界", 4000, 30_000);

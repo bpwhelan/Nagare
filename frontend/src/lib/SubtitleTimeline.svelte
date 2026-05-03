@@ -1,7 +1,7 @@
 <script>
   import { onDestroy } from 'svelte';
-  import { subtitles, subtitleCandidates, selectedSubtitleCandidateId, subtitleSelectionMode, activeHistoryItemId, activeLineIndex, positionMs, pauseOnHover, pauseOnSeek, disableSubtitleSeeking, isPlaying, sessionState, showErrorToast, setOptimisticPosition, setOptimisticPlayState, applySubtitlePayload, yomitanPopupVisible } from './stores.js';
-  import { fireSeek, firePlayPause, playPause, selectSubtitleTrack } from './api.js';
+  import { subtitles, subtitleCandidates, selectedSubtitleCandidateId, subtitleSelectionMode, subtitleOffsetMs, activeHistoryItemId, activeLineIndex, positionMs, pauseOnHover, pauseOnSeek, disableSubtitleSeeking, isPlaying, sessionState, showErrorToast, setOptimisticPosition, setOptimisticPlayState, applySubtitlePayload, yomitanPopupVisible } from './stores.js';
+  import { fireSeek, firePlayPause, playPause, selectSubtitleTrack, setSubtitleOffset } from './api.js';
   import { formatTime } from './utils.js';
   import AudioTrackSelector from './AudioTrackSelector.svelte';
 
@@ -67,6 +67,77 @@
       select.value = previousValue;
       showErrorToast(error?.message || 'Could not switch subtitle track');
     }
+  }
+
+  let offsetBusy = false;
+
+  $: offsetSupported = !$activeHistoryItemId && $subtitles.length > 0;
+  $: offsetLabel = formatOffset($subtitleOffsetMs);
+
+  function formatOffset(ms) {
+    if (!ms) return '0 ms';
+    const sign = ms > 0 ? '+' : '−';
+    const absMs = Math.abs(ms);
+    if (absMs >= 1000) {
+      const secs = absMs / 1000;
+      const text = secs >= 10 ? secs.toFixed(1) : secs.toFixed(2);
+      return `${sign}${text} s`;
+    }
+    return `${sign}${absMs} ms`;
+  }
+
+  function handleNudgeClick(event) {
+    const base = 100;
+    const amount = event.shiftKey ? base * 5 : base;
+    const direction = event.currentTarget.dataset.dir === 'back' ? -1 : 1;
+    nudgeOffset(direction * amount);
+  }
+
+  async function nudgeOffset(deltaMs) {
+    if (offsetBusy || !offsetSupported) return;
+    offsetBusy = true;
+    try {
+      const result = await setSubtitleOffset({ deltaMs });
+      if (result?.ok === false) {
+        throw new Error(result.error || 'Failed to update offset');
+      }
+      applySubtitlePayload(result?.subtitles);
+    } catch (error) {
+      showErrorToast(error?.message || 'Failed to update subtitle offset');
+    } finally {
+      offsetBusy = false;
+    }
+  }
+
+  async function resetOffset() {
+    if (offsetBusy || !offsetSupported || !$subtitleOffsetMs) return;
+    offsetBusy = true;
+    try {
+      const result = await setSubtitleOffset({ offsetMs: 0 });
+      if (result?.ok === false) {
+        throw new Error(result.error || 'Failed to reset offset');
+      }
+      applySubtitlePayload(result?.subtitles);
+    } catch (error) {
+      showErrorToast(error?.message || 'Failed to reset subtitle offset');
+    } finally {
+      offsetBusy = false;
+    }
+  }
+
+  /**
+   * Snap a subtitle line's start to the current playback position.
+   * 'current' = the active line should start NOW (most common).
+   * 'next'    = the next line should start NOW (when subs are one line behind).
+   * @param {'current'|'next'} which
+   */
+  function snapLineToPosition(which) {
+    const idx = $activeLineIndex;
+    if (idx == null || !$subtitles.length) return;
+    const targetIdx = which === 'current' ? idx : idx + 1;
+    if (targetIdx < 0 || targetIdx >= $subtitles.length) return;
+    const delta = $positionMs - $subtitles[targetIdx].start_ms;
+    nudgeOffset(delta);
   }
 
   function handleLinePointerDown(event) {
@@ -193,6 +264,20 @@
               {/each}
             </select>
           </label>
+        {/if}
+        {#if offsetSupported}
+          <div class="offset-adjuster" role="group" aria-label="Subtitle timing offset">
+            <span class="offset-label">Offset</span>
+            <div class="offset-buttons">
+              <button type="button" class="offset-btn jump" on:click={() => snapLineToPosition('current')} disabled={offsetBusy || $activeLineIndex == null} title="Snap current subtitle to playback position">⏮</button>
+              <button type="button" class="offset-btn" data-dir="back" on:click={handleNudgeClick} disabled={offsetBusy} title="−100 ms (Shift: −500 ms)">◂</button>
+              <button type="button" class="offset-value" on:click={resetOffset} disabled={offsetBusy || !$subtitleOffsetMs} title={$subtitleOffsetMs ? 'Reset to 0' : 'No offset applied'}>
+                {offsetLabel}
+              </button>
+              <button type="button" class="offset-btn" data-dir="fwd" on:click={handleNudgeClick} disabled={offsetBusy} title="+100 ms (Shift: +500 ms)">▸</button>
+              <button type="button" class="offset-btn jump" on:click={() => snapLineToPosition('next')} disabled={offsetBusy || $activeLineIndex == null || $activeLineIndex >= $subtitles.length - 1} title="Snap next subtitle to playback position">⏭</button>
+            </div>
+          </div>
         {/if}
         {#if !$activeHistoryItemId}
           <AudioTrackSelector />
@@ -331,6 +416,71 @@
     white-space: nowrap;
   }
 
+  .offset-adjuster {
+    display: flex;
+    align-items: center;
+    gap: 0.45rem;
+    min-width: 0;
+  }
+
+  .offset-label {
+    font-size: 0.8rem;
+    color: var(--text-dim);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+  }
+
+  .offset-buttons {
+    display: inline-flex;
+    align-items: stretch;
+    border-radius: 6px;
+    overflow: hidden;
+    border: 1px solid var(--border);
+    background: var(--bg-card);
+  }
+
+  .offset-buttons button {
+    background: transparent;
+    border: none;
+    border-right: 1px solid var(--border);
+    color: var(--text-secondary);
+    font: inherit;
+    font-size: 0.8rem;
+    padding: 0.3rem 0.55rem;
+    cursor: pointer;
+    font-variant-numeric: tabular-nums;
+    line-height: 1;
+  }
+
+  .offset-buttons button:last-child {
+    border-right: none;
+  }
+
+  .offset-buttons button:hover:not(:disabled) {
+    background: var(--bg-hover);
+    color: var(--text-primary);
+  }
+
+  .offset-buttons button:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+
+  .offset-value {
+    min-width: 4.2rem;
+    text-align: center;
+    color: var(--text-primary) !important;
+    font-weight: 500;
+  }
+
+  .offset-btn.jump {
+    font-size: 0.7rem;
+    color: var(--text-dim);
+  }
+
+  .offset-btn.jump:hover:not(:disabled) {
+    color: var(--accent);
+  }
   .lines {
     display: flex;
     flex-direction: column;
@@ -433,6 +583,29 @@
     .track-picker select {
       min-width: 0;
       width: 100%;
+    }
+
+    .offset-adjuster {
+      width: 100%;
+      align-items: stretch;
+      flex-direction: column;
+      gap: 0.3rem;
+    }
+
+    .offset-buttons {
+      width: 100%;
+    }
+
+    .offset-buttons button {
+      flex: 1 1 0;
+      padding: 0.55rem 0.4rem;
+      font-size: 0.9rem;
+      min-height: 40px;
+    }
+
+    .offset-value {
+      flex: 1.4 1 0;
+      min-width: 0;
     }
   }
 

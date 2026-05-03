@@ -37,6 +37,24 @@ export async function selectSubtitleTrack(candidateId = null) {
   });
 }
 
+/**
+ * Adjust the subtitle timing offset.
+ * Pass `deltaMs` to nudge by a relative amount, or `offsetMs` for an absolute value.
+ * `historyId` targets a specific past item; defaults to the active session.
+ *
+ * @param {{ offsetMs?: number, deltaMs?: number, historyId?: string|null }} args
+ */
+export async function setSubtitleOffset({ offsetMs = null, deltaMs = null, historyId = null } = {}) {
+  const body = {};
+  if (offsetMs != null) body.offset_ms = offsetMs;
+  if (deltaMs != null) body.delta_ms = deltaMs;
+  if (historyId) body.history_id = historyId;
+  return api('/api/subtitles/offset', {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
+}
+
 export async function enrichCard({
   noteId,
   sentence,
