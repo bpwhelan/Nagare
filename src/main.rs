@@ -8,7 +8,7 @@ mod plex_websocket;
 mod session;
 mod subtitle;
 
-use crate::anki::{AnkiClient, AnkiStatus, NewCardEvent};
+use crate::anki::{AnkiBeaconEvent, AnkiClient, AnkiStatus, NewCardNotification};
 use crate::api::AppState;
 use crate::config::Config;
 use crate::media_server::{EmbyClient, JellyfinClient, PlexClient, ServerMap};
@@ -153,7 +153,8 @@ async fn main() -> anyhow::Result<()> {
     let anki_session_rx = session_rx.clone();
 
     // New card events are processed centrally, then broadcast as prepared dialog payloads.
-    let (raw_card_tx, raw_card_rx) = mpsc::channel::<NewCardEvent>(64);
+    let (raw_card_tx, raw_card_rx) = mpsc::channel::<NewCardNotification>(64);
+    let (anki_event_tx, anki_event_rx) = mpsc::channel::<AnkiBeaconEvent>(128);
     let (card_tx, _) = broadcast::channel::<EnrichmentDialogState>(64);
 
     // Create session manager
@@ -187,6 +188,7 @@ async fn main() -> anyhow::Result<()> {
         servers: session_manager.servers(),
         anki_client: Arc::new(RwLock::new(anki_client)),
         anki_status: anki_status.clone(),
+        anki_event_tx,
         enhancement_queue: Arc::new(RwLock::new(Vec::new())),
         enhancement_tx,
         session_rx,
@@ -225,6 +227,7 @@ async fn main() -> anyhow::Result<()> {
             poller_config,
             poller_status,
             poller_card_tx,
+            anki_event_rx,
             anki_session_rx,
         )
         .await;

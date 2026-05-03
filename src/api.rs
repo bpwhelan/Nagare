@@ -1,4 +1,7 @@
-use crate::anki::{AnkiClient, AnkiStatus, NewCardEvent};
+use crate::anki::{
+    AnkiBeaconEvent, AnkiBeaconEventKind, AnkiClient, AnkiStatus, NewCardEvent,
+    NewCardNotification, note_info_to_event,
+};
 use crate::config::{Config, MediaServerKind};
 use crate::media;
 use crate::media_server::{MediaServer, ServerMap};
@@ -12,6 +15,7 @@ use crate::session::{
 use crate::subtitle::{SubtitleTrack, find_all_matching_lines, find_matching_line};
 use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
@@ -36,6 +40,7 @@ pub struct AppState {
     pub servers: Arc<RwLock<ServerMap>>,
     pub anki_client: Arc<RwLock<Arc<AnkiClient>>>,
     pub anki_status: Arc<RwLock<AnkiStatus>>,
+    pub anki_event_tx: mpsc::Sender<AnkiBeaconEvent>,
     pub enhancement_queue: Arc<RwLock<Vec<EnhancementQueueItem>>>,
     pub enhancement_tx: mpsc::Sender<EnhancementJob>,
     pub session_rx: watch::Receiver<SessionState>,
@@ -65,6 +70,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/sessions/select", post(select_session))
         .route("/api/subtitles", get(get_subtitles))
         .route("/api/subtitles/select", post(select_subtitle_track))
+        .route("/api/subtitles/offset", post(set_subtitle_offset))
         .route("/api/history", get(get_history))
         .route(
             "/api/history/{item_id}/subtitles",
@@ -90,11 +96,32 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/audio-tracks", get(get_audio_tracks))
         .route("/api/audio-tracks/select", post(select_audio_track))
         .route("/api/audio-tracks/preview", post(preview_audio_track))
+        .route("/anki/events", post(post_anki_event))
         .route("/ws", get(ws_handler))
         .with_state(state)
 }
 
 // === REST Handlers ===
+
+async fn post_anki_event(
+    State(state): State<Arc<AppState>>,
+    Json(event): Json<AnkiBeaconEvent>,
+) -> StatusCode {
+    let accepted_status = match event.event {
+        AnkiBeaconEventKind::Heartbeat => StatusCode::NO_CONTENT,
+        AnkiBeaconEventKind::NoteAdded => {
+            if event.note_id.is_none() {
+                return StatusCode::BAD_REQUEST;
+            }
+            StatusCode::ACCEPTED
+        }
+    };
+
+    match state.anki_event_tx.send(event).await {
+        Ok(()) => accepted_status,
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE,
+    }
+}
 
 async fn get_state(State(state): State<Arc<AppState>>) -> Json<SessionState> {
     let session_state = state.session_rx.borrow().clone();
@@ -132,6 +159,7 @@ async fn active_subtitle_data(state: &Arc<AppState>) -> SubtitleData {
         .as_ref()
         .map(|now_playing| now_playing.subtitle_selection_mode)
         .unwrap_or(SubtitleSelectionMode::Auto);
+    let subtitle_offset_ms = track.as_ref().map(|t| t.offset_ms).unwrap_or(0);
     let lines = track.map(|track| track.lines).unwrap_or_default();
     let count = lines.len();
 
@@ -141,10 +169,12 @@ async fn active_subtitle_data(state: &Arc<AppState>) -> SubtitleData {
         candidates,
         selected_candidate_id,
         selection_mode,
+        subtitle_offset_ms,
     }
 }
 
 fn history_subtitle_data(track: Option<SubtitleTrack>) -> SubtitleData {
+    let subtitle_offset_ms = track.as_ref().map(|t| t.offset_ms).unwrap_or(0);
     let lines = track.map(|track| track.lines).unwrap_or_default();
     let count = lines.len();
 
@@ -154,6 +184,7 @@ fn history_subtitle_data(track: Option<SubtitleTrack>) -> SubtitleData {
         candidates: Vec::new(),
         selected_candidate_id: None,
         selection_mode: SubtitleSelectionMode::Auto,
+        subtitle_offset_ms,
     }
 }
 
@@ -184,6 +215,73 @@ async fn select_subtitle_track(
             "error": error.to_string(),
         })),
     }
+}
+
+#[derive(Deserialize)]
+struct SetSubtitleOffsetRequest {
+    /// Absolute offset in ms. If `delta_ms` is also given, this is treated as the previous offset.
+    #[serde(default)]
+    offset_ms: Option<i64>,
+    /// Optional delta to apply on top of the current offset.
+    #[serde(default)]
+    delta_ms: Option<i64>,
+    /// Adjust the offset for a specific history item; defaults to the active item.
+    #[serde(default)]
+    history_id: Option<String>,
+}
+
+async fn set_subtitle_offset(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<SetSubtitleOffsetRequest>,
+) -> Json<serde_json::Value> {
+    // Determine the absolute offset to apply.
+    let target_id = body.history_id.clone();
+    let current = current_subtitle_offset(&state, target_id.as_deref()).await;
+    let absolute = match (body.offset_ms, body.delta_ms) {
+        (_, Some(delta)) => current.saturating_add(delta),
+        (Some(value), None) => value,
+        (None, None) => current,
+    };
+
+    match state
+        .session_manager
+        .set_subtitle_offset(target_id.as_deref(), absolute)
+        .await
+    {
+        Ok(new_offset) => {
+            // For history-only adjustments include a history payload, otherwise the active one.
+            let payload = if let Some(history_id) = target_id.as_deref() {
+                let track = state.subtitle_history.read().await.get(history_id).cloned();
+                history_subtitle_data(track)
+            } else {
+                active_subtitle_data(&state).await
+            };
+            Json(serde_json::json!({
+                "ok": true,
+                "offset_ms": new_offset,
+                "subtitles": payload,
+            }))
+        }
+        Err(error) => Json(serde_json::json!({
+            "ok": false,
+            "error": error.to_string(),
+        })),
+    }
+}
+
+async fn current_subtitle_offset(state: &Arc<AppState>, history_id: Option<&str>) -> i64 {
+    if let Some(id) = history_id {
+        if let Some(track) = state.subtitle_history.read().await.get(id) {
+            return track.offset_ms;
+        }
+    }
+    state
+        .subtitles
+        .read()
+        .await
+        .as_ref()
+        .map(|t| t.offset_ms)
+        .unwrap_or(0)
 }
 
 async fn get_pending_enrichments(
@@ -401,22 +499,6 @@ enum DialogLookup {
     CardId(i64),
 }
 
-fn build_note_event(note: crate::anki::NoteInfo, sentence_field: &str) -> NewCardEvent {
-    let sentence = note
-        .fields
-        .get(sentence_field)
-        .map(|field| field.value.clone())
-        .unwrap_or_default();
-
-    NewCardEvent {
-        note_id: note.note_id,
-        sentence,
-        fields: note.fields,
-        model_name: note.model_name,
-        tags: note.tags,
-    }
-}
-
 async fn fetch_note_event(
     anki_client: Arc<AnkiClient>,
     config: &Config,
@@ -426,7 +508,7 @@ async fn fetch_note_event(
     notes
         .into_iter()
         .next()
-        .map(|note| build_note_event(note, &config.anki.fields.sentence))
+        .map(|note| note_info_to_event(note, &config.anki.fields.sentence))
 }
 
 async fn lookup_dialog_state(
@@ -478,8 +560,12 @@ async fn resolve_audio_mapping(
 
 async fn prepare_enrichment_candidate(
     state: &Arc<AppState>,
-    event: NewCardEvent,
+    notification: NewCardNotification,
 ) -> Option<EnrichmentDialogState> {
+    let NewCardNotification {
+        event,
+        card_ids: provided_card_ids,
+    } = notification;
     let subtitles = state.subtitles.read().await;
     let track = subtitles.as_ref()?;
 
@@ -518,17 +604,22 @@ async fn prepare_enrichment_candidate(
     drop(subtitles);
 
     let config = state.config.read().await.clone();
-    let anki_client = state.anki_client.read().await.clone();
-    let card_ids = anki_client
-        .find_cards_for_note(event.note_id)
-        .await
-        .unwrap_or_else(|error| {
-            warn!(
-                "Failed to look up card ids for note {}: {}",
-                event.note_id, error
-            );
-            Vec::new()
-        });
+    let card_ids = match provided_card_ids.filter(|ids| !ids.is_empty()) {
+        Some(ids) => ids,
+        None => {
+            let anki_client = state.anki_client.read().await.clone();
+            anki_client
+                .find_cards_for_note(event.note_id)
+                .await
+                .unwrap_or_else(|error| {
+                    warn!(
+                        "Failed to look up card ids for note {}: {}",
+                        event.note_id, error
+                    );
+                    Vec::new()
+                })
+        }
+    };
 
     Some(EnrichmentDialogState {
         event,
@@ -1063,9 +1154,12 @@ async fn perform_enrichment(
     result
 }
 
-pub async fn run_new_card_processor(state: Arc<AppState>, mut rx: mpsc::Receiver<NewCardEvent>) {
-    while let Some(event) = rx.recv().await {
-        let Some(candidate) = prepare_enrichment_candidate(&state, event).await else {
+pub async fn run_new_card_processor(
+    state: Arc<AppState>,
+    mut rx: mpsc::Receiver<NewCardNotification>,
+) {
+    while let Some(notification) = rx.recv().await {
+        let Some(candidate) = prepare_enrichment_candidate(&state, notification).await else {
             continue;
         };
 
@@ -1696,6 +1790,8 @@ struct SubtitleData {
     candidates: Vec<SubtitleCandidate>,
     selected_candidate_id: Option<String>,
     selection_mode: SubtitleSelectionMode,
+    /// Accumulated user timing offset already baked into `lines` (ms).
+    subtitle_offset_ms: i64,
 }
 
 async fn audio_tracks_data(state: &Arc<AppState>) -> AudioTracksData {
@@ -1764,6 +1860,7 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
             SubtitleSelectionMode,
             usize,
             Vec<SubtitleCandidate>,
+            i64,
         )> = None;
         let mut last_anki_status: Option<AnkiStatus> = None;
         let mut last_enhancement_queue: Vec<EnhancementQueueItem> = Vec::new();
@@ -1795,12 +1892,14 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
                         .map(|np| np.subtitle_selection_mode)
                         .unwrap_or(SubtitleSelectionMode::Auto);
                     let subtitle_lines = subs.as_ref().map(|track| track.lines.clone()).unwrap_or_default();
+                    let subtitle_offset_ms = subs.as_ref().map(|track| track.offset_ms).unwrap_or(0);
                     let subtitle_data = SubtitleData {
                         count: subtitle_lines.len(),
                         lines: subtitle_lines,
                         candidates: current_candidates.clone(),
                         selected_candidate_id,
                         selection_mode,
+                        subtitle_offset_ms,
                     };
                     let current_subtitle_signature = (
                         current_item_id.clone(),
@@ -1808,6 +1907,7 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
                         subtitle_data.selection_mode,
                         subtitle_data.count,
                         subtitle_data.candidates.clone(),
+                        subtitle_data.subtitle_offset_ms,
                     );
 
                     let send_subs = current_item_id != last_item_id

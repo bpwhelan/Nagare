@@ -35,6 +35,7 @@ export const subtitles = writable(/** @type {SubtitleLine[]} */ ([]));
 export const subtitleCandidates = writable(/** @type {SubtitleCandidate[]} */ ([]));
 export const selectedSubtitleCandidateId = writable(/** @type {string|null} */ (null));
 export const subtitleSelectionMode = writable(/** @type {'auto'|'manual'} */ ('auto'));
+export const subtitleOffsetMs = writable(0);
 export const activeLineIndex = writable(/** @type {number|null} */ (null));
 export const pendingCards = writable(/** @type {NewCardWithMatch[]} */ ([]));
 export const connected = writable(false);
@@ -128,6 +129,7 @@ export function applySubtitlePayload(payload) {
   subtitleCandidates.set(payload?.candidates || []);
   selectedSubtitleCandidateId.set(payload?.selected_candidate_id ?? null);
   subtitleSelectionMode.set(payload?.selection_mode || 'auto');
+  subtitleOffsetMs.set(payload?.subtitle_offset_ms ?? 0);
 }
 
 // Toasts
