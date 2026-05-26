@@ -203,6 +203,10 @@ impl AnkiClient {
             http: Client::builder()
                 .connect_timeout(Duration::from_secs(5))
                 .timeout(Duration::from_secs(30))
+                // AnkiConnect is a small local/LAN HTTP server; avoiding idle
+                // connection reuse prevents stale pooled sockets from turning
+                // into recurring one-off poll failures.
+                .pool_max_idle_per_host(0)
                 .build()
                 .unwrap_or_else(|error| {
                     warn!("Failed to build timed AnkiConnect client: {}", error);
@@ -401,7 +405,14 @@ fn has_live_session(state: &SessionState) -> bool {
 fn grace_remaining_since(last_live_session_at: Option<std::time::Instant>) -> Option<Duration> {
     const SESSION_POLL_GRACE: Duration = Duration::from_secs(600);
 
-    last_live_session_at.map(|last_seen| SESSION_POLL_GRACE.saturating_sub(last_seen.elapsed()))
+    last_live_session_at.and_then(|last_seen| {
+        let remaining = SESSION_POLL_GRACE.saturating_sub(last_seen.elapsed());
+        if remaining.is_zero() {
+            None
+        } else {
+            Some(remaining)
+        }
+    })
 }
 
 async fn set_idle_anki_status(status: &Arc<RwLock<AnkiStatus>>) {
@@ -579,11 +590,13 @@ async fn poll_ankiconnect_once(
 ) -> PollStep {
     let base_interval = Duration::from_millis(anki_config.polling_rate_ms);
     let max_interval = Duration::from_secs(5);
+    const DISCONNECT_AFTER_ERRORS: u32 = 5;
 
     match client.find_notes("added:1").await {
         Ok(current_ids) => {
-            {
+            let was_disconnected = {
                 let mut current_status = status.write().await;
+                let was_disconnected = current_status.state == AnkiConnectionState::Disconnected;
                 if current_status.state != AnkiConnectionState::Connected {
                     info!("AnkiConnect reachable at {}", anki_config.url);
                 }
@@ -591,13 +604,21 @@ async fn poll_ankiconnect_once(
                     state: AnkiConnectionState::Connected,
                     message: None,
                 };
-            }
+                was_disconnected
+            };
 
             if *consecutive_errors > 0 {
-                info!(
-                    "AnkiConnect reconnected after {} failed poll(s)",
-                    *consecutive_errors
-                );
+                if was_disconnected || *final_warning_shown {
+                    info!(
+                        "AnkiConnect reconnected after {} failed poll(s)",
+                        *consecutive_errors
+                    );
+                } else {
+                    debug!(
+                        "AnkiConnect recovered after {} transient failed poll(s)",
+                        *consecutive_errors
+                    );
+                }
                 *consecutive_errors = 0;
                 *final_warning_shown = false;
             }
@@ -659,18 +680,19 @@ async fn poll_ankiconnect_once(
         }
         Err(error) => {
             *consecutive_errors += 1;
-            set_disconnected_anki_status(
-                status,
-                format!(
-                    "Cannot reach AnkiConnect at {}. Card enrichment will stay unavailable until Anki is running. Last error: {}",
-                    anki_config.url, error
-                ),
-            )
-            .await;
+            if *consecutive_errors >= DISCONNECT_AFTER_ERRORS {
+                set_disconnected_anki_status(
+                    status,
+                    format!(
+                        "Cannot reach AnkiConnect at {}. Card enrichment will stay unavailable until Anki is running. Last error: {}",
+                        anki_config.url, error
+                    ),
+                )
+                .await;
+            }
 
-            const MAX_LOGGED_ERRORS: u32 = 5;
             if !*final_warning_shown {
-                if *consecutive_errors >= MAX_LOGGED_ERRORS {
+                if *consecutive_errors >= DISCONNECT_AFTER_ERRORS {
                     warn!(
                         "AnkiConnect unreachable after {} attempts - suppressing further \
                          warnings until reconnected. Make sure Anki is running and \
@@ -679,15 +701,15 @@ async fn poll_ankiconnect_once(
                     );
                     *final_warning_shown = true;
                 } else {
-                    warn!(
-                        "AnkiConnect poll failed ({}/{}): {}",
-                        *consecutive_errors, MAX_LOGGED_ERRORS, error
+                    debug!(
+                        "AnkiConnect transient poll failure ({}/{}): {}",
+                        *consecutive_errors, DISCONNECT_AFTER_ERRORS, error
                     );
                 }
             }
 
             let backoff = std::cmp::min(
-                base_interval * 2u32.pow((*consecutive_errors).min(10)),
+                base_interval * 2u32.pow(consecutive_errors.saturating_sub(1).min(10)),
                 max_interval,
             );
             PollStep::Continue(backoff)
@@ -825,6 +847,7 @@ pub async fn run_anki_poller(
     let mut poller_idle = false;
     let mut heartbeat: Option<HeartbeatState> = None;
     let mut processed_push_notes: HashSet<i64> = HashSet::new();
+    let mut next_fallback_poll_at: Option<Instant> = None;
     let mut last_live_session_at = if has_live_session(&session_rx.borrow()) {
         Some(Instant::now())
     } else {
@@ -855,6 +878,7 @@ pub async fn run_anki_poller(
             if !poller_idle {
                 known_ids.clear();
                 initialized = false;
+                next_fallback_poll_at = None;
                 consecutive_errors = 0;
                 final_warning_shown = false;
                 poller_idle = true;
@@ -922,27 +946,41 @@ pub async fn run_anki_poller(
         }
 
         let wait_after_poll = if push_active {
+            next_fallback_poll_at = None;
             heartbeat
                 .as_ref()
                 .map(HeartbeatState::duration_until_stale)
                 .unwrap_or_else(|| Duration::from_secs(30))
         } else {
-            let client = anki_client.read().await.clone();
-            let anki_config = config.read().await.anki.clone();
-            match poll_ankiconnect_once(
-                client,
-                anki_config,
-                &status,
-                &tx,
-                &mut known_ids,
-                &mut initialized,
-                &mut consecutive_errors,
-                &mut final_warning_shown,
-            )
-            .await
+            let now = Instant::now();
+            if next_fallback_poll_at
+                .map(|deadline| now >= deadline)
+                .unwrap_or(true)
             {
-                PollStep::Continue(wait_duration) => wait_duration,
-                PollStep::Stop => return,
+                let client = anki_client.read().await.clone();
+                let anki_config = config.read().await.anki.clone();
+                match poll_ankiconnect_once(
+                    client,
+                    anki_config,
+                    &status,
+                    &tx,
+                    &mut known_ids,
+                    &mut initialized,
+                    &mut consecutive_errors,
+                    &mut final_warning_shown,
+                )
+                .await
+                {
+                    PollStep::Continue(wait_duration) => {
+                        next_fallback_poll_at = Some(Instant::now() + wait_duration);
+                        wait_duration
+                    }
+                    PollStep::Stop => return,
+                }
+            } else {
+                next_fallback_poll_at
+                    .map(|deadline| deadline.saturating_duration_since(now))
+                    .unwrap_or(Duration::ZERO)
             }
         };
 
