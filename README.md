@@ -2,6 +2,24 @@
 
 Pronounced "Nah-gah-reh". Subtitle mining companion for Emby, Jellyfin, and Plex. Watches live playback sessions, displays a subtitle timeline in the browser, and enriches Anki cards with sentence audio, screenshots, and source metadata.
 
+![Nagare UI](.github/assets/nagare.png)
+
+<p align="center"><em>The subtitle timeline — mine any line from the current or past session directly in the browser. Highlighting via [Jiten Reader](https://jiten.moe/reader) </em></p>
+
+---
+
+![Anki Enhancement Dialogue](.github/assets/card_enhancement.png)
+
+<p align="center"><em>Anki Enhancement Dialogue allowing for tight control over what we mine</em></p>
+
+---
+
+<video src=".github/assets/card_example.mp4" controls width="100%"></video>
+
+<p align="center"><em>Finished Card (Kiku Notetype)</em></p>
+
+---
+
 NOTE: This project is my most vibe-coded yet, so YMMV. It's really a problem that I seeked out to solve for myself, but I believe/hope it can be useful for others.
 
 ## Features
@@ -22,6 +40,8 @@ NOTE: This project is my most vibe-coded yet, so YMMV. It's really a problem tha
 - [x] Add Plex support
 - [x] AnkiConnect integration
 - [x] Support for subtitles even when player has none (listening practice while maintaining mineability).
+- [x] Mining History, allowing you to touch up cards after the fact, or add more context.
+- [x] Session History, allowing you to load past sessions and mine from them.
 - [ ] Automatic Subtitle Sync? IDK if this is even feasible, the ability to press a button, Nagare syncs with alass or subplz, and then sends the updated sub to the media server would be the idea.
 - [ ] More Active Subtitle Sync? If you change subtitle timing in media player, Nagare will not adjust.
 - [ ] More options for audio/ss formats
@@ -87,9 +107,9 @@ All configuration is managed through the web UI Config page and stored in `data/
 
 ## How it works
 
-1. Nagare polls your media servers for active playback sessions
-2. Select a session in the web UI to load its subtitle track
-3. Create a card in Anki — Nagare matches it to the current subtitle context
+1. Nagare polls your media server(s) for active playback sessions
+2. Select a session or allow Nagare to auto-select the most recently active one
+3. Create a card in Anki — Nagare matches it to the exact subtitle context
 4. Confirm the match, preview audio/screenshot, and enrich the card
 
 ## Project structure
