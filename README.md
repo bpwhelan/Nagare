@@ -14,7 +14,9 @@ Pronounced "Nah-gah-reh". Subtitle mining companion for Emby, Jellyfin, and Plex
 
 ---
 
-<video src=".github/assets/card_example.mp4" controls width="100%"></video>
+
+https://github.com/user-attachments/assets/0c175780-ec50-4d05-b526-b4f4dcf35bdd
+
 
 <p align="center"><em>Finished Card (Kiku Notetype)</em></p>
 
