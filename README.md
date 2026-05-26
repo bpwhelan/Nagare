@@ -4,7 +4,7 @@ Pronounced "Nah-gah-reh". Subtitle mining companion for Emby, Jellyfin, and Plex
 
 ![Nagare UI](.github/assets/nagare.png)
 
-<p align="center"><em>The subtitle timeline — mine any line from the current or past session directly in the browser. Highlighting via [Jiten Reader](https://jiten.moe/reader) </em></p>
+<p align="center"><em>The subtitle timeline — mine any line from the current or past session directly in the browser. Highlighting via https://jiten.moe/reader </em></p>
 
 ---
 
