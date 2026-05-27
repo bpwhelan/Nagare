@@ -935,15 +935,21 @@ async fn generate_and_store_screenshot(
     item_id: &str,
     time_ms: i64,
     note_id: i64,
+    static_format: crate::config::StaticScreenshotFormat,
 ) -> Option<String> {
     info!(
         "[enhance {}] Capturing screenshot fallback at {}ms...",
         note_id, time_ms
     );
-    match media::generate_screenshot(source, time_ms).await {
-        Ok((ss_path, ss_data)) => {
-            let ss_filename = format!("nagare_{}_{}_ss.webp", item_id, time_ms);
-            let ss_b64 = media::to_base64(&ss_data);
+    match media::generate_screenshot(source, time_ms, static_format).await {
+        Ok(image) => {
+            let ss_filename = format!(
+                "nagare_{}_{}_ss.{}",
+                item_id,
+                time_ms,
+                image.format.extension()
+            );
+            let ss_b64 = media::to_base64(&image.data);
             let picture_html = match anki_client.store_media_file(&ss_filename, &ss_b64).await {
                 Ok(_) => {
                     info!("[enhance {}] Screenshot stored in Anki", note_id);
@@ -957,7 +963,7 @@ async fn generate_and_store_screenshot(
                     None
                 }
             };
-            media::cleanup_temp_file(&ss_path).await;
+            media::cleanup_temp_file(&image.path).await;
             picture_html
         }
         Err(error) => {
@@ -1017,16 +1023,23 @@ async fn perform_enrichment(
         let selected_audio_track = *state.selected_audio_track.read().await;
         let (audio_track_index, audio_track_ordinal) =
             resolve_audio_mapping(&state, selected_audio_track).await;
+        let audio_codec = config.mining.audio_codec;
         let (audio_path, audio_data) = media::extract_audio(
             &source,
             req.start_ms,
             req.end_ms,
             audio_track_index,
             audio_track_ordinal,
+            audio_codec,
         )
         .await
         .map_err(|error| format!("Audio extraction failed: {}", error))?;
-        let audio_filename = format!("nagare_{}_{}.opus", media_ctx.item_id, req.start_ms);
+        let audio_filename = format!(
+            "nagare_{}_{}.{}",
+            media_ctx.item_id,
+            req.start_ms,
+            audio_codec.extension()
+        );
         let audio_b64 = media::to_base64(&audio_data);
         info!(
             "[enhance {}] Audio extracted ({} bytes), storing in Anki as {}...",
@@ -1047,11 +1060,15 @@ async fn perform_enrichment(
         let mut picture_html = String::new();
         let mid_ms = (req.start_ms + req.end_ms) / 2;
         if req.generate_avif {
+            let avif_encoder = config.mining.animated_screenshot_encoder;
             info!(
-                "[enhance {}] Generating AVIF ({}ms - {}ms)...",
-                note_id, req.start_ms, req.end_ms
+                "[enhance {}] Generating AVIF with {} ({}ms - {}ms)...",
+                note_id,
+                avif_encoder.as_str(),
+                req.start_ms,
+                req.end_ms
             );
-            match media::generate_avif(&source, req.start_ms, req.end_ms).await {
+            match media::generate_avif(&source, req.start_ms, req.end_ms, avif_encoder).await {
                 Ok((avif_path, avif_data)) => {
                     let avif_filename =
                         format!("nagare_{}_{}.avif", media_ctx.item_id, req.start_ms);
@@ -1097,6 +1114,7 @@ async fn perform_enrichment(
                 &media_ctx.item_id,
                 mid_ms,
                 note_id,
+                config.mining.static_screenshot_format,
             )
             .await
             {
@@ -1579,12 +1597,14 @@ async fn preview_audio_url(
     let selected_audio_track = *state.selected_audio_track.read().await;
     let (audio_track_index, audio_track_ordinal) =
         resolve_audio_mapping(&state, selected_audio_track).await;
+    let audio_codec = config.mining.audio_codec;
     match media::extract_audio(
         &source,
         req.start_ms,
         req.end_ms,
         audio_track_index,
         audio_track_ordinal,
+        audio_codec,
     )
     .await
     {
@@ -1593,7 +1613,8 @@ async fn preview_audio_url(
             media::cleanup_temp_file(&path).await;
             Json(serde_json::json!({
                 "audio_base64": b64,
-                "format": "opus",
+                "format": audio_codec.as_str(),
+                "mime_type": audio_codec.mime_type(),
             }))
         }
         Err(e) => Json(serde_json::json!({"error": e.to_string()})),
@@ -1634,13 +1655,16 @@ async fn preview_screenshot(
         }
     };
 
-    match media::generate_screenshot(&source, req.time_ms).await {
-        Ok((path, data)) => {
-            let b64 = media::to_base64(&data);
-            media::cleanup_temp_file(&path).await;
+    match media::generate_screenshot(&source, req.time_ms, config.mining.static_screenshot_format)
+        .await
+    {
+        Ok(image) => {
+            let b64 = media::to_base64(&image.data);
+            media::cleanup_temp_file(&image.path).await;
             Json(serde_json::json!({
                 "image_base64": b64,
-                "format": "webp",
+                "format": image.format.as_str(),
+                "mime_type": image.format.mime_type(),
             }))
         }
         Err(e) => Json(serde_json::json!({"error": e.to_string()})),
@@ -1725,12 +1749,14 @@ async fn preview_audio_track(
 
     let (audio_track_index, audio_track_ordinal) =
         resolve_audio_mapping(&state, Some(req.stream_index)).await;
+    let audio_codec = config.mining.audio_codec;
     match media::extract_audio(
         &source,
         sample_start_ms,
         end_ms,
         audio_track_index,
         audio_track_ordinal,
+        audio_codec,
     )
     .await
     {
@@ -1739,7 +1765,8 @@ async fn preview_audio_track(
             media::cleanup_temp_file(&path).await;
             Json(serde_json::json!({
                 "audio_base64": b64,
-                "format": "opus",
+                "format": audio_codec.as_str(),
+                "mime_type": audio_codec.mime_type(),
             }))
         }
         Err(e) => Json(serde_json::json!({"error": e.to_string()})),
