@@ -162,14 +162,128 @@ pub struct MiningConfig {
     #[serde(default = "default_audio_end_offset_ms")]
     pub audio_end_offset_ms: i64,
 
+    #[serde(default = "default_audio_codec")]
+    pub audio_codec: AudioCodec,
+
     #[serde(default = "default_true")]
     pub generate_avif: bool,
+
+    #[serde(default = "default_animated_screenshot_encoder")]
+    pub animated_screenshot_encoder: AnimatedScreenshotEncoder,
+
+    #[serde(default = "default_static_screenshot_format")]
+    pub static_screenshot_format: StaticScreenshotFormat,
 
     /// Legacy server-side setting kept temporarily so existing configs can be
     /// migrated into client-side local storage. It is ignored by the backend
     /// and stripped when the config is written back to disk.
     #[serde(default)]
     pub auto_approve: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum AudioCodec {
+    Mp3,
+    Aac,
+    Opus,
+}
+
+impl AudioCodec {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Mp3 => "mp3",
+            Self::Aac => "aac",
+            Self::Opus => "opus",
+        }
+    }
+
+    pub fn extension(self) -> &'static str {
+        match self {
+            Self::Mp3 => "mp3",
+            Self::Aac => "m4a",
+            Self::Opus => "opus",
+        }
+    }
+
+    pub fn mime_type(self) -> &'static str {
+        match self {
+            Self::Mp3 => "audio/mpeg",
+            Self::Aac => "audio/mp4",
+            Self::Opus => "audio/ogg; codecs=opus",
+        }
+    }
+
+    pub fn ffmpeg_args(self) -> &'static [&'static str] {
+        match self {
+            Self::Mp3 => &["-acodec", "libmp3lame", "-b:a", "96k", "-ac", "1"],
+            Self::Aac => &[
+                "-acodec",
+                "aac",
+                "-b:a",
+                "96k",
+                "-ac",
+                "1",
+                "-movflags",
+                "+faststart",
+            ],
+            Self::Opus => &["-acodec", "libopus", "-b:a", "64k", "-ac", "1"],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum AnimatedScreenshotEncoder {
+    #[serde(rename = "libsvtav1")]
+    Libsvtav1,
+    #[serde(rename = "libaom-av1")]
+    LibaomAv1,
+}
+
+impl AnimatedScreenshotEncoder {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Libsvtav1 => "libsvtav1",
+            Self::LibaomAv1 => "libaom-av1",
+        }
+    }
+
+    pub fn fallback(self) -> Self {
+        match self {
+            Self::Libsvtav1 => Self::LibaomAv1,
+            Self::LibaomAv1 => Self::Libsvtav1,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum StaticScreenshotFormat {
+    Webp,
+    Jpg,
+    Png,
+}
+
+impl StaticScreenshotFormat {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Webp => "webp",
+            Self::Jpg => "jpg",
+            Self::Png => "png",
+        }
+    }
+
+    pub fn extension(self) -> &'static str {
+        self.as_str()
+    }
+
+    pub fn mime_type(self) -> &'static str {
+        match self {
+            Self::Webp => "image/webp",
+            Self::Jpg => "image/jpeg",
+            Self::Png => "image/png",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -328,7 +442,10 @@ impl Default for MiningConfig {
         Self {
             audio_start_offset_ms: default_audio_start_offset_ms(),
             audio_end_offset_ms: default_audio_end_offset_ms(),
+            audio_codec: default_audio_codec(),
             generate_avif: true,
+            animated_screenshot_encoder: default_animated_screenshot_encoder(),
+            static_screenshot_format: default_static_screenshot_format(),
             auto_approve: false,
         }
     }
@@ -363,6 +480,15 @@ fn default_audio_start_offset_ms() -> i64 {
 }
 fn default_audio_end_offset_ms() -> i64 {
     500
+}
+fn default_audio_codec() -> AudioCodec {
+    AudioCodec::Mp3
+}
+fn default_animated_screenshot_encoder() -> AnimatedScreenshotEncoder {
+    AnimatedScreenshotEncoder::Libsvtav1
+}
+fn default_static_screenshot_format() -> StaticScreenshotFormat {
+    StaticScreenshotFormat::Webp
 }
 fn default_true() -> bool {
     true

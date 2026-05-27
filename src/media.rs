@@ -5,6 +5,14 @@ use tokio::process::Command;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+use crate::config::{AnimatedScreenshotEncoder, AudioCodec, StaticScreenshotFormat};
+
+/// Set to true locally to force AVIF generation through the configured encoder's fallback path.
+const FORCE_AVIF_ENCODER_FALLBACK: bool = false;
+
+/// Set to true locally to force static screenshot generation through its fallback path.
+const FORCE_SCREENSHOT_JPEG_FALLBACK: bool = false;
+
 /// Temporary directory for ffmpeg output.
 fn temp_dir() -> PathBuf {
     let dir = std::env::temp_dir().join("nagare");
@@ -28,6 +36,12 @@ fn http_input_args(source: &str) -> Vec<&'static str> {
     }
 }
 
+pub struct GeneratedImage {
+    pub path: PathBuf,
+    pub data: Vec<u8>,
+    pub format: StaticScreenshotFormat,
+}
+
 /// Run an ffmpeg command, capturing stderr, returning a descriptive error on failure.
 async fn run_ffmpeg(mut cmd: Command) -> Result<()> {
     cmd.kill_on_drop(true);
@@ -48,7 +62,7 @@ async fn run_ffmpeg(mut cmd: Command) -> Result<()> {
     Ok(())
 }
 
-/// Extract audio from a video source to Opus format.
+/// Extract audio from a video source to the configured audio codec.
 ///
 /// When `audio_stream_ordinal` is `Some(idx)`, ffmpeg is told to use that specific
 /// audio stream (`-map 0:a:{idx}`), which is more reliable than server-provided
@@ -60,9 +74,10 @@ pub async fn extract_audio(
     end_ms: i64,
     audio_stream_index: Option<u32>,
     audio_stream_ordinal: Option<usize>,
+    audio_codec: AudioCodec,
 ) -> Result<(PathBuf, Vec<u8>)> {
     let id = Uuid::new_v4();
-    let output_path = temp_dir().join(format!("{}.opus", id));
+    let output_path = temp_dir().join(format!("{}.{}", id, audio_codec.extension()));
 
     let start_secs = start_ms as f64 / 1000.0;
     let duration_secs = (end_ms - start_ms) as f64 / 1000.0;
@@ -92,16 +107,9 @@ pub async fn extract_audio(
         cmd.args(["-map", &format!("0:{}", idx)]);
     }
 
-    cmd.args([
-        "-vn",
-        "-acodec",
-        "libopus",
-        "-b:a",
-        "64k",
-        "-ac",
-        "1",
-        output_path.to_str().unwrap(),
-    ]);
+    cmd.arg("-vn");
+    cmd.args(audio_codec.ffmpeg_args());
+    cmd.arg(output_path.to_str().unwrap());
 
     run_ffmpeg(cmd)
         .await
@@ -109,7 +117,8 @@ pub async fn extract_audio(
 
     let data = tokio::fs::read(&output_path).await?;
     info!(
-        "Extracted audio: {:.1}s ({} bytes)",
+        "Extracted {} audio: {:.1}s ({} bytes)",
+        audio_codec.as_str(),
         duration_secs,
         data.len()
     );
@@ -117,8 +126,51 @@ pub async fn extract_audio(
     Ok((output_path, data))
 }
 
+fn build_avif_command(
+    source: &str,
+    start_secs: f64,
+    duration: f64,
+    vf: &str,
+    crf: i32,
+    encoder: AnimatedScreenshotEncoder,
+    output_path: &Path,
+) -> Command {
+    let mut cmd = Command::new("ffmpeg");
+    for arg in http_input_args(source) {
+        cmd.arg(arg);
+    }
+    cmd.arg("-y")
+        .arg("-ss")
+        .arg(format!("{:.3}", start_secs))
+        .arg("-i")
+        .arg(source)
+        .arg("-t")
+        .arg(format!("{:.3}", duration))
+        .arg("-vf")
+        .arg(vf)
+        .arg("-c:v")
+        .arg(encoder.as_str())
+        .arg("-crf")
+        .arg(crf.to_string());
+
+    if encoder == AnimatedScreenshotEncoder::Libsvtav1 {
+        cmd.args(["-preset", "8"]);
+    }
+
+    cmd.arg("-an")
+        .arg("-movflags")
+        .arg("+faststart")
+        .arg(output_path);
+    cmd
+}
+
 /// Generate an animated AVIF from a video source.
-pub async fn generate_avif(source: &str, start_ms: i64, end_ms: i64) -> Result<(PathBuf, Vec<u8>)> {
+pub async fn generate_avif(
+    source: &str,
+    start_ms: i64,
+    end_ms: i64,
+    encoder: AnimatedScreenshotEncoder,
+) -> Result<(PathBuf, Vec<u8>)> {
     let id = Uuid::new_v4();
     let output_path = temp_dir().join(format!("{}.avif", id));
 
@@ -136,33 +188,54 @@ pub async fn generate_avif(source: &str, start_ms: i64, end_ms: i64) -> Result<(
 
     let vf = format!("fps={},scale={}:-1", fps, scale);
 
-    let mut cmd = Command::new("ffmpeg");
-    for arg in http_input_args(source) {
-        cmd.arg(arg);
-    }
-    cmd.args([
-        "-y",
-        "-ss",
-        &format!("{:.3}", start_secs),
-        "-i",
-        source,
-        "-t",
-        &format!("{:.3}", duration),
-        "-vf",
-        &vf,
-        "-c:v",
-        "libaom-av1",
-        "-crf",
-        &crf.to_string(),
-        "-an",
-        "-movflags",
-        "+faststart",
-        output_path.to_str().unwrap(),
-    ]);
-
-    run_ffmpeg(cmd)
+    let primary_result = if FORCE_AVIF_ENCODER_FALLBACK {
+        Err(anyhow::anyhow!(
+            "forced AVIF encoder fallback via FORCE_AVIF_ENCODER_FALLBACK"
+        ))
+    } else {
+        run_ffmpeg(build_avif_command(
+            source,
+            start_secs,
+            duration,
+            &vf,
+            crf,
+            encoder,
+            &output_path,
+        ))
         .await
-        .map_err(|e| anyhow::anyhow!("ffmpeg AVIF generation failed: {}", e))?;
+    };
+
+    if let Err(primary_error) = primary_result {
+        let fallback_encoder = encoder.fallback();
+        warn!(
+            "AVIF generation with {} failed; retrying with {}: {}",
+            encoder.as_str(),
+            fallback_encoder.as_str(),
+            primary_error
+        );
+        let _ = tokio::fs::remove_file(&output_path).await;
+        run_ffmpeg(build_avif_command(
+            source,
+            start_secs,
+            duration,
+            &vf,
+            crf,
+            fallback_encoder,
+            &output_path,
+        ))
+        .await
+        .map_err(|fallback_error| {
+            anyhow::anyhow!(
+                "ffmpeg AVIF generation failed with {} and {}\n{}: {}\n{}: {}",
+                encoder.as_str(),
+                fallback_encoder.as_str(),
+                encoder.as_str(),
+                primary_error,
+                fallback_encoder.as_str(),
+                fallback_error
+            )
+        })?;
+    }
 
     let data = tokio::fs::read(&output_path).await?;
     info!(
@@ -176,42 +249,122 @@ pub async fn generate_avif(source: &str, start_ms: i64, end_ms: i64) -> Result<(
     Ok((output_path, data))
 }
 
-/// Generate a single screenshot (still image) from video.
-pub async fn generate_screenshot(source: &str, time_ms: i64) -> Result<(PathBuf, Vec<u8>)> {
-    let id = Uuid::new_v4();
-    let output_path = temp_dir().join(format!("{}.webp", id));
-
-    let time_secs = time_ms as f64 / 1000.0;
-
+fn build_screenshot_command(
+    source: &str,
+    time_secs: f64,
+    output_path: &Path,
+    format: StaticScreenshotFormat,
+) -> Command {
     let mut cmd = Command::new("ffmpeg");
     for arg in http_input_args(source) {
         cmd.arg(arg);
     }
-    cmd.args([
-        "-y",
-        "-ss",
-        &format!("{:.3}", time_secs),
-        "-i",
-        source,
-        "-frames:v",
-        "1",
-        "-vf",
-        "scale=640:-1",
-        "-c:v",
-        "libwebp",
-        "-quality",
-        "90",
-        output_path.to_str().unwrap(),
-    ]);
+    cmd.arg("-y")
+        .arg("-ss")
+        .arg(format!("{:.3}", time_secs))
+        .arg("-i")
+        .arg(source)
+        .arg("-frames:v")
+        .arg("1")
+        .arg("-vf")
+        .arg("scale=640:-1");
 
-    run_ffmpeg(cmd)
-        .await
-        .map_err(|e| anyhow::anyhow!("ffmpeg screenshot failed: {}", e))?;
+    match format {
+        StaticScreenshotFormat::Webp => {
+            cmd.args(["-c:v", "libwebp", "-quality", "90"]);
+        }
+        StaticScreenshotFormat::Jpg => {
+            cmd.args(["-c:v", "mjpeg", "-q:v", "2"]);
+        }
+        StaticScreenshotFormat::Png => {
+            cmd.args(["-c:v", "png", "-compression_level", "6"]);
+        }
+    }
 
-    let data = tokio::fs::read(&output_path).await?;
-    debug!("Generated screenshot: {} bytes", data.len());
+    cmd.arg(output_path);
+    cmd
+}
 
-    Ok((output_path, data))
+fn static_screenshot_attempts(primary: StaticScreenshotFormat) -> Vec<StaticScreenshotFormat> {
+    let mut attempts = vec![primary];
+    for format in [
+        StaticScreenshotFormat::Jpg,
+        StaticScreenshotFormat::Webp,
+        StaticScreenshotFormat::Png,
+    ] {
+        if format != primary {
+            attempts.push(format);
+        }
+    }
+    attempts
+}
+
+/// Generate a single screenshot (still image) from video.
+pub async fn generate_screenshot(
+    source: &str,
+    time_ms: i64,
+    primary_format: StaticScreenshotFormat,
+) -> Result<GeneratedImage> {
+    let id = Uuid::new_v4();
+
+    let time_secs = time_ms as f64 / 1000.0;
+
+    let mut errors = Vec::new();
+    for (attempt_index, format) in static_screenshot_attempts(primary_format)
+        .into_iter()
+        .enumerate()
+    {
+        let output_path = temp_dir().join(format!("{}.{}", id, format.extension()));
+        let result = if attempt_index == 0 && FORCE_SCREENSHOT_JPEG_FALLBACK {
+            Err(anyhow::anyhow!(
+                "forced static screenshot fallback via FORCE_SCREENSHOT_JPEG_FALLBACK"
+            ))
+        } else {
+            run_ffmpeg(build_screenshot_command(
+                source,
+                time_secs,
+                &output_path,
+                format,
+            ))
+            .await
+        };
+
+        match result {
+            Ok(()) => {
+                let data = tokio::fs::read(&output_path).await?;
+                debug!(
+                    "Generated {} screenshot: {} bytes",
+                    format.as_str(),
+                    data.len()
+                );
+
+                return Ok(GeneratedImage {
+                    path: output_path,
+                    data,
+                    format,
+                });
+            }
+            Err(error) => {
+                warn!(
+                    "Screenshot generation with {} failed{}: {}",
+                    format.as_str(),
+                    if attempt_index == 0 {
+                        "; retrying fallback"
+                    } else {
+                        ""
+                    },
+                    error
+                );
+                let _ = tokio::fs::remove_file(&output_path).await;
+                errors.push(format!("{}: {}", format.as_str(), error));
+            }
+        }
+    }
+
+    anyhow::bail!(
+        "ffmpeg screenshot failed with all configured fallback formats\n{}",
+        errors.join("\n")
+    )
 }
 
 /// Determine the media source path/URL based on config.

@@ -42,7 +42,10 @@
     if (!config.mining) config.mining = {};
     if (config.mining.audio_start_offset_ms == null) config.mining.audio_start_offset_ms = 100;
     if (config.mining.audio_end_offset_ms == null) config.mining.audio_end_offset_ms = 500;
+    if (config.mining.audio_codec == null) config.mining.audio_codec = 'mp3';
     if (config.mining.generate_avif == null) config.mining.generate_avif = true;
+    if (config.mining.animated_screenshot_encoder == null) config.mining.animated_screenshot_encoder = 'libsvtav1';
+    if (config.mining.static_screenshot_format == null) config.mining.static_screenshot_format = 'webp';
     delete config.mining.auto_approve;
     applyMiningConfig(config.mining);
   }
@@ -428,10 +431,33 @@
         <input id="end-offset" type="number" min="0" max="5000" step="50" bind:value={config.mining.audio_end_offset_ms} />
       </div>
       <div class="field">
+        <label for="audio-codec">Audio Codec</label>
+        <select id="audio-codec" bind:value={config.mining.audio_codec}>
+          <option value="mp3">MP3 (most compatible)</option>
+          <option value="aac">AAC / M4A</option>
+          <option value="opus">Opus</option>
+        </select>
+      </div>
+      <div class="field">
         <div class="checkbox-row">
           <input id="default-avif" type="checkbox" bind:checked={config.mining.generate_avif} />
           <label for="default-avif">Generate animated screenshot by default</label>
         </div>
+      </div>
+      <div class="field">
+        <label for="animated-screenshot-encoder">Animated Screenshot Encoder</label>
+        <select id="animated-screenshot-encoder" bind:value={config.mining.animated_screenshot_encoder}>
+          <option value="libsvtav1">libsvtav1 (fast)</option>
+          <option value="libaom-av1">libaom-av1 (slow, higher quality)</option>
+        </select>
+      </div>
+      <div class="field">
+        <label for="static-screenshot-format">Static Screenshot Format</label>
+        <select id="static-screenshot-format" bind:value={config.mining.static_screenshot_format}>
+          <option value="webp">WebP</option>
+          <option value="jpg">JPG</option>
+          <option value="png">PNG</option>
+        </select>
       </div>
     </section>
 

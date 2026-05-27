@@ -1,6 +1,7 @@
 <script>
   import { audioTracks, selectedAudioTrackIndex, showAudioTrackModal, showErrorToast, applyAudioTracksPayload } from './stores.js';
   import { selectAudioTrack, previewAudioTrack } from './api.js';
+  import { audioMimeType } from './utils.js';
 
   let previewingIndex = null;
   let previewAudioUrl = null;
@@ -44,7 +45,7 @@
       const bytes = atob(result.audio_base64);
       const arr = new Uint8Array(bytes.length);
       for (let i = 0; i < bytes.length; i++) arr[i] = bytes.charCodeAt(i);
-      const blob = new Blob([arr], { type: 'audio/ogg; codecs=opus' });
+      const blob = new Blob([arr], { type: audioMimeType(result.format, result.mime_type) });
       previewAudioUrl = URL.createObjectURL(blob);
       previewAudioEl = new Audio(previewAudioUrl);
       previewAudioEl.addEventListener('ended', () => { previewingIndex = null; });

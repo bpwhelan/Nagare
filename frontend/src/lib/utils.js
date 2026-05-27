@@ -17,3 +17,34 @@ export function formatTimeFull(ms) {
   }
   return `${minutes}:${seconds.toString().padStart(2, '0')}`;
 }
+
+export function audioMimeType(format, mimeType = null) {
+  if (mimeType) return mimeType;
+  switch (format) {
+    case 'mp3':
+      return 'audio/mpeg';
+    case 'aac':
+      return 'audio/mp4';
+    case 'opus':
+      return 'audio/ogg; codecs=opus';
+    default:
+      return 'application/octet-stream';
+  }
+}
+
+export function imageMimeType(format, mimeType = null) {
+  if (mimeType) return mimeType;
+  switch (format) {
+    case 'jpeg':
+    case 'jpg':
+      return 'image/jpeg';
+    case 'webp':
+      return 'image/webp';
+    case 'png':
+      return 'image/png';
+    case 'avif':
+      return 'image/avif';
+    default:
+      return 'application/octet-stream';
+  }
+}

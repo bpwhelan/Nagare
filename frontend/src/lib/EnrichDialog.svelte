@@ -18,7 +18,7 @@
     isPlaying,
   } from './stores.js';
   import { enrichCard, skipEnrichment, previewAudio, previewScreenshot, getSubtitleMatches, firePlayPause, queueEnrichCard } from './api.js';
-  import { formatTime } from './utils.js';
+  import { audioMimeType, formatTime, imageMimeType } from './utils.js';
 
   $: card = $dialogCard || $pendingCards[0] || null;
   $: isRouteCard = $dialogCard != null;
@@ -390,7 +390,7 @@
     const bytes = atob(result.audio_base64);
     const arr = new Uint8Array(bytes.length);
     for (let i = 0; i < bytes.length; i++) arr[i] = bytes.charCodeAt(i);
-    const blob = new Blob([arr], { type: 'audio/ogg; codecs=opus' });
+    const blob = new Blob([arr], { type: audioMimeType(result.format, result.mime_type) });
     const nextUrl = URL.createObjectURL(blob);
 
     if (audioElement) {
@@ -451,7 +451,7 @@
         const bytes = atob(result.image_base64);
         const arr = new Uint8Array(bytes.length);
         for (let i = 0; i < bytes.length; i++) arr[i] = bytes.charCodeAt(i);
-        const blob = new Blob([arr], { type: 'image/avif' });
+        const blob = new Blob([arr], { type: imageMimeType(result.format, result.mime_type) });
         screenshotUrl = URL.createObjectURL(blob);
       }
     } catch (e) {
