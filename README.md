@@ -34,7 +34,9 @@
 
 ---
 
-https://github.com/user-attachments/assets/0c175780-ec50-4d05-b526-b4f4dcf35bdd
+
+https://github.com/user-attachments/assets/3b0fb77d-189e-4558-8479-7bccaa67e86f
+
 
 <p align="center"><em>Finished Card (Kiku Notetype)</em></p>
 
