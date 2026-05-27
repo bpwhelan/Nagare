@@ -1,10 +1,30 @@
-# Nagare (流れ)
+<p align="center">
+    <img src=".github/assets/icon.png" width="100" height="100" style="border-radius: 20px" alt="nagare" />
+</p>
 
-Pronounced "Nah-gah-reh". Subtitle mining companion for Emby, Jellyfin, and Plex. Watches live playback sessions, displays a subtitle timeline in the browser, and enriches Anki cards with sentence audio, screenshots, and source metadata.
+<h1 align="center">Nagare (流れ)</h1>
+
+<p align="center">
+    <em>Pronounced "Nah-gah-reh" — subtitle mining companion for Emby, Jellyfin, and Plex.</em>
+</p>
+
+<div align="center">
+
+[![Github All Releases](https://img.shields.io/github/downloads/bpwhelan/Nagare/total.svg)](https://github.com/bpwhelan/Nagare/releases)
+<a href="https://github.com/sponsors/bpwhelan">
+    <img src="https://img.shields.io/static/v1?label=Sponsor&message=%E2%9D%A4&logo=GitHub&color=%23fe8e86" alt="Sponsor on GitHub">
+</a>
+[![Ko-Fi](https://img.shields.io/badge/donate-ko--fi-ed6760?label=donate)](https://ko-fi.com/beangate)
+[![Docker Image](https://img.shields.io/badge/ghcr.io-nagare-0db7ed?logo=docker)](https://github.com/bpwhelan/Nagare/pkgs/container/nagare)
+[![GitHub License](https://img.shields.io/github/license/bpwhelan/Nagare)](https://github.com/bpwhelan/Nagare?tab=MIT-1-ov-file)
+
+</div>
+
+### 🎬 See it in Action
 
 ![Nagare UI](.github/assets/nagare.png)
 
-<p align="center"><em>The subtitle timeline — mine any line from the current or past session directly in the browser. Highlighting via https://jiten.moe/reader </em></p>
+<p align="center"><em>The subtitle timeline — mine any line from the current or past session directly in the browser. Highlighting via https://jiten.moe/reader</em></p>
 
 ---
 
@@ -14,15 +34,19 @@ Pronounced "Nah-gah-reh". Subtitle mining companion for Emby, Jellyfin, and Plex
 
 ---
 
-
 https://github.com/user-attachments/assets/0c175780-ec50-4d05-b526-b4f4dcf35bdd
-
 
 <p align="center"><em>Finished Card (Kiku Notetype)</em></p>
 
 ---
 
-NOTE: This project is my most vibe-coded yet, so YMMV. It's really a problem that I seeked out to solve for myself, but I believe/hope it can be useful for others.
+## What does it do?
+
+Nagare watches your active media server playback sessions, displays a live subtitle timeline in the browser, and enriches Anki cards with sentence audio, screenshots, and source metadata — without interrupting your immersion.
+
+> **Note:** This project is my most vibe-coded yet, so YMMV. It's really a problem that I sought out to solve for myself, but I believe/hope it can be useful for others.
+
+---
 
 ## Features
 
