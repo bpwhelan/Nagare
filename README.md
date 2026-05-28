@@ -70,8 +70,9 @@ Nagare watches your active media server playback sessions, displays a live subti
 - [x] Support for subtitles even when player has none (listening practice while maintaining mineability).
 - [x] Mining History, allowing you to touch up cards after the fact, or add more context.
 - [x] Session History, allowing you to load past sessions and mine from them.
+- [x] Manual Subtitle Offset
 - [ ] Automatic Subtitle Sync? IDK if this is even feasible, the ability to press a button, Nagare syncs with alass or subplz, and then sends the updated sub to the media server would be the idea.
-- [ ] More Active Subtitle Sync? If you change subtitle timing in media player, Nagare will not adjust.
+- [ ] More Active Subtitle Sync? If you change subtitle timing in media player, Nagare will not adjust. I doubt this is possible...
 - [ ] More options for audio/ss formats
 
 
