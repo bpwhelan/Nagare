@@ -251,6 +251,12 @@
 
   // Indices whose native text the user has explicitly toggled on (touch / click).
   let nativeShown = new Set();
+  // Index currently hovered via the toggle glyph (desktop reveal only).
+  let hoveredNativeIndex = null;
+
+  function nativeVisible(index, shown, hovered) {
+    return shown.has(index) || hovered === index;
+  }
 
   function toggleNative(index) {
     if (nativeShown.has(index)) {
@@ -262,7 +268,10 @@
   }
 
   // Drop toggled indices when the track changes so stale ids don't leak across items.
-  $: if ($nativeSubtitles) nativeShown = new Set();
+  $: if ($nativeSubtitles) {
+    nativeShown = new Set();
+    hoveredNativeIndex = null;
+  }
 </script>
 
 <div class="timeline-container" class:navigation-disabled={$yomitanPopupVisible} bind:this={container} on:scroll={handleScroll}>
@@ -337,32 +346,33 @@
           on:keyup={(e) => e.key === 'Enter' && handleLineClick(line)}
           on:mouseenter={() => handleLineMouseEnter(i)}
           on:mouseleave={() => handleLineMouseLeave(i)}
+          class:has-native={!!nativeTextByLine[i]}
         >
           <div class="line-body">
-            <div class="line-main">
-              <p class="text">
-                {@html line.text.replace(/\n/g, '<br>')}
-              </p>
-              {#if nativeTextByLine[i]}
-                <button
-                  type="button"
-                  class="native-toggle"
-                  class:active={nativeShown.has(i)}
-                  aria-label="Toggle native-language line"
-                  aria-pressed={nativeShown.has(i)}
-                  title="Show native-language subtitle"
-                  on:pointerdown|stopPropagation
-                  on:click|stopPropagation={() => toggleNative(i)}
-                  on:keyup|stopPropagation={(e) => e.key === 'Enter' && toggleNative(i)}
-                >文<span>A</span></button>
-              {/if}
-            </div>
+            <p class="text">
+              {@html line.text.replace(/\n/g, '<br>')}
+            </p>
             {#if nativeTextByLine[i]}
-              <p class="native-text" class:native-shown={nativeShown.has(i)}>
+              <p class="native-text" class:native-shown={nativeVisible(i, nativeShown, hoveredNativeIndex)}>
                 {@html nativeTextByLine[i].replace(/\n/g, '<br>')}
               </p>
             {/if}
           </div>
+          {#if nativeTextByLine[i]}
+            <button
+              type="button"
+              class="native-toggle"
+              class:active={nativeShown.has(i)}
+              aria-label="Toggle native-language line"
+              aria-pressed={nativeShown.has(i)}
+              title="Show native-language subtitle"
+              on:pointerdown|stopPropagation
+              on:click|stopPropagation={() => toggleNative(i)}
+              on:keyup|stopPropagation={(e) => e.key === 'Enter' && toggleNative(i)}
+              on:mouseenter={() => (hoveredNativeIndex = i)}
+              on:mouseleave={() => { if (hoveredNativeIndex === i) hoveredNativeIndex = null; }}
+            ><svg viewBox="0 0 20 20" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><line x1="4" y1="7" x2="16" y2="7" /><line x1="4" y1="12" x2="12" y2="12" /></svg></button>
+          {/if}
         </div>
         {@html newLineCharacter}
       {/each}
@@ -536,6 +546,7 @@
   }
 
   .line {
+    position: relative;
     display: flex;
     align-items: flex-start;
     gap: 0.75rem;
@@ -570,20 +581,16 @@
   .line-body {
     flex: 1;
     min-width: 0;
-    display: flex;
-    flex-direction: column;
-    gap: 0.15rem;
+    /* #app sets text-align: center globally; subtitles must read left. */
+    text-align: left;
   }
 
-  .line-main {
-    display: flex;
-    align-items: flex-start;
-    gap: 0.5rem;
+  /* Reserve room on the right for the absolute toggle glyph. */
+  .line.has-native .line-body {
+    padding-right: 1.9rem;
   }
 
   .line .text {
-    flex: 1;
-    min-width: 0;
     font-size: 1.1rem;
     line-height: 1.5;
     word-break: break-word;
@@ -591,25 +598,21 @@
   }
 
   .native-toggle {
-    flex-shrink: 0;
-    align-self: flex-start;
+    position: absolute;
+    top: 0.5rem;
+    right: 0.5rem;
     display: inline-flex;
-    align-items: baseline;
-    gap: 1px;
-    padding: 0.05rem 0.3rem;
+    align-items: center;
+    justify-content: center;
+    padding: 0.15rem 0.25rem;
     border: 1px solid var(--border);
     border-radius: 4px;
-    background: transparent;
+    background: var(--bg-secondary);
     color: var(--text-dim);
-    font-size: 0.7rem;
-    line-height: 1.3;
+    line-height: 0;
     cursor: pointer;
     opacity: 0.5;
     transition: opacity 0.15s, color 0.15s, border-color 0.15s;
-  }
-
-  .native-toggle span {
-    font-size: 0.6rem;
   }
 
   .line:hover .native-toggle {
@@ -624,24 +627,17 @@
   }
 
   .native-text {
-    margin: 0;
+    margin: 0.15rem 0 0;
     font-size: 0.95rem;
     line-height: 1.45;
     color: var(--text-secondary);
     word-break: break-word;
-    /* Hidden by default; revealed on desktop hover or explicit toggle. */
+    /* Hidden by default; revealed on glyph hover (desktop) or explicit toggle. */
     display: none;
   }
 
   .native-text.native-shown {
     display: block;
-  }
-
-  /* Desktop: hovering the line reveals the native text without a tap. */
-  @media (hover: hover) {
-    .line:hover .native-text {
-      display: block;
-    }
   }
 
   .line.active {
@@ -777,13 +773,8 @@
 
     /* Bigger tap target on touch devices. */
     .native-toggle {
-      padding: 0.3rem 0.5rem;
-      font-size: 0.8rem;
+      padding: 0.35rem 0.45rem;
       opacity: 0.8;
-    }
-
-    .native-toggle span {
-      font-size: 0.68rem;
     }
 
     .line-count {
