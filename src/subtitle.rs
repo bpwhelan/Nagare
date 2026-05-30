@@ -442,6 +442,45 @@ pub fn find_all_matching_lines(track: &SubtitleTrack, sentence: &str) -> Vec<(us
     candidates
 }
 
+/// Score how well a native-language track pairs with the loaded target track.
+///
+/// Native subtitles segment text differently from the target language, so raw
+/// entry count is a weak signal — the dominant factor is how much the two
+/// tracks' covered time spans overlap. Returns a value in `0.0..=1.0`
+/// (higher is a better match). Empty tracks score `0.0`.
+pub fn score_native_candidate(target: &SubtitleTrack, native: &SubtitleTrack) -> f64 {
+    let (Some(t_start), Some(t_end)) = (
+        target.lines.first().map(|l| l.start_ms),
+        target.lines.last().map(|l| l.end_ms),
+    ) else {
+        return 0.0;
+    };
+    let (Some(n_start), Some(n_end)) = (
+        native.lines.first().map(|l| l.start_ms),
+        native.lines.last().map(|l| l.end_ms),
+    ) else {
+        return 0.0;
+    };
+
+    // Fraction of the union span that the two spans share.
+    let overlap_start = t_start.max(n_start);
+    let overlap_end = t_end.min(n_end);
+    let overlap = (overlap_end - overlap_start).max(0) as f64;
+    let union = (t_end.max(n_end) - t_start.min(n_start)).max(1) as f64;
+    let span_score = overlap / union;
+
+    // Entry-count similarity as a weak tiebreaker.
+    let n = target.lines.len() as f64;
+    let m = native.lines.len() as f64;
+    let count_score = if n == 0.0 || m == 0.0 {
+        0.0
+    } else {
+        n.min(m) / n.max(m)
+    };
+
+    span_score * 0.8 + count_score * 0.2
+}
+
 /// Simple LCS length computation for fuzzy matching.
 fn longest_common_subsequence(a: &str, b: &str) -> usize {
     let a_chars: Vec<char> = a.chars().collect();
@@ -556,5 +595,40 @@ Dialogue: 0,0:00:05.00,0:00:08.00,Default,,0,0,0,,これはテストです
 
         let result = find_matching_line(&track, "こんにちは世界", 4000, 30_000);
         assert_eq!(result, Some(1));
+    }
+
+    fn track_spanning(start_ms: i64, end_ms: i64, count: usize) -> SubtitleTrack {
+        let step = ((end_ms - start_ms) / count.max(1) as i64).max(1);
+        let lines = (0..count)
+            .map(|i| SubtitleLine {
+                index: i,
+                start_ms: start_ms + step * i as i64,
+                end_ms: start_ms + step * (i as i64 + 1),
+                text: format!("line {i}"),
+            })
+            .collect();
+        SubtitleTrack {
+            lines,
+            offset_ms: 0,
+        }
+    }
+
+    #[test]
+    fn test_score_native_candidate_prefers_overlapping_span() {
+        let target = track_spanning(0, 600_000, 100);
+        // Fully overlapping native track scores higher than a barely-overlapping one.
+        let aligned = track_spanning(0, 600_000, 90);
+        let misaligned = track_spanning(550_000, 1_200_000, 90);
+        assert!(score_native_candidate(&target, &aligned) > score_native_candidate(&target, &misaligned));
+    }
+
+    #[test]
+    fn test_score_native_candidate_empty_is_zero() {
+        let target = track_spanning(0, 600_000, 100);
+        let empty = SubtitleTrack {
+            lines: Vec::new(),
+            offset_ms: 0,
+        };
+        assert_eq!(score_native_candidate(&target, &empty), 0.0);
     }
 }

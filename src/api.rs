@@ -46,6 +46,7 @@ pub struct AppState {
     pub session_rx: watch::Receiver<SessionState>,
     pub new_card_tx: broadcast::Sender<EnrichmentDialogState>,
     pub subtitles: Arc<RwLock<Option<SubtitleTrack>>>,
+    pub native_subtitles: Arc<RwLock<Option<SubtitleTrack>>>,
     pub subtitle_candidates: Arc<RwLock<Vec<SubtitleCandidate>>>,
     pub subtitle_history: Arc<RwLock<HashMap<String, SubtitleTrack>>>,
     pub history: Arc<RwLock<HashMap<String, HistoryEntry>>>,
@@ -162,10 +163,20 @@ async fn active_subtitle_data(state: &Arc<AppState>) -> SubtitleData {
     let subtitle_offset_ms = track.as_ref().map(|t| t.offset_ms).unwrap_or(0);
     let lines = track.map(|track| track.lines).unwrap_or_default();
     let count = lines.len();
+    let native_lines = state
+        .native_subtitles
+        .read()
+        .await
+        .as_ref()
+        .map(|t| t.lines.clone())
+        .unwrap_or_default();
+    let native_count = native_lines.len();
 
     SubtitleData {
         lines,
         count,
+        native_lines,
+        native_count,
         candidates,
         selected_candidate_id,
         selection_mode,
@@ -178,9 +189,12 @@ fn history_subtitle_data(track: Option<SubtitleTrack>) -> SubtitleData {
     let lines = track.map(|track| track.lines).unwrap_or_default();
     let count = lines.len();
 
+    // Native subtitles are live-playback only for now (not persisted to history).
     SubtitleData {
         lines,
         count,
+        native_lines: Vec::new(),
+        native_count: 0,
         candidates: Vec::new(),
         selected_candidate_id: None,
         selection_mode: SubtitleSelectionMode::Auto,
@@ -374,6 +388,10 @@ async fn get_dialog_by_card_id(
 pub(crate) struct EnrichRequest {
     note_id: i64,
     sentence: Option<String>,
+    /// Optional native-language translation gathered from the native subtitle
+    /// track, written to the configured Anki field when both are present.
+    #[serde(default)]
+    translation: Option<String>,
     start_ms: i64,
     end_ms: i64,
     generate_avif: bool,
@@ -1133,6 +1151,15 @@ async fn perform_enrichment(
         if let Some(sentence) = req.sentence.clone() {
             fields.insert(config.anki.fields.sentence.clone(), sentence);
         }
+        if let Some(translation_field) = config.anki.fields.sentence_translation.as_ref() {
+            if !translation_field.is_empty() {
+                if let Some(translation) = req.translation.as_ref() {
+                    if !translation.is_empty() {
+                        fields.insert(translation_field.clone(), translation.clone());
+                    }
+                }
+            }
+        }
         if let Some(source_field) = config.anki.fields.source_name.as_ref() {
             if !source_field.is_empty() {
                 fields.insert(source_field.clone(), media_ctx.title.clone());
@@ -1814,6 +1841,9 @@ struct AudioTracksData {
 struct SubtitleData {
     lines: Vec<crate::subtitle::SubtitleLine>,
     count: usize,
+    /// Secondary native-language lines shown alongside the target subtitles.
+    native_lines: Vec<crate::subtitle::SubtitleLine>,
+    native_count: usize,
     candidates: Vec<SubtitleCandidate>,
     selected_candidate_id: Option<String>,
     selection_mode: SubtitleSelectionMode,
@@ -1840,6 +1870,7 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
     let mut result_rx = state.enhancement_result_tx.subscribe();
     let mut remote_rx = state.remote_result_tx.subscribe();
     let subtitles = state.subtitles.clone();
+    let native_subtitles = state.native_subtitles.clone();
     let subtitle_candidates = state.subtitle_candidates.clone();
     let anki_status = state.anki_status.clone();
     let enhancement_queue = state.enhancement_queue.clone();
@@ -1888,6 +1919,7 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
             usize,
             Vec<SubtitleCandidate>,
             i64,
+            usize,
         )> = None;
         let mut last_anki_status: Option<AnkiStatus> = None;
         let mut last_enhancement_queue: Vec<EnhancementQueueItem> = Vec::new();
@@ -1920,9 +1952,18 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
                         .unwrap_or(SubtitleSelectionMode::Auto);
                     let subtitle_lines = subs.as_ref().map(|track| track.lines.clone()).unwrap_or_default();
                     let subtitle_offset_ms = subs.as_ref().map(|track| track.offset_ms).unwrap_or(0);
+                    let native_lines = native_subtitles
+                        .read()
+                        .await
+                        .as_ref()
+                        .map(|track| track.lines.clone())
+                        .unwrap_or_default();
+                    let native_count = native_lines.len();
                     let subtitle_data = SubtitleData {
                         count: subtitle_lines.len(),
                         lines: subtitle_lines,
+                        native_count,
+                        native_lines,
                         candidates: current_candidates.clone(),
                         selected_candidate_id,
                         selection_mode,
@@ -1935,6 +1976,7 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
                         subtitle_data.count,
                         subtitle_data.candidates.clone(),
                         subtitle_data.subtitle_offset_ms,
+                        subtitle_data.native_count,
                     );
 
                     let send_subs = current_item_id != last_item_id

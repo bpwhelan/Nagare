@@ -32,6 +32,7 @@ export const sessionState = writable(/** @type {SessionState} */ ({
 }));
 
 export const subtitles = writable(/** @type {SubtitleLine[]} */ ([]));
+export const nativeSubtitles = writable(/** @type {SubtitleLine[]} */ ([]));
 export const subtitleCandidates = writable(/** @type {SubtitleCandidate[]} */ ([]));
 export const selectedSubtitleCandidateId = writable(/** @type {string|null} */ (null));
 export const subtitleSelectionMode = writable(/** @type {'auto'|'manual'} */ ('auto'));
@@ -126,6 +127,7 @@ export function applyMiningConfig(mining = {}) {
  */
 export function applySubtitlePayload(payload) {
   subtitles.set(payload?.lines || []);
+  nativeSubtitles.set(payload?.native_lines || []);
   subtitleCandidates.set(payload?.candidates || []);
   selectedSubtitleCandidateId.set(payload?.selected_candidate_id ?? null);
   subtitleSelectionMode.set(payload?.selection_mode || 'auto');
