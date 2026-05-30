@@ -277,6 +277,11 @@
           bind:value={config.target_language} />
       </div>
       <div class="field">
+        <label for="native-lang">Native Language <span class="hint">(ISO 639-2/B — secondary subtitle shown alongside)</span></label>
+        <input id="native-lang" type="text" placeholder="eng"
+          bind:value={config.native_language} />
+      </div>
+      <div class="field">
         <label for="media-mode">Media Access Mode</label>
         <select id="media-mode" bind:value={config.media_access_mode}>
           <option value="auto">Auto (disk → API fallback)</option>
@@ -337,6 +342,14 @@
           value={config.anki.fields.source_name || ''}
           on:input={(e) => {
             config.anki.fields.source_name = e.target.value || null;
+          }} />
+      </div>
+      <div class="field">
+        <label for="f-translation">Sentence Translation Field <span class="hint">(optional — native-language translation)</span></label>
+        <input id="f-translation" type="text" placeholder="Leave empty to skip"
+          value={config.anki.fields.sentence_translation || ''}
+          on:input={(e) => {
+            config.anki.fields.sentence_translation = e.target.value || null;
           }} />
       </div>
     </section>
