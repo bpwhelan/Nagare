@@ -151,6 +151,9 @@ pub struct SessionManager {
     config: Arc<RwLock<Config>>,
     state: Arc<RwLock<SessionState>>,
     subtitles: Arc<RwLock<Option<SubtitleTrack>>>,
+    /// Secondary native-language track shown alongside the target subtitles
+    /// (live playback only). `None` when no suitable native track exists.
+    native_subtitles: Arc<RwLock<Option<SubtitleTrack>>>,
     subtitle_candidates: Arc<RwLock<Vec<SubtitleCandidate>>>,
     state_tx: watch::Sender<SessionState>,
     /// User override for which session to track (None = auto-select)
@@ -159,6 +162,8 @@ pub struct SessionManager {
     selected_subtitle_candidate_override: Arc<RwLock<Option<String>>>,
     /// The subtitle candidate currently loaded into Nagare, if any.
     loaded_subtitle_candidate_id: Arc<RwLock<Option<String>>>,
+    /// The native-language subtitle candidate currently loaded, if any.
+    loaded_native_candidate_id: Arc<RwLock<Option<String>>>,
     /// Subtitle tracks keyed by item_id, kept forever for history mining
     subtitle_history: Arc<RwLock<HashMap<String, SubtitleTrack>>>,
     /// Metadata for previously-watched items
@@ -216,11 +221,13 @@ impl SessionManager {
             config,
             state: Arc::new(RwLock::new(initial_state)),
             subtitles: Arc::new(RwLock::new(None)),
+            native_subtitles: Arc::new(RwLock::new(None)),
             subtitle_candidates: Arc::new(RwLock::new(Vec::new())),
             state_tx,
             selected_session_id: Arc::new(RwLock::new(None)),
             selected_subtitle_candidate_override: Arc::new(RwLock::new(None)),
             loaded_subtitle_candidate_id: Arc::new(RwLock::new(None)),
+            loaded_native_candidate_id: Arc::new(RwLock::new(None)),
             subtitle_history: Arc::new(RwLock::new(subtitle_history)),
             history: Arc::new(RwLock::new(history)),
             audio_tracks: Arc::new(RwLock::new(Vec::new())),
@@ -235,6 +242,10 @@ impl SessionManager {
 
     pub fn subtitles(&self) -> Arc<RwLock<Option<SubtitleTrack>>> {
         self.subtitles.clone()
+    }
+
+    pub fn native_subtitles(&self) -> Arc<RwLock<Option<SubtitleTrack>>> {
+        self.native_subtitles.clone()
     }
 
     pub fn subtitle_candidates(&self) -> Arc<RwLock<Vec<SubtitleCandidate>>> {
@@ -1019,7 +1030,13 @@ impl SessionManager {
             .clone()
             .ok_or_else(|| anyhow::anyhow!("No active session"))?;
 
-        let target_lang = self.config.read().await.target_language.clone();
+        let (target_lang, native_lang) = {
+            let config = self.config.read().await;
+            (
+                config.target_language.clone(),
+                config.native_language.clone(),
+            )
+        };
         let sessions = self.collect_server_sessions(servers).await;
         let active = sessions
             .into_iter()
@@ -1076,6 +1093,7 @@ impl SessionManager {
             &media_source_id,
             &active.session,
             &target_lang,
+            &native_lang,
             &active.server,
             candidate.as_ref(),
         )
@@ -1119,6 +1137,7 @@ impl SessionManager {
             let mut subs = self.subtitles.write().await;
             *subs = None;
             drop(subs);
+            self.clear_native_subtitles().await;
             let mut subtitle_candidates = self.subtitle_candidates.write().await;
             *subtitle_candidates = Vec::new();
             drop(subtitle_candidates);
@@ -1135,6 +1154,7 @@ impl SessionManager {
 
         let config = self.config.read().await;
         let target_lang = config.target_language.clone();
+        let native_lang = config.native_language.clone();
         drop(config);
 
         let sessions = self.collect_server_sessions(servers).await;
@@ -1321,6 +1341,7 @@ impl SessionManager {
             let mut subs = self.subtitles.write().await;
             *subs = None;
             drop(subs);
+            self.clear_native_subtitles().await;
             let mut loaded_candidate = self.loaded_subtitle_candidate_id.write().await;
             *loaded_candidate = None;
             drop(loaded_candidate);
@@ -1350,6 +1371,7 @@ impl SessionManager {
                 &media_source_id,
                 &active.session,
                 &target_lang,
+                &native_lang,
                 &active.server,
                 candidate.as_ref(),
             )
@@ -1412,6 +1434,12 @@ impl SessionManager {
                 self.history.write().await.insert(history_id.clone(), entry);
             }
 
+            // Broadcast before the potentially-slow SQLite write so listeners
+            // (e.g. the Anki poller) see the live session without waiting for
+            // the full subtitle history to be flushed to disk.
+            let snapshot = self.state.read().await.clone();
+            let _ = self.state_tx.send(snapshot);
+
             self.save_history(true).await;
         }
 
@@ -1430,7 +1458,8 @@ impl SessionManager {
         // Throttled save for position updates (at most once every 30 s)
         self.save_history(false).await;
 
-        // Broadcast state update
+        // Broadcast final state (covers position-only polls where no subtitle
+        // reload occurred; harmless double-send on new-item polls).
         let snapshot = self.state.read().await.clone();
         let _ = self.state_tx.send(snapshot);
     }
@@ -1570,146 +1599,250 @@ impl SessionManager {
         )
     }
 
+    /// Fetch and parse a single subtitle candidate into a [`SubtitleTrack`].
+    /// Returns `None` if the source could not be read.
+    async fn fetch_subtitle_track_for_candidate(
+        &self,
+        item_id: &str,
+        media_source_id: &str,
+        candidate: &SubtitleCandidate,
+        server: &Arc<dyn MediaServer>,
+    ) -> Option<SubtitleTrack> {
+        match candidate.source {
+            SubtitleCandidateSource::Server => {
+                let stream_index = candidate.stream_index?;
+                debug!(
+                    "Fetching subtitles: item={} msid={} index={}",
+                    item_id, media_source_id, stream_index
+                );
+                match server
+                    .get_subtitles(item_id, media_source_id, stream_index, SubtitleFormat::Vtt)
+                    .await
+                {
+                    Ok(content) => Some(parse_subtitle(&content, None)),
+                    Err(e) => {
+                        warn!(
+                            "Failed to fetch subtitles from API for stream {}: {}",
+                            stream_index, e
+                        );
+                        None
+                    }
+                }
+            }
+            SubtitleCandidateSource::Sidecar => {
+                let sidecar_path = candidate.local_path.as_ref()?;
+                match std::fs::read_to_string(sidecar_path) {
+                    Ok(content) => Some(parse_subtitle(&content, sidecar_path.to_str())),
+                    Err(error) => {
+                        warn!(
+                            "Failed to read subtitle sidecar {:?}: {}",
+                            sidecar_path, error
+                        );
+                        None
+                    }
+                }
+            }
+        }
+    }
+
+    async fn clear_native_subtitles(&self) {
+        let mut native = self.native_subtitles.write().await;
+        *native = None;
+        drop(native);
+        let mut loaded = self.loaded_native_candidate_id.write().await;
+        *loaded = None;
+    }
+
     async fn load_subtitles_for_item(
         &self,
         item_id: &str,
         media_source_id: &str,
         session: &Session,
         target_lang: &str,
+        native_lang: &str,
         server: &Arc<dyn MediaServer>,
         candidate: Option<&SubtitleCandidate>,
     ) {
-        let selected_candidate_id = candidate.map(|track| track.id.clone());
+        let mut loaded_id: Option<String> = None;
+        let mut track: Option<SubtitleTrack> = None;
 
+        // 1. Try the resolved candidate (Server stream or sidecar file).
         if let Some(track_candidate) = candidate {
-            match track_candidate.source {
-                SubtitleCandidateSource::Server => {
-                    if let Some(stream_index) = track_candidate.stream_index {
-                        debug!(
-                            "Fetching subtitles: item={} msid={} index={}",
-                            item_id, media_source_id, stream_index
-                        );
-
-                        match server
-                            .get_subtitles(
-                                item_id,
-                                media_source_id,
-                                stream_index,
-                                SubtitleFormat::Vtt,
-                            )
-                            .await
-                        {
-                            Ok(content) => {
-                                let track = parse_subtitle(&content, None);
-                                info!("Loaded {} subtitle lines from API", track.lines.len());
-                                let mut subs = self.subtitles.write().await;
-                                *subs = Some(track);
-                                drop(subs);
-                                let mut loaded_candidate =
-                                    self.loaded_subtitle_candidate_id.write().await;
-                                *loaded_candidate = selected_candidate_id;
-                                return;
-                            }
-                            Err(e) => {
-                                warn!(
-                                    "Failed to fetch subtitles from API for stream {}: {}",
-                                    stream_index, e
-                                );
-                            }
-                        }
-                    }
-                }
-                SubtitleCandidateSource::Sidecar => {
-                    if let Some(sidecar_path) = track_candidate.local_path.as_ref() {
-                        match std::fs::read_to_string(sidecar_path) {
-                            Ok(content) => {
-                                let track = parse_subtitle(&content, sidecar_path.to_str());
-                                info!(
-                                    "Loaded {} subtitle lines from sidecar: {:?}",
-                                    track.lines.len(),
-                                    sidecar_path
-                                );
-                                let mut subs = self.subtitles.write().await;
-                                *subs = Some(track);
-                                drop(subs);
-                                let mut loaded_candidate =
-                                    self.loaded_subtitle_candidate_id.write().await;
-                                *loaded_candidate = selected_candidate_id;
-                                return;
-                            }
-                            Err(error) => {
-                                warn!(
-                                    "Failed to read subtitle sidecar {:?}: {}",
-                                    sidecar_path, error
-                                );
-                            }
-                        }
-                    }
-                }
+            if let Some(fetched) = self
+                .fetch_subtitle_track_for_candidate(
+                    item_id,
+                    media_source_id,
+                    track_candidate,
+                    server,
+                )
+                .await
+            {
+                info!(
+                    "Loaded {} subtitle lines for {}",
+                    fetched.lines.len(),
+                    track_candidate.id
+                );
+                loaded_id = Some(track_candidate.id.clone());
+                track = Some(fetched);
             }
-        }
-
-        let local_path = self
-            .mapped_media_path_for_session(item_id, session, server)
-            .await;
-
-        if candidate.is_none() {
+        } else {
             debug!(
                 "No loadable subtitle track candidate selected for item {}; trying fallback sources",
                 item_id
             );
         }
 
-        // Disk fallback
-        if let Some(local_path) = local_path.as_ref() {
-            debug!("Trying disk fallback at: {:?}", local_path);
+        let local_path = self
+            .mapped_media_path_for_session(item_id, session, server)
+            .await;
 
-            let fallback_candidates = Self::sidecar_subtitle_candidates(local_path);
-            let sidecar_fallback = if let Some(track_candidate) = candidate {
-                fallback_candidates.iter().find(|sidecar| {
-                    track_candidate.source == SubtitleCandidateSource::Server
-                        && (Self::language_matches_target(sidecar.language.as_deref(), target_lang)
-                            || (track_candidate.language.is_some()
+        // 2. Disk fallback when nothing loaded yet.
+        if track.is_none() {
+            if let Some(local_path) = local_path.as_ref() {
+                debug!("Trying disk fallback at: {:?}", local_path);
+
+                let fallback_candidates = Self::sidecar_subtitle_candidates(local_path);
+                let sidecar_fallback = if let Some(track_candidate) = candidate {
+                    fallback_candidates.iter().find(|sidecar| {
+                        track_candidate.source == SubtitleCandidateSource::Server
+                            && (Self::language_matches_target(
+                                sidecar.language.as_deref(),
+                                target_lang,
+                            ) || (track_candidate.language.is_some()
                                 && sidecar.language == track_candidate.language))
+                    })
+                } else {
+                    fallback_candidates.iter().find(|sidecar| {
+                        Self::language_matches_target(sidecar.language.as_deref(), target_lang)
+                    })
+                }
+                .or_else(|| {
+                    fallback_candidates
+                        .iter()
+                        .find(|sidecar| sidecar.language.is_none())
                 })
-            } else {
-                fallback_candidates.iter().find(|sidecar| {
-                    Self::language_matches_target(sidecar.language.as_deref(), target_lang)
-                })
-            }
-            .or_else(|| {
-                fallback_candidates
-                    .iter()
-                    .find(|sidecar| sidecar.language.is_none())
-            })
-            .or_else(|| fallback_candidates.first());
+                .or_else(|| fallback_candidates.first());
 
-            if let Some(sidecar_candidate) = sidecar_fallback {
-                if let Some(sidecar_path) = sidecar_candidate.local_path.as_ref() {
-                    if let Ok(content) = std::fs::read_to_string(sidecar_path) {
-                        let track = parse_subtitle(&content, sidecar_path.to_str());
-                        info!(
-                            "Loaded {} subtitle lines from disk fallback: {:?}",
-                            track.lines.len(),
-                            sidecar_path
-                        );
-                        let mut subs = self.subtitles.write().await;
-                        *subs = Some(track);
-                        drop(subs);
-                        let mut loaded_candidate = self.loaded_subtitle_candidate_id.write().await;
-                        *loaded_candidate = Some(sidecar_candidate.id.clone());
-                        return;
+                if let Some(sidecar_candidate) = sidecar_fallback {
+                    if let Some(sidecar_path) = sidecar_candidate.local_path.as_ref() {
+                        if let Ok(content) = std::fs::read_to_string(sidecar_path) {
+                            let parsed = parse_subtitle(&content, sidecar_path.to_str());
+                            info!(
+                                "Loaded {} subtitle lines from disk fallback: {:?}",
+                                parsed.lines.len(),
+                                sidecar_path
+                            );
+                            loaded_id = Some(sidecar_candidate.id.clone());
+                            track = Some(parsed);
+                        }
                     }
                 }
             }
         }
 
-        warn!("Could not load subtitles from any source");
-        let mut subs = self.subtitles.write().await;
-        *subs = None;
-        drop(subs);
-        let mut loaded_candidate = self.loaded_subtitle_candidate_id.write().await;
-        *loaded_candidate = None;
+        if track.is_none() {
+            warn!("Could not load subtitles from any source");
+        }
+
+        // Store the resolved target track.
+        {
+            let mut subs = self.subtitles.write().await;
+            *subs = track.clone();
+        }
+        {
+            let mut loaded_candidate = self.loaded_subtitle_candidate_id.write().await;
+            *loaded_candidate = loaded_id.clone();
+        }
+
+        // Load a native-language track alongside it (live playback only).
+        self.load_native_subtitles_for_item(
+            item_id,
+            media_source_id,
+            native_lang,
+            server,
+            track.as_ref(),
+            loaded_id.as_deref(),
+        )
+        .await;
+    }
+
+    /// Pick and load the best native-language subtitle track for the active item.
+    ///
+    /// Native subtitles use their own raw timings; per-line pairing in the UI
+    /// matches them against the (offset-baked) target line times, so applying a
+    /// target offset can drift the pairing — acceptable for v1.
+    async fn load_native_subtitles_for_item(
+        &self,
+        item_id: &str,
+        media_source_id: &str,
+        native_lang: &str,
+        server: &Arc<dyn MediaServer>,
+        target_track: Option<&SubtitleTrack>,
+        target_candidate_id: Option<&str>,
+    ) {
+        let Some(target_track) = target_track else {
+            self.clear_native_subtitles().await;
+            return;
+        };
+
+        let native_candidates: Vec<SubtitleCandidate> = self
+            .subtitle_candidates
+            .read()
+            .await
+            .iter()
+            .filter(|c| Some(c.id.as_str()) != target_candidate_id)
+            .filter(|c| Self::language_matches_target(c.language.as_deref(), native_lang))
+            .cloned()
+            .collect();
+
+        if native_candidates.is_empty() {
+            self.clear_native_subtitles().await;
+            return;
+        }
+
+        // With a single candidate, skip the cost of scoring; otherwise fetch
+        // each and keep the one that best aligns with the target track.
+        let chosen = if native_candidates.len() == 1 {
+            let candidate = native_candidates.into_iter().next().unwrap();
+            self.fetch_subtitle_track_for_candidate(item_id, media_source_id, &candidate, server)
+                .await
+                .map(|track| (candidate, track))
+        } else {
+            let mut best: Option<(SubtitleCandidate, SubtitleTrack, f64)> = None;
+            for candidate in native_candidates {
+                if let Some(track) = self
+                    .fetch_subtitle_track_for_candidate(
+                        item_id,
+                        media_source_id,
+                        &candidate,
+                        server,
+                    )
+                    .await
+                {
+                    let score = crate::subtitle::score_native_candidate(target_track, &track);
+                    if best.as_ref().map(|(_, _, s)| score > *s).unwrap_or(true) {
+                        best = Some((candidate, track, score));
+                    }
+                }
+            }
+            best.map(|(candidate, track, _)| (candidate, track))
+        };
+
+        match chosen {
+            Some((candidate, track)) => {
+                info!(
+                    "Loaded {} native subtitle lines from {}",
+                    track.lines.len(),
+                    candidate.id
+                );
+                let mut native = self.native_subtitles.write().await;
+                *native = Some(track);
+                drop(native);
+                let mut loaded = self.loaded_native_candidate_id.write().await;
+                *loaded = Some(candidate.id);
+            }
+            None => self.clear_native_subtitles().await,
+        }
     }
 }
 

@@ -15,10 +15,11 @@
     showErrorToast,
     showToast,
     subtitles,
+    nativeSubtitles,
     isPlaying,
   } from './stores.js';
   import { enrichCard, skipEnrichment, previewAudio, previewScreenshot, getSubtitleMatches, firePlayPause, queueEnrichCard } from './api.js';
-  import { audioMimeType, formatTime, imageMimeType } from './utils.js';
+  import { audioMimeType, formatTime, imageMimeType, gatherTranslation } from './utils.js';
 
   $: card = $dialogCard || $pendingCards[0] || null;
   $: isRouteCard = $dialogCard != null;
@@ -64,6 +65,10 @@
   $: contextLines = getContextLines(anchorLineIndex, includedLineFirst, includedLineLast, $subtitles);
 
   let editedSentence = '';
+  let editedTranslation = '';
+  // True once the user manually edits the translation, so the auto-gather
+  // reactive stops overwriting their text.
+  let translationDirty = false;
   let startMs = 0;
   let endMs = 0;
   let generateAvif = true;
@@ -164,6 +169,8 @@
   $: if (card && cardKey !== lastCardKey) {
     lastCardKey = cardKey;
     editedSentence = card.event.sentence || '';
+    editedTranslation = '';
+    translationDirty = false;
     historyMatches = null;
     selectedHistoryMatch = matchedIndex != null ? { line_index: matchedIndex } : null;
     includedLineFirst = card.included_line_first ?? null;
@@ -198,6 +205,12 @@
     includedLineLast = anchorLineIndex;
     setRangeFromInclusion();
     editedSentence = buildSelectedSentence();
+  }
+
+  // Auto-gather the native-language translation for the current mined range
+  // until the user edits it manually.
+  $: if (!translationDirty) {
+    editedTranslation = gatherTranslation($nativeSubtitles, startMs, endMs);
   }
 
   $: autoApproveReady = shouldAutoApprovePending
@@ -315,6 +328,7 @@
     const payload = {
       noteId,
       sentence: editedSentence,
+      translation: editedTranslation,
       startMs,
       endMs,
       generateAvif,
@@ -591,6 +605,21 @@
           <textarea bind:value={editedSentence} rows="2"></textarea>
         </label>
       </div>
+
+      <!-- Native-language translation (only when a native track is loaded) -->
+      {#if $nativeSubtitles.length > 0}
+        <div class="field-section">
+          <label>
+            <span class="label-text">Translation</span>
+            <textarea
+              bind:value={editedTranslation}
+              on:input={() => (translationDirty = true)}
+              rows="2"
+              placeholder="Native-language translation gathered from the subtitle track"
+            ></textarea>
+          </label>
+        </div>
+      {/if}
 
       <!-- Range slider -->
       <div class="range-section">

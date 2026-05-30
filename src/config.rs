@@ -17,6 +17,11 @@ pub struct Config {
     #[serde(default = "default_target_language")]
     pub target_language: String,
 
+    /// Native/comprehension language for the secondary subtitle track shown
+    /// alongside the target-language subtitles (default English).
+    #[serde(default = "default_native_language")]
+    pub native_language: String,
+
     #[serde(default)]
     pub anki: AnkiConfig,
 
@@ -146,6 +151,11 @@ pub struct AnkiFieldMapping {
     /// Optional field to write the show/source name into
     #[serde(default)]
     pub source_name: Option<String>,
+
+    /// Optional field to write the native-language sentence translation into.
+    /// When unset/empty the translation feature is disabled.
+    #[serde(default)]
+    pub sentence_translation: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -302,6 +312,7 @@ impl Default for Config {
             jellyfin: None,
             plex: None,
             target_language: default_target_language(),
+            native_language: default_native_language(),
             anki: AnkiConfig::default(),
             path_mappings: Vec::new(),
             media_access_mode: default_media_access_mode(),
@@ -433,6 +444,7 @@ impl Default for AnkiFieldMapping {
             sentence_audio: default_sentence_audio_field(),
             picture: default_picture_field(),
             source_name: None,
+            sentence_translation: None,
         }
     }
 }
@@ -456,6 +468,9 @@ fn default_listen_address() -> String {
 }
 fn default_target_language() -> String {
     "jpn".to_string()
+}
+fn default_native_language() -> String {
+    "eng".to_string()
 }
 fn default_ankiconnect_url() -> String {
     "http://localhost:8765".to_string()

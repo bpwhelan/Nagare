@@ -58,6 +58,7 @@ export async function setSubtitleOffset({ offsetMs = null, deltaMs = null, histo
 export async function enrichCard({
   noteId,
   sentence,
+  translation = null,
   startMs,
   endMs,
   generateAvif = true,
@@ -73,6 +74,7 @@ export async function enrichCard({
     end_ms: endMs,
     generate_avif: generateAvif,
   };
+  if (translation) body.translation = translation;
   if (matchedLineIndex != null) body.matched_line_index = matchedLineIndex;
   if (includedLineFirst != null) body.included_line_first = includedLineFirst;
   if (includedLineLast != null) body.included_line_last = includedLineLast;

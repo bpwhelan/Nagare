@@ -170,6 +170,7 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let subtitles = session_manager.subtitles();
+    let native_subtitles = session_manager.native_subtitles();
     let subtitle_candidates = session_manager.subtitle_candidates();
     let subtitle_history = session_manager.subtitle_history();
     let history = session_manager.history();
@@ -194,6 +195,7 @@ async fn main() -> anyhow::Result<()> {
         session_rx,
         new_card_tx: card_tx.clone(),
         subtitles,
+        native_subtitles,
         subtitle_candidates,
         subtitle_history,
         history,

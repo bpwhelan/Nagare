@@ -1,8 +1,8 @@
 <script>
   import { onDestroy } from 'svelte';
-  import { subtitles, subtitleCandidates, selectedSubtitleCandidateId, subtitleSelectionMode, subtitleOffsetMs, activeHistoryItemId, activeLineIndex, positionMs, pauseOnHover, pauseOnSeek, disableSubtitleSeeking, isPlaying, sessionState, showErrorToast, setOptimisticPosition, setOptimisticPlayState, applySubtitlePayload, yomitanPopupVisible } from './stores.js';
+  import { subtitles, nativeSubtitles, subtitleCandidates, selectedSubtitleCandidateId, subtitleSelectionMode, subtitleOffsetMs, activeHistoryItemId, activeLineIndex, positionMs, pauseOnHover, pauseOnSeek, disableSubtitleSeeking, isPlaying, sessionState, showErrorToast, setOptimisticPosition, setOptimisticPlayState, applySubtitlePayload, yomitanPopupVisible } from './stores.js';
   import { fireSeek, firePlayPause, playPause, selectSubtitleTrack, setSubtitleOffset } from './api.js';
-  import { formatTime } from './utils.js';
+  import { formatTime, nativeLinesForRange } from './utils.js';
   import AudioTrackSelector from './AudioTrackSelector.svelte';
 
   const newLineCharacter = '\n';
@@ -238,6 +238,31 @@
     if (line.end_ms < posMs) return 'line past';
     return 'line future';
   }
+
+  // Native-language text aligned to each target line (by time overlap).
+  // Empty array when no native track is loaded (e.g. history view).
+  $: nativeTextByLine = $nativeSubtitles.length
+    ? $subtitles.map((line) =>
+        nativeLinesForRange($nativeSubtitles, line.start_ms, line.end_ms)
+          .map((n) => n.text)
+          .join('\n')
+      )
+    : [];
+
+  // Indices whose native text the user has explicitly toggled on (touch / click).
+  let nativeShown = new Set();
+
+  function toggleNative(index) {
+    if (nativeShown.has(index)) {
+      nativeShown.delete(index);
+    } else {
+      nativeShown.add(index);
+    }
+    nativeShown = new Set(nativeShown); // reassign to trigger reactivity
+  }
+
+  // Drop toggled indices when the track changes so stale ids don't leak across items.
+  $: if ($nativeSubtitles) nativeShown = new Set();
 </script>
 
 <div class="timeline-container" class:navigation-disabled={$yomitanPopupVisible} bind:this={container} on:scroll={handleScroll}>
@@ -313,9 +338,31 @@
           on:mouseenter={() => handleLineMouseEnter(i)}
           on:mouseleave={() => handleLineMouseLeave(i)}
         >
-          <p class="text">
-            {@html line.text.replace(/\n/g, '<br>')}
-          </p>
+          <div class="line-body">
+            <div class="line-main">
+              <p class="text">
+                {@html line.text.replace(/\n/g, '<br>')}
+              </p>
+              {#if nativeTextByLine[i]}
+                <button
+                  type="button"
+                  class="native-toggle"
+                  class:active={nativeShown.has(i)}
+                  aria-label="Toggle native-language line"
+                  aria-pressed={nativeShown.has(i)}
+                  title="Show native-language subtitle"
+                  on:pointerdown|stopPropagation
+                  on:click|stopPropagation={() => toggleNative(i)}
+                  on:keyup|stopPropagation={(e) => e.key === 'Enter' && toggleNative(i)}
+                >文<span>A</span></button>
+              {/if}
+            </div>
+            {#if nativeTextByLine[i]}
+              <p class="native-text" class:native-shown={nativeShown.has(i)}>
+                {@html nativeTextByLine[i].replace(/\n/g, '<br>')}
+              </p>
+            {/if}
+          </div>
         </div>
         {@html newLineCharacter}
       {/each}
@@ -520,11 +567,81 @@
     cursor: default;
   }
 
+  .line-body {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.15rem;
+  }
+
+  .line-main {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.5rem;
+  }
+
   .line .text {
+    flex: 1;
+    min-width: 0;
     font-size: 1.1rem;
     line-height: 1.5;
     word-break: break-word;
     margin: 0;
+  }
+
+  .native-toggle {
+    flex-shrink: 0;
+    align-self: flex-start;
+    display: inline-flex;
+    align-items: baseline;
+    gap: 1px;
+    padding: 0.05rem 0.3rem;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: transparent;
+    color: var(--text-dim);
+    font-size: 0.7rem;
+    line-height: 1.3;
+    cursor: pointer;
+    opacity: 0.5;
+    transition: opacity 0.15s, color 0.15s, border-color 0.15s;
+  }
+
+  .native-toggle span {
+    font-size: 0.6rem;
+  }
+
+  .line:hover .native-toggle {
+    opacity: 1;
+  }
+
+  .native-toggle:hover,
+  .native-toggle.active {
+    color: var(--accent);
+    border-color: var(--accent);
+    opacity: 1;
+  }
+
+  .native-text {
+    margin: 0;
+    font-size: 0.95rem;
+    line-height: 1.45;
+    color: var(--text-secondary);
+    word-break: break-word;
+    /* Hidden by default; revealed on desktop hover or explicit toggle. */
+    display: none;
+  }
+
+  .native-text.native-shown {
+    display: block;
+  }
+
+  /* Desktop: hovering the line reveals the native text without a tap. */
+  @media (hover: hover) {
+    .line:hover .native-text {
+      display: block;
+    }
   }
 
   .line.active {
@@ -651,6 +768,22 @@
 
     .line.active .text {
       font-size: 1.28rem;
+    }
+
+    .native-text {
+      font-size: 1.05rem;
+      line-height: 1.5;
+    }
+
+    /* Bigger tap target on touch devices. */
+    .native-toggle {
+      padding: 0.3rem 0.5rem;
+      font-size: 0.8rem;
+      opacity: 0.8;
+    }
+
+    .native-toggle span {
+      font-size: 0.68rem;
     }
 
     .line-count {
