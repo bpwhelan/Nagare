@@ -165,11 +165,17 @@ fn build_avif_command(
 }
 
 /// Generate an animated AVIF from a video source.
+///
+/// `max_width` and `max_fps` are upper bounds: the source is never upscaled
+/// past them, and longer clips are scaled down further from these caps to keep
+/// the resulting file small (mirroring the adaptive tiers used in GSM).
 pub async fn generate_avif(
     source: &str,
     start_ms: i64,
     end_ms: i64,
     encoder: AnimatedScreenshotEncoder,
+    max_width: u32,
+    max_fps: u32,
 ) -> Result<(PathBuf, Vec<u8>)> {
     let id = Uuid::new_v4();
     let output_path = temp_dir().join(format!("{}.avif", id));
@@ -177,16 +183,21 @@ pub async fn generate_avif(
     let start_secs = start_ms as f64 / 1000.0;
     let duration = (end_ms - start_ms) as f64 / 1000.0;
 
-    // Adaptive settings based on duration
-    let (fps, scale, crf) = if duration > 10.0 {
-        (6, 360, 45)
+    // Adaptive multipliers scale the configured caps down for longer clips.
+    let (fps_multiplier, width_multiplier, crf) = if duration > 10.0 {
+        (0.6, 0.75, 45)
     } else if duration > 5.0 {
-        (8, 400, 42)
+        (0.8, 5.0 / 6.0, 42)
     } else {
-        (10, 480, 40)
+        (1.0, 1.0, 40)
     };
 
-    let vf = format!("fps={},scale={}:-1", fps, scale);
+    let fps = ((max_fps as f64 * fps_multiplier).round() as u32).max(1);
+    let width = ((max_width as f64 * width_multiplier).round() as u32).max(2);
+
+    // `min(width,iw)` avoids upscaling past the source; `-2` keeps an even,
+    // aspect-correct height that the AV1 encoders require.
+    let vf = format!("fps={},scale='min({},iw)':-2", fps, width);
 
     let primary_result = if FORCE_AVIF_ENCODER_FALLBACK {
         Err(anyhow::anyhow!(
@@ -239,9 +250,9 @@ pub async fn generate_avif(
 
     let data = tokio::fs::read(&output_path).await?;
     info!(
-        "Generated AVIF: {:.1}s, {}x? @ {}fps ({} bytes)",
+        "Generated AVIF: {:.1}s, max {}px @ {}fps ({} bytes)",
         duration,
-        scale,
+        width,
         fps,
         data.len()
     );

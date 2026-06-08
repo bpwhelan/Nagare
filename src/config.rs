@@ -181,6 +181,17 @@ pub struct MiningConfig {
     #[serde(default = "default_animated_screenshot_encoder")]
     pub animated_screenshot_encoder: AnimatedScreenshotEncoder,
 
+    /// Upper bound on the animated screenshot width in pixels. The source is
+    /// never upscaled past its native width, and longer clips are scaled down
+    /// further from this cap to keep file sizes small.
+    #[serde(default = "default_avif_max_width")]
+    pub avif_max_width: u32,
+
+    /// Upper bound on the animated screenshot frame rate. Longer clips are
+    /// scaled down further from this cap.
+    #[serde(default = "default_avif_max_fps")]
+    pub avif_max_fps: u32,
+
     #[serde(default = "default_static_screenshot_format")]
     pub static_screenshot_format: StaticScreenshotFormat,
 
@@ -457,6 +468,8 @@ impl Default for MiningConfig {
             audio_codec: default_audio_codec(),
             generate_avif: true,
             animated_screenshot_encoder: default_animated_screenshot_encoder(),
+            avif_max_width: default_avif_max_width(),
+            avif_max_fps: default_avif_max_fps(),
             static_screenshot_format: default_static_screenshot_format(),
             auto_approve: false,
         }
@@ -501,6 +514,12 @@ fn default_audio_codec() -> AudioCodec {
 }
 fn default_animated_screenshot_encoder() -> AnimatedScreenshotEncoder {
     AnimatedScreenshotEncoder::Libsvtav1
+}
+fn default_avif_max_width() -> u32 {
+    480
+}
+fn default_avif_max_fps() -> u32 {
+    10
 }
 fn default_static_screenshot_format() -> StaticScreenshotFormat {
     StaticScreenshotFormat::Webp

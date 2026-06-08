@@ -1086,7 +1086,16 @@ async fn perform_enrichment(
                 req.start_ms,
                 req.end_ms
             );
-            match media::generate_avif(&source, req.start_ms, req.end_ms, avif_encoder).await {
+            match media::generate_avif(
+                &source,
+                req.start_ms,
+                req.end_ms,
+                avif_encoder,
+                config.mining.avif_max_width,
+                config.mining.avif_max_fps,
+            )
+            .await
+            {
                 Ok((avif_path, avif_data)) => {
                     let avif_filename =
                         format!("nagare_{}_{}.avif", media_ctx.item_id, req.start_ms);
