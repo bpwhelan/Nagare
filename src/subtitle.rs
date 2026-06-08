@@ -98,7 +98,7 @@ pub fn parse_vtt(content: &str) -> SubtitleTrack {
     }
 
     SubtitleTrack {
-        lines,
+        lines: merge_duplicate_cues(lines),
         offset_ms: 0,
     }
 }
@@ -153,7 +153,7 @@ pub fn parse_srt(content: &str) -> SubtitleTrack {
     }
 
     SubtitleTrack {
-        lines,
+        lines: merge_duplicate_cues(lines),
         offset_ms: 0,
     }
 }
@@ -214,14 +214,9 @@ pub fn parse_ass(content: &str) -> SubtitleTrack {
         }
     }
 
-    // Sort by start time (ASS events might not be in order)
-    lines.sort_by_key(|l| l.start_ms);
-    for (i, line) in lines.iter_mut().enumerate() {
-        line.index = i;
-    }
-
+    // ASS events might not be in order; merge_duplicate_cues sorts and reindexes.
     SubtitleTrack {
-        lines,
+        lines: merge_duplicate_cues(lines),
         offset_ms: 0,
     }
 }
@@ -309,6 +304,37 @@ fn strip_ass_tags(text: &str) -> String {
         .replace("\\n", "\n")
         .trim()
         .to_string()
+}
+
+/// Collapse cues that share identical timing into a single line.
+///
+/// Some sources split one on-screen moment across several cues with the same
+/// start/end — either exact duplicates (e.g. a line repeated verbatim) or distinct
+/// lines meant to display together. We drop the exact duplicates and concatenate the
+/// distinct ones onto one line. Lines are sorted by timing first so equal timings sit
+/// adjacent, then re-indexed.
+fn merge_duplicate_cues(mut lines: Vec<SubtitleLine>) -> Vec<SubtitleLine> {
+    lines.sort_by_key(|l| (l.start_ms, l.end_ms));
+
+    let mut merged: Vec<SubtitleLine> = Vec::with_capacity(lines.len());
+    for line in lines {
+        if let Some(last) = merged.last_mut() {
+            if last.start_ms == line.start_ms && last.end_ms == line.end_ms {
+                // Same timing: skip text already present, otherwise join onto one line.
+                if !last.text.contains(&line.text) {
+                    last.text.push(' ');
+                    last.text.push_str(&line.text);
+                }
+                continue;
+            }
+        }
+        merged.push(line);
+    }
+
+    for (i, line) in merged.iter_mut().enumerate() {
+        line.index = i;
+    }
+    merged
 }
 
 /// Normalize Japanese text for fuzzy matching: strip whitespace, punctuation, etc.
@@ -558,6 +584,52 @@ Dialogue: 0,0:00:05.00,0:00:08.00,Default,,0,0,0,,これはテストです
         assert_eq!(track.lines.len(), 2);
         assert_eq!(track.lines[0].text, "こんにちは世界");
         assert_eq!(track.lines[0].start_ms, 1000);
+    }
+
+    #[test]
+    fn test_merge_duplicate_cues() {
+        // Mirrors a real subtitle: same-timing exact dupes get dropped, same-timing
+        // distinct lines get concatenated, different timings stay separate.
+        let content = r#"352
+00:20:09,230 --> 00:20:10,110
+ノルノアさんこそ
+
+353
+00:20:10,110 --> 00:20:10,900
+ノルノアさんこそ
+
+354
+00:20:10,110 --> 00:20:10,900
+俺の思い違いだったのかも…
+
+355
+00:20:10,900 --> 00:20:10,980
+俺の思い違いだったのかも…
+
+356
+00:20:10,990 --> 00:20:12,990
+俺の思い違いだったのかも…
+
+357
+00:20:10,990 --> 00:20:12,990
+お体 大切に
+なさってください
+"#;
+        let track = parse_srt(content);
+        assert_eq!(track.lines.len(), 4);
+        assert_eq!(track.lines[0].text, "ノルノアさんこそ");
+        // 353 + 354 share timing: dup dropped, distinct line concatenated.
+        assert_eq!(track.lines[1].text, "ノルノアさんこそ 俺の思い違いだったのかも…");
+        assert_eq!(track.lines[2].text, "俺の思い違いだったのかも…");
+        // 356 + 357 share timing (357 itself is a two-line cue joined on parse).
+        assert_eq!(
+            track.lines[3].text,
+            "俺の思い違いだったのかも… お体 大切に\nなさってください"
+        );
+        // Indices are contiguous after merging.
+        for (i, line) in track.lines.iter().enumerate() {
+            assert_eq!(line.index, i);
+        }
     }
 
     #[test]

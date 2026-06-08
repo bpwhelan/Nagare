@@ -45,6 +45,8 @@
     if (config.mining.audio_codec == null) config.mining.audio_codec = 'mp3';
     if (config.mining.generate_avif == null) config.mining.generate_avif = true;
     if (config.mining.animated_screenshot_encoder == null) config.mining.animated_screenshot_encoder = 'libsvtav1';
+    if (config.mining.avif_max_width == null) config.mining.avif_max_width = 480;
+    if (config.mining.avif_max_fps == null) config.mining.avif_max_fps = 10;
     if (config.mining.static_screenshot_format == null) config.mining.static_screenshot_format = 'webp';
     delete config.mining.auto_approve;
     applyMiningConfig(config.mining);
@@ -463,6 +465,14 @@
           <option value="libsvtav1">libsvtav1 (fast)</option>
           <option value="libaom-av1">libaom-av1 (slow, higher quality)</option>
         </select>
+      </div>
+      <div class="field">
+        <label for="avif-max-width">Animated Screenshot Max Width <span class="hint">(px, never upscaled; longer clips scale down further)</span></label>
+        <input id="avif-max-width" type="number" min="64" max="3840" step="16" bind:value={config.mining.avif_max_width} />
+      </div>
+      <div class="field">
+        <label for="avif-max-fps">Animated Screenshot Max FPS <span class="hint">(longer clips scale down further)</span></label>
+        <input id="avif-max-fps" type="number" min="1" max="60" step="1" bind:value={config.mining.avif_max_fps} />
       </div>
       <div class="field">
         <label for="static-screenshot-format">Static Screenshot Format</label>

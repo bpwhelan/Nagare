@@ -1,6 +1,6 @@
 <script>
   import { onDestroy } from 'svelte';
-  import { subtitles, nativeSubtitles, subtitleCandidates, selectedSubtitleCandidateId, subtitleSelectionMode, subtitleOffsetMs, activeHistoryItemId, activeLineIndex, positionMs, pauseOnHover, pauseOnSeek, disableSubtitleSeeking, isPlaying, sessionState, showErrorToast, setOptimisticPosition, setOptimisticPlayState, applySubtitlePayload, yomitanPopupVisible } from './stores.js';
+  import { subtitles, nativeSubtitles, subtitleCandidates, selectedSubtitleCandidateId, subtitleSelectionMode, subtitleOffsetMs, activeHistoryItemId, activeLineIndex, positionMs, pauseOnHover, pauseOnSeek, disableSubtitleSeeking, isPlaying, sessionState, showErrorToast, setOptimisticPosition, setOptimisticPlayState, applySubtitlePayload, yomitanPopupVisible, nowPlayingTitle } from './stores.js';
   import { fireSeek, firePlayPause, playPause, selectSubtitleTrack, setSubtitleOffset } from './api.js';
   import { formatTime, nativeLinesForRange } from './utils.js';
   import AudioTrackSelector from './AudioTrackSelector.svelte';
@@ -239,6 +239,41 @@
     return 'line future';
   }
 
+  // Format milliseconds as an SRT timestamp: HH:MM:SS,mmm
+  function srtTimestamp(ms) {
+    const clamped = Math.max(0, Math.round(ms || 0));
+    const millis = clamped % 1000;
+    const totalSeconds = Math.floor(clamped / 1000);
+    const seconds = totalSeconds % 60;
+    const minutes = Math.floor(totalSeconds / 60) % 60;
+    const hours = Math.floor(totalSeconds / 3600);
+    const pad = (n, len = 2) => n.toString().padStart(len, '0');
+    return `${pad(hours)}:${pad(minutes)}:${pad(seconds)},${pad(millis, 3)}`;
+  }
+
+  function buildSrt(lines) {
+    return lines
+      .map((line, i) => `${i + 1}\n${srtTimestamp(line.start_ms)} --> ${srtTimestamp(line.end_ms)}\n${line.text}\n`)
+      .join('\n');
+  }
+
+  function downloadSubtitles() {
+    const lines = $subtitles;
+    if (!lines.length) return;
+    const safeTitle = ($nowPlayingTitle || 'subtitles')
+      .replace(/[\\/:*?"<>|]+/g, '_')
+      .trim() || 'subtitles';
+    const blob = new Blob([buildSrt(lines)], { type: 'text/srt;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${safeTitle}.srt`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  }
+
   // Native-language text aligned to each target line (by time overlap).
   // Empty array when no native track is loaded (e.g. history view).
   $: nativeTextByLine = $nativeSubtitles.length
@@ -286,6 +321,12 @@
           Auto-scroll
         </label>
         <span class="line-count">{$subtitles.length} lines</span>
+        {#if $subtitles.length > 0}
+          <button class="download-btn" on:click={downloadSubtitles} title="Download current subtitle as .srt">
+            <svg viewBox="0 0 20 20" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 3v9" /><path d="M6 9l4 4 4-4" /><path d="M4 16h12" /></svg>
+            Download
+          </button>
+        {/if}
       </div>
       <div class="controls-detail">
         {#if showSubtitleSelector}
@@ -471,6 +512,29 @@
     font-size: 0.8rem;
     color: var(--text-dim);
     white-space: nowrap;
+  }
+
+  .download-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3rem;
+    margin-left: auto;
+    padding: 0.3rem 0.55rem;
+    font: inherit;
+    font-size: 0.8rem;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    background: var(--bg-card);
+    color: var(--text-secondary);
+    cursor: pointer;
+    white-space: nowrap;
+    transition: background 0.15s, color 0.15s, border-color 0.15s;
+  }
+
+  .download-btn:hover {
+    background: var(--bg-hover);
+    color: var(--text-primary);
+    border-color: var(--accent);
   }
 
   .offset-adjuster {
