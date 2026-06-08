@@ -1,6 +1,6 @@
 <script>
   import { onDestroy } from 'svelte';
-  import { subtitles, nativeSubtitles, subtitleCandidates, selectedSubtitleCandidateId, subtitleSelectionMode, subtitleOffsetMs, activeHistoryItemId, activeLineIndex, positionMs, pauseOnHover, pauseOnSeek, disableSubtitleSeeking, isPlaying, sessionState, showErrorToast, setOptimisticPosition, setOptimisticPlayState, applySubtitlePayload, yomitanPopupVisible, nowPlayingTitle } from './stores.js';
+  import { subtitles, nativeSubtitles, subtitleCandidates, selectedSubtitleCandidateId, subtitleSelectionMode, subtitleOffsetMs, activeHistoryItemId, activeLineIndex, positionMs, pauseOnHover, pauseOnSeek, disableSubtitleSeeking, isPlaying, sessionState, showErrorToast, setOptimisticPosition, setOptimisticPlayState, applySubtitlePayload, yomitanPopupVisible, nowPlayingTitle, showNativeSubtitles, showDownloadButton } from './stores.js';
   import { fireSeek, firePlayPause, playPause, selectSubtitleTrack, setSubtitleOffset } from './api.js';
   import { formatTime, nativeLinesForRange } from './utils.js';
   import AudioTrackSelector from './AudioTrackSelector.svelte';
@@ -275,8 +275,10 @@
   }
 
   // Native-language text aligned to each target line (by time overlap).
-  // Empty array when no native track is loaded (e.g. history view).
-  $: nativeTextByLine = $nativeSubtitles.length
+  // Empty array when no native track is loaded (e.g. history view) or when the
+  // user has hidden the secondary subtitle. Clearing the array also removes the
+  // per-line toggle and the `has-native` styling, since both key off it.
+  $: nativeTextByLine = $showNativeSubtitles && $nativeSubtitles.length
     ? $subtitles.map((line) =>
         nativeLinesForRange($nativeSubtitles, line.start_ms, line.end_ms)
           .map((n) => n.text)
@@ -321,7 +323,7 @@
           Auto-scroll
         </label>
         <span class="line-count">{$subtitles.length} lines</span>
-        {#if $subtitles.length > 0}
+        {#if $subtitles.length > 0 && $showDownloadButton}
           <button class="download-btn" on:click={downloadSubtitles} title="Download current subtitle as .srt">
             <svg viewBox="0 0 20 20" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 3v9" /><path d="M6 9l4 4 4-4" /><path d="M4 16h12" /></svg>
             Download
