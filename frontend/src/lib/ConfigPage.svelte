@@ -1,7 +1,7 @@
 <script>
   import { onMount } from 'svelte';
   import { getConfig, updateConfig } from './api.js';
-  import { applyMiningConfig, autoApprove, pauseOnEnhance, showErrorToast, showToast } from './stores.js';
+  import { applyMiningConfig, autoApprove, pauseOnEnhance, showNativeSubtitles, showDownloadButton, showErrorToast, showToast } from './stores.js';
 
   const AUTO_APPROVE_STORAGE_KEY = 'opt_autoApprove';
 
@@ -468,11 +468,11 @@
       </div>
       <div class="field">
         <label for="avif-max-width">Animated Screenshot Max Width <span class="hint">(px, never upscaled; longer clips scale down further)</span></label>
-        <input id="avif-max-width" type="number" min="64" max="3840" step="16" bind:value={config.mining.avif_max_width} />
+        <input id="avif-max-width" type="number" min="480" max="1280" step="16" bind:value={config.mining.avif_max_width} />
       </div>
       <div class="field">
         <label for="avif-max-fps">Animated Screenshot Max FPS <span class="hint">(longer clips scale down further)</span></label>
-        <input id="avif-max-fps" type="number" min="1" max="60" step="1" bind:value={config.mining.avif_max_fps} />
+        <input id="avif-max-fps" type="number" min="1" max="30" step="1" bind:value={config.mining.avif_max_fps} />
       </div>
       <div class="field">
         <label for="static-screenshot-format">Static Screenshot Format</label>
@@ -502,6 +502,23 @@
         <div class="checkbox-row">
           <input id="pause-on-enhance" type="checkbox" bind:checked={$pauseOnEnhance} />
           <label for="pause-on-enhance">Pause playback when the Anki enhance screen opens</label>
+        </div>
+      </div>
+    </section>
+
+    <section class="section">
+      <h2>Interface</h2>
+      <p class="hint">Show or hide optional UI elements. Stored locally and applies only on this device.</p>
+      <div class="field">
+        <div class="checkbox-row">
+          <input id="show-native-subtitles" type="checkbox" bind:checked={$showNativeSubtitles} />
+          <label for="show-native-subtitles">Show native-language secondary subtitle</label>
+        </div>
+      </div>
+      <div class="field">
+        <div class="checkbox-row">
+          <input id="show-download-button" type="checkbox" bind:checked={$showDownloadButton} />
+          <label for="show-download-button">Show subtitle download button</label>
         </div>
       </div>
     </section>

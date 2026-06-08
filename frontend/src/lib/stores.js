@@ -51,6 +51,10 @@ export const pauseOnSeek = localStorageStore('opt_pauseOnSeek', false);
 export const disableSubtitleSeeking = localStorageStore('opt_disableSubtitleSeeking', false);
 export const pauseOnEnhance = localStorageStore('opt_pauseOnEnhance', true);
 export const yomitanPause = localStorageStore('opt_yomitanPause', false);
+
+// Interface visibility toggles (client-only). Each hides an optional UI element.
+export const showNativeSubtitles = localStorageStore('opt_showNativeSubtitles', true);
+export const showDownloadButton = localStorageStore('opt_showDownloadButton', true);
 export const yomitanPopupVisible = writable(false);
 export const audioStartOffset = writable(100);
 export const audioEndOffset = writable(500);
