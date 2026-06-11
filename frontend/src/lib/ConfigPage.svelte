@@ -8,6 +8,13 @@
   let config = null;
   let loading = true;
   let saving = false;
+  let activeTab = 'server';
+
+  const TABS = [
+    { id: 'server', label: 'Server' },
+    { id: 'anki', label: 'Anki & Media' },
+    { id: 'frontend', label: 'Frontend' },
+  ];
 
   onMount(async () => {
     try {
@@ -36,6 +43,7 @@
     if (!config.anki.fields) config.anki.fields = {};
     if (!config.path_mappings) config.path_mappings = [];
     if (!config.anki.add_tags) config.anki.add_tags = [];
+    if (config.anki.series_tag_parent == null) config.anki.series_tag_parent = '';
     if (!config.anki.ignore_tags) config.anki.ignore_tags = [];
     if (!config.anki.require_tags) config.anki.require_tags = [];
     if (!config.anki.note_types) config.anki.note_types = [];
@@ -148,10 +156,18 @@
   {#if loading}
     <p>Loading configuration...</p>
   {:else if config}
-    <section class="settings-part">
-      <h2>Server Settings</h2>
-      <p class="hint">Saved to the Nagare server and shared across clients.</p>
-    </section>
+    <div class="tab-bar">
+      {#each TABS as tab}
+        <button
+          class="tab"
+          class:active={activeTab === tab.id}
+          on:click={() => (activeTab = tab.id)}
+        >{tab.label}</button>
+      {/each}
+    </div>
+
+    {#if activeTab === 'server'}
+    <p class="hint tab-hint">Saved to the Nagare server and shared across clients.</p>
 
     <!-- ── Media Servers ────────────────────────────── -->
     <section class="section">
@@ -307,6 +323,10 @@
       {/each}
       <button class="btn-small" on:click={addPathMapping}>+ Add Mapping</button>
     </section>
+    {/if}
+
+    {#if activeTab === 'anki'}
+    <p class="hint tab-hint">Saved to the Nagare server and shared across clients.</p>
 
     <!-- ── AnkiConnect ──────────────────────────────── -->
     <section class="section">
@@ -404,6 +424,12 @@
       </div>
 
       <div class="field">
+        <label for="series-tag-parent">Series Tag Parent <span class="hint">(optional — adds <code>parent::Series_Name</code> per show)</span></label>
+        <input id="series-tag-parent" type="text" placeholder="e.g. anime — leave empty to disable"
+          bind:value={config.anki.series_tag_parent} />
+      </div>
+
+      <div class="field">
         <!-- svelte-ignore a11y_label_has_associated_control -->
         <label>Ignore Tags <span class="hint">(skip cards with any of these)</span></label>
         <div class="tag-list">
@@ -483,11 +509,10 @@
         </select>
       </div>
     </section>
+    {/if}
 
-    <section class="settings-part">
-      <h2>Client Settings</h2>
-      <p class="hint">Saved only in this browser.</p>
-    </section>
+    {#if activeTab === 'frontend'}
+    <p class="hint tab-hint">Saved only in this browser, applies to this device.</p>
 
     <section class="section">
       <h2>Mining Options</h2>
@@ -522,13 +547,16 @@
         </div>
       </div>
     </section>
+    {/if}
 
-    <!-- ── Save Button ──────────────────────────────── -->
-    <div class="save-bar">
-      <button class="btn-save" on:click={save} disabled={saving}>
-        {saving ? 'Saving...' : 'Save Server Settings'}
-      </button>
-    </div>
+    <!-- ── Save Button (server-backed tabs only) ─────── -->
+    {#if activeTab !== 'frontend'}
+      <div class="save-bar">
+        <button class="btn-save" on:click={save} disabled={saving}>
+          {saving ? 'Saving...' : 'Save Server Settings'}
+        </button>
+      </div>
+    {/if}
   {:else}
     <p class="error">Failed to load configuration</p>
   {/if}
@@ -550,14 +578,36 @@
     border: 1px solid var(--border);
   }
 
-  .settings-part {
+  .tab-bar {
+    display: flex;
+    gap: 0.25rem;
     margin-bottom: 1rem;
+    border-bottom: 1px solid var(--border);
   }
 
-  .settings-part h2 {
-    margin: 0 0 0.25rem;
-    font-size: 1.2rem;
+  .tab {
+    background: transparent;
+    border: none;
+    border-bottom: 2px solid transparent;
+    color: var(--text-secondary);
+    cursor: pointer;
+    padding: 0.5rem 0.9rem;
+    font-size: 0.9rem;
+    font-weight: 600;
+    margin-bottom: -1px;
+  }
+
+  .tab:hover {
     color: var(--text-primary);
+  }
+
+  .tab.active {
+    color: var(--accent);
+    border-bottom-color: var(--accent);
+  }
+
+  .tab-hint {
+    margin-bottom: 1rem;
   }
 
   .section h2 {
@@ -790,6 +840,13 @@
     .section {
       padding: 0.75rem;
       margin-bottom: 1rem;
+    }
+
+    .tab {
+      flex: 1;
+      padding: 0.6rem 0.4rem;
+      min-height: 44px;
+      font-size: 0.85rem;
     }
 
     .mapping-row {

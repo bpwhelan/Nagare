@@ -94,6 +94,9 @@ pub struct NowPlayingState {
     pub server_kind: MediaServerKind,
     pub item_id: String,
     pub title: String,
+    /// Series name as reported by the media server (None for movies / one-offs).
+    #[serde(default)]
+    pub series_name: Option<String>,
     pub position_ms: i64,
     pub duration_ms: Option<i64>,
     pub is_paused: bool,
@@ -117,6 +120,9 @@ pub struct HistoryEntry {
     pub server_kind: MediaServerKind,
     pub item_id: String,
     pub title: String,
+    /// Series name as reported by the media server (None for movies / one-offs).
+    #[serde(default)]
+    pub series_name: Option<String>,
     pub media_source_id: String,
     pub file_path: Option<String>,
     pub duration_ms: Option<i64>,
@@ -1298,6 +1304,7 @@ impl SessionManager {
                     server_kind: active.kind,
                     item_id: item_id.clone(),
                     title: np.display_title(),
+                    series_name: np.series_name.clone(),
                     position_ms: session.position_ms().unwrap_or(0),
                     duration_ms: np.run_time_ticks.map(|t| t / 10_000),
                     is_paused: session.play_state.is_paused,
@@ -1360,6 +1367,11 @@ impl SessionManager {
                 .as_ref()
                 .map(|np| np.display_title())
                 .unwrap_or_else(|| item_id.clone());
+            let series_name = active
+                .session
+                .now_playing
+                .as_ref()
+                .and_then(|np| np.series_name.clone());
             if item_changed {
                 info!(
                     "New item detected: {} ({}) on {}",
@@ -1424,6 +1436,7 @@ impl SessionManager {
                     server_kind: active.kind,
                     item_id: item_id.clone(),
                     title: display_title.clone(),
+                    series_name: series_name.clone(),
                     media_source_id: media_source_id.clone(),
                     file_path,
                     duration_ms: dur,

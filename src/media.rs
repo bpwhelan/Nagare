@@ -193,11 +193,15 @@ pub async fn generate_avif(
     };
 
     let fps = ((max_fps as f64 * fps_multiplier).round() as u32).max(1);
-    let width = ((max_width as f64 * width_multiplier).round() as u32).max(2);
+    // Round the width cap down to an even value; AV1 encoders (notably
+    // SVT-AV1) reject odd dimensions for the YUV 4:2:0 colorspace.
+    let width = (((max_width as f64 * width_multiplier).round() as u32) & !1).max(2);
 
-    // `min(width,iw)` avoids upscaling past the source; `-2` keeps an even,
-    // aspect-correct height that the AV1 encoders require.
-    let vf = format!("fps={},scale='min({},iw)':-2", fps, width);
+    // `min(width,iw)` avoids upscaling past the source. `2*trunc(.../2)` clamps
+    // the result down to an even width even when the source width (`iw`) is odd,
+    // and `-2` keeps an even, aspect-correct height. Both are required by the
+    // AV1 encoders for YUV_420 (odd dimensions raise "must be even" errors).
+    let vf = format!("fps={},scale='2*trunc(min({},iw)/2)':-2", fps, width);
 
     let primary_result = if FORCE_AVIF_ENCODER_FALLBACK {
         Err(anyhow::anyhow!(
