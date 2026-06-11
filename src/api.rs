@@ -444,6 +444,8 @@ struct MediaContext {
     media_source_id: String,
     file_path: Option<String>,
     title: String,
+    /// Series name from the media server (None for movies / one-offs).
+    series_name: Option<String>,
 }
 
 fn history_entry_to_media_context(entry: &HistoryEntry) -> MediaContext {
@@ -453,6 +455,7 @@ fn history_entry_to_media_context(entry: &HistoryEntry) -> MediaContext {
         media_source_id: entry.media_source_id.clone(),
         file_path: entry.file_path.clone(),
         title: entry.title.clone(),
+        series_name: entry.series_name.clone(),
     }
 }
 
@@ -494,6 +497,7 @@ async fn resolve_media_context(
             media_source_id: np.media_source_id,
             file_path: np.file_path,
             title: np.title,
+            series_name: np.series_name,
         });
     }
 
@@ -584,42 +588,64 @@ async fn prepare_enrichment_candidate(
         event,
         card_ids: provided_card_ids,
     } = notification;
-    let subtitles = state.subtitles.read().await;
-    let track = subtitles.as_ref()?;
 
     let session_state = state.session_rx.borrow().clone();
-    let position_ms = session_state
-        .now_playing
-        .as_ref()
-        .map(|now_playing| now_playing.position_ms)
-        .unwrap_or(0);
-    let history_id = session_state
-        .now_playing
-        .as_ref()
-        .map(|now_playing| now_playing.history_id.clone());
+    let now_playing = session_state.now_playing.clone();
 
-    // Try time-windowed match first (±30s around playback position)
-    let mut matched_line_index = find_matching_line(track, &event.sentence, position_ms, 30_000);
+    // Resolve the matched subtitle line and the history item it belongs to.
+    // `(line_index, history_id)` — `history_id` is the item the audio/screenshot
+    // should be sourced from when the card is enriched.
+    let mut matched: Option<(usize, Option<String>)> = None;
 
-    // Fall back to a global match across the entire subtitle track.
-    // Cards should be accepted whenever we have subs loaded and a match exists,
-    // regardless of playback state or reported position.
-    if matched_line_index.is_none() {
-        let global_matches = find_all_matching_lines(track, &event.sentence);
-        if let Some(&(best_idx, score)) = global_matches.first() {
-            if score > 0.6 {
-                info!(
-                    "No time-windowed match for note {} at position {}ms; \
-                     global fallback matched line {} (score {:.2})",
-                    event.note_id, position_ms, best_idx, score
-                );
-                matched_line_index = Some(best_idx);
+    // 1. Live mining: match against the active session's subtitle track, but only
+    //    while something is actually playing. The shared `state.subtitles` slot is
+    //    owned by the session poller and gets cleared whenever playback stops, so
+    //    trusting it without an active `now_playing` would attribute mined-from-
+    //    history cards to the wrong (or no) media item.
+    if let Some(np) = now_playing.as_ref() {
+        let subtitles = state.subtitles.read().await;
+        if let Some(track) = subtitles.as_ref() {
+            let line = find_matching_line(track, &event.sentence, np.position_ms, 30_000).or_else(
+                || {
+                    // Fall back to a global match across the whole track —
+                    // accept whenever subs are loaded and a match exists,
+                    // regardless of the reported playback position.
+                    find_all_matching_lines(track, &event.sentence)
+                        .first()
+                        .filter(|(_, score)| *score > 0.6)
+                        .map(|&(idx, _)| idx)
+                },
+            );
+            if let Some(idx) = line {
+                matched = Some((idx, Some(np.history_id.clone())));
             }
         }
     }
 
-    let matched_line_index = matched_line_index?;
-    drop(subtitles);
+    // 2. Mining from history: the user activated a past watch item (or nothing is
+    //    playing at all). Scan the persisted watch-history subtitle tracks and pick
+    //    the best global match so the dialog still opens and the card is attributed
+    //    to the correct history item.
+    if matched.is_none() {
+        let history_tracks = state.subtitle_history.read().await;
+        let mut best: Option<(usize, f64, String)> = None;
+        for (hist_id, track) in history_tracks.iter() {
+            if let Some(&(idx, score)) = find_all_matching_lines(track, &event.sentence).first() {
+                if score > 0.6 && best.as_ref().map_or(true, |(_, b, _)| score > *b) {
+                    best = Some((idx, score, hist_id.clone()));
+                }
+            }
+        }
+        if let Some((idx, score, hist_id)) = best {
+            info!(
+                "Note {} matched history item {} (mining from history, score {:.2})",
+                event.note_id, hist_id, score
+            );
+            matched = Some((idx, Some(hist_id)));
+        }
+    }
+
+    let (matched_line_index, history_id) = matched?;
 
     let config = state.config.read().await.clone();
     let card_ids = match provided_card_ids.filter(|ids| !ids.is_empty()) {
@@ -994,6 +1020,17 @@ async fn generate_and_store_screenshot(
     }
 }
 
+/// Sanitize a string into a single Anki tag component. Anki separates tags by
+/// whitespace and nests them with `::`, so collapse whitespace to underscores
+/// and neutralize stray colons that would otherwise create unintended nesting.
+fn sanitize_tag_component(value: &str) -> String {
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join("_")
+        .replace(':', "_")
+}
+
 async fn perform_enrichment(
     state: &Arc<AppState>,
     req: &EnrichRequest,
@@ -1189,8 +1226,24 @@ async fn perform_enrichment(
         }
         info!("[enhance {}] Note fields updated", note_id);
 
-        if !config.anki.add_tags.is_empty() {
-            let tags_str = config.anki.add_tags.join(" ");
+        let mut tags_to_add: Vec<String> = config.anki.add_tags.clone();
+        let series_tag_parent = config.anki.series_tag_parent.trim();
+        if !series_tag_parent.is_empty() {
+            // Prefer the series name reported by the media server; fall back to
+            // the bare title for movies / one-offs that have no series.
+            let series_source = media_ctx.series_name.as_deref().unwrap_or(&media_ctx.title);
+            let series = sanitize_tag_component(series_source);
+            if series.is_empty() {
+                warn!(
+                    "[enhance {}] Series tag enabled but no series/title available",
+                    note_id
+                );
+            } else {
+                tags_to_add.push(format!("{}::{}", series_tag_parent, series));
+            }
+        }
+        if !tags_to_add.is_empty() {
+            let tags_str = tags_to_add.join(" ");
             info!("[enhance {}] Adding tags: {}", note_id, tags_str);
             if let Err(error) = anki_client.add_tags(&[req.note_id], &tags_str).await {
                 warn!("Failed to add tags to note {}: {}", req.note_id, error);

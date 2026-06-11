@@ -545,6 +545,7 @@
         <span class="note-id">Note #{card.event.note_id}</span>
       </div>
 
+      <div class="dialog-body">
       <!-- History match picker (only in history mode) -->
       {#if $activeHistoryItemId}
         {#if fetchingMatches}
@@ -598,28 +599,29 @@
         </div>
       </div>
 
-      <!-- Sentence editor -->
-      <div class="field-section">
-        <label>
-          <span class="label-text">Sentence</span>
-          <textarea bind:value={editedSentence} rows="2"></textarea>
-        </label>
-      </div>
-
-      <!-- Native-language translation (only when a native track is loaded) -->
-      {#if $nativeSubtitles.length > 0}
+      <!-- Sentence + translation editors (side-by-side when a native track is loaded) -->
+      <div class="text-fields" class:two-col={$nativeSubtitles.length > 0}>
         <div class="field-section">
           <label>
-            <span class="label-text">Translation</span>
-            <textarea
-              bind:value={editedTranslation}
-              on:input={() => (translationDirty = true)}
-              rows="2"
-              placeholder="Native-language translation gathered from the subtitle track"
-            ></textarea>
+            <span class="label-text">Sentence</span>
+            <textarea bind:value={editedSentence} rows="2"></textarea>
           </label>
         </div>
-      {/if}
+
+        {#if $nativeSubtitles.length > 0}
+          <div class="field-section">
+            <label>
+              <span class="label-text">Translation</span>
+              <textarea
+                bind:value={editedTranslation}
+                on:input={() => (translationDirty = true)}
+                rows="2"
+                placeholder="Native-language translation gathered from the subtitle track"
+              ></textarea>
+            </label>
+          </div>
+        {/if}
+      </div>
 
       <!-- Range slider -->
       <div class="range-section">
@@ -671,15 +673,19 @@
         </div>
       </div>
 
-      <!-- Audio preview -->
+      <!-- Audio preview + screenshot options -->
       <div class="preview-section">
         <div class="preview-row">
           <button class="small-btn" on:click={handlePlayAudio} disabled={audioLoading}>
             {audioLoading ? 'Loading...' : '▶ Play Audio'}
           </button>
           <button class="small-btn" on:click={handlePreviewScreenshot} disabled={screenshotLoading}>
-            {screenshotLoading ? '...' : '🖼 Preview Screenshot'}
+            {screenshotLoading ? '...' : '🖼 Screenshot'}
           </button>
+          <label class="checkbox-label avif-toggle" title="Generate animated screenshot (AVIF)">
+            <input type="checkbox" bind:checked={generateAvif} />
+            Animated AVIF
+          </label>
         </div>
 
         {#if screenshotUrl}
@@ -689,17 +695,9 @@
         {/if}
       </div>
 
-      <!-- Options -->
-      <div class="options-section">
-        <label class="checkbox-label">
-          <input type="checkbox" bind:checked={generateAvif} />
-          Generate animated screenshot (AVIF)
-        </label>
-      </div>
-
-      <!-- Fields preview -->
-      <div class="fields-section">
-        <h3>Card Fields</h3>
+      <!-- Fields preview (collapsed by default to save vertical space) -->
+      <details class="fields-section">
+        <summary>Card Fields ({Object.keys(card.event.fields).length})</summary>
         <div class="field-list">
           {#each Object.entries(card.event.fields) as [name, field]}
             <div class="field-item">
@@ -708,9 +706,11 @@
             </div>
           {/each}
         </div>
+      </details>
       </div>
+      <!-- /dialog-body -->
 
-      <!-- Actions -->
+      <!-- Actions (sticky footer — always visible) -->
       <div class="actions">
         <button on:click={handleSkip} disabled={submitting}>
           {card.source === 'pending' ? 'Skip' : 'Close'}
@@ -742,17 +742,30 @@
     width: 100%;
     max-width: 700px;
     max-height: 90vh;
-    overflow-y: auto;
-    padding: 1.5rem;
+    overflow: hidden;
     display: flex;
     flex-direction: column;
-    gap: 0.8rem;
   }
 
+  /* Sticky header — never scrolls out of view */
   .dialog-header {
     display: flex;
     justify-content: space-between;
     align-items: center;
+    flex-shrink: 0;
+    padding: 1rem 1.5rem;
+    border-bottom: 1px solid var(--border);
+  }
+
+  /* Scrollable middle — only this region scrolls */
+  .dialog-body {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+    padding: 1rem 1.5rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.8rem;
   }
 
   .dialog-header h2 {
@@ -777,7 +790,7 @@
     background: var(--bg-primary);
     border-radius: 8px;
     padding: 0.5rem;
-    max-height: 180px;
+    max-height: 140px;
     overflow-y: auto;
   }
 
@@ -829,7 +842,16 @@
     cursor: not-allowed;
   }
 
-  /* ── Sentence ── */
+  /* ── Sentence / translation ── */
+
+  .text-fields {
+    display: grid;
+    gap: 0.8rem;
+  }
+
+  .text-fields.two-col {
+    grid-template-columns: 1fr 1fr;
+  }
 
   .field-section label {
     display: flex;
@@ -946,7 +968,14 @@
 
   .preview-row {
     display: flex;
+    align-items: center;
     gap: 0.5rem;
+  }
+
+  .avif-toggle {
+    margin-left: auto;
+    font-size: 0.8rem;
+    white-space: nowrap;
   }
 
   .screenshot-wrap {
@@ -966,10 +995,6 @@
 
   /* ── Options ── */
 
-  .options-section {
-    padding: 0.3rem 0;
-  }
-
   .checkbox-label {
     display: flex;
     align-items: center;
@@ -978,17 +1003,28 @@
     cursor: pointer;
   }
 
-  /* ── Fields ── */
+  /* ── Fields (collapsible) ── */
 
   .fields-section {
-    max-height: 120px;
-    overflow-y: auto;
+    background: var(--bg-primary);
+    border-radius: 6px;
+  }
+
+  .fields-section summary {
+    font-size: 0.85rem;
+    color: var(--text-secondary);
+    cursor: pointer;
+    padding: 0.4rem 0.6rem;
+    user-select: none;
   }
 
   .field-list {
     display: flex;
     flex-direction: column;
     gap: 0.2rem;
+    max-height: 120px;
+    overflow-y: auto;
+    padding: 0 0.6rem 0.5rem;
   }
 
   .field-item {
@@ -1014,12 +1050,15 @@
 
   /* ── Actions ── */
 
+  /* Sticky footer — Skip/Confirm always visible */
   .actions {
     display: flex;
     justify-content: flex-end;
     gap: 0.75rem;
-    padding-top: 0.5rem;
+    flex-shrink: 0;
+    padding: 0.85rem 1.5rem;
     border-top: 1px solid var(--border);
+    background: var(--bg-secondary);
   }
 
   /* ── Match picker (history mode) ── */
@@ -1104,12 +1143,26 @@
       max-width: 100%;
       max-height: 100vh;
       border-radius: 0;
-      padding: 1rem;
+    }
+
+    .dialog-header,
+    .dialog-body,
+    .actions {
+      padding-left: 1rem;
+      padding-right: 1rem;
+    }
+
+    .dialog-body {
       gap: 0.6rem;
     }
 
     .dialog-header h2 {
       font-size: 1rem;
+    }
+
+    /* Stack sentence/translation on narrow screens */
+    .text-fields.two-col {
+      grid-template-columns: 1fr;
     }
 
     .context-lines {
@@ -1166,13 +1219,13 @@
       font-size: 0.85rem;
     }
 
+    /* Keep Skip/Confirm side-by-side so the sticky footer stays short */
     .actions {
-      flex-direction: column;
       gap: 0.5rem;
     }
 
     .actions button {
-      width: 100%;
+      flex: 1;
       min-height: 44px;
       font-size: 0.95rem;
     }
@@ -1182,7 +1235,7 @@
       gap: 0.1rem;
     }
 
-    .fields-section {
+    .field-list {
       max-height: 88px;
     }
 

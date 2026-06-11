@@ -5,6 +5,7 @@
   import { formatTime } from './utils.js';
 
   let loading = false;
+  let activeTab = 'mined'; // 'mined' | 'watch'
 
   onMount(loadHistory);
 
@@ -59,63 +60,86 @@
     </button>
   </div>
 
-  <section class="history-section">
-    <div class="section-header">
-      <h3>Mined Notes</h3>
-      <p class="hint">Tap a mined note to reopen the enhancement dialog.</p>
-    </div>
-    {#if $minedHistoryItems.length === 0}
-      <div class="empty compact">
-        <p>No mined notes yet</p>
-      </div>
-    {:else}
-      <div class="history-list">
-        {#each $minedHistoryItems as item}
-          <button class="history-item mined-item" on:click={() => handleOpenMined(item)}>
-            <div class="item-header">
-              <div class="item-title">{item.title}</div>
-              <span class="item-server">note #{item.note_id}</span>
-            </div>
-            <div class="item-preview">{@html item.sentence.replace(/\n/g, '<br>')}</div>
-            <div class="item-meta">
-              <span class="meta-time">{timeAgo(item.updated_at)}</span>
-            </div>
-          </button>
-        {/each}
-      </div>
-    {/if}
-  </section>
+  <div class="history-tabs" role="tablist">
+    <button
+      class="tab"
+      class:active={activeTab === 'mined'}
+      role="tab"
+      aria-selected={activeTab === 'mined'}
+      on:click={() => (activeTab = 'mined')}
+    >
+      Mined Notes
+      {#if $minedHistoryItems.length > 0}
+        <span class="tab-count">{$minedHistoryItems.length}</span>
+      {/if}
+    </button>
+    <button
+      class="tab"
+      class:active={activeTab === 'watch'}
+      role="tab"
+      aria-selected={activeTab === 'watch'}
+      on:click={() => (activeTab = 'watch')}
+    >
+      Watch History
+      {#if $historyItems.length > 0}
+        <span class="tab-count">{$historyItems.length}</span>
+      {/if}
+    </button>
+  </div>
 
-  <section class="history-section">
-    <div class="section-header">
-      <h3>Watch History</h3>
+  {#if activeTab === 'mined'}
+    <section class="history-section">
+      <p class="hint">Tap a mined note to reopen the enhancement dialog.</p>
+      {#if $minedHistoryItems.length === 0}
+        <div class="empty compact">
+          <p>No mined notes yet</p>
+        </div>
+      {:else}
+        <div class="history-list">
+          {#each $minedHistoryItems as item}
+            <button class="history-item mined-item" on:click={() => handleOpenMined(item)}>
+              <div class="item-header">
+                <div class="item-title">{item.title}</div>
+                <span class="item-server">note #{item.note_id}</span>
+              </div>
+              <div class="item-preview">{@html item.sentence.replace(/\n/g, '<br>')}</div>
+              <div class="item-meta">
+                <span class="meta-time">{timeAgo(item.updated_at)}</span>
+              </div>
+            </button>
+          {/each}
+        </div>
+      {/if}
+    </section>
+  {:else}
+    <section class="history-section">
       <p class="hint">Load subtitles from something you watched recently.</p>
-    </div>
-    {#if $historyItems.length === 0}
-      <div class="empty compact">
-        <p>No watch history yet</p>
-        <p class="hint">Watch something with target language audio and it will appear here</p>
-      </div>
-    {:else}
-      <div class="history-list">
-        {#each $historyItems as item}
-          <button class="history-item" on:click={() => handleActivate(item)}>
-            <div class="item-header">
-              <div class="item-title">{item.title}</div>
-              <span class="item-server">{item.server_kind}</span>
-            </div>
-            <div class="item-meta">
-              <span class="meta-subs">📝 {item.subtitle_count} lines</span>
-              {#if item.duration_ms}
-                <span class="meta-duration">⏱ {formatTime(item.duration_ms)}</span>
-              {/if}
-              <span class="meta-time">{timeAgo(item.last_seen)}</span>
-            </div>
-          </button>
-        {/each}
-      </div>
-    {/if}
-  </section>
+      {#if $historyItems.length === 0}
+        <div class="empty compact">
+          <p>No watch history yet</p>
+          <p class="hint">Watch something with target language audio and it will appear here</p>
+        </div>
+      {:else}
+        <div class="history-list">
+          {#each $historyItems as item}
+            <button class="history-item" on:click={() => handleActivate(item)}>
+              <div class="item-header">
+                <div class="item-title">{item.title}</div>
+                <span class="item-server">{item.server_kind}</span>
+              </div>
+              <div class="item-meta">
+                <span class="meta-subs">📝 {item.subtitle_count} lines</span>
+                {#if item.duration_ms}
+                  <span class="meta-duration">⏱ {formatTime(item.duration_ms)}</span>
+                {/if}
+                <span class="meta-time">{timeAgo(item.last_seen)}</span>
+              </div>
+            </button>
+          {/each}
+        </div>
+      {/if}
+    </section>
+  {/if}
 </div>
 
 <style>
@@ -134,17 +158,58 @@
     margin-bottom: 1rem;
   }
 
+  .history-tabs {
+    display: flex;
+    gap: 0.25rem;
+    margin-bottom: 1rem;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .tab {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    padding: 0.5rem 0.9rem;
+    background: transparent;
+    border: none;
+    border-radius: 0;
+    border-bottom: 2px solid transparent;
+    color: var(--text-secondary);
+    font-size: 0.9rem;
+    cursor: pointer;
+  }
+
+  .tab:hover {
+    color: var(--text-primary);
+  }
+
+  .tab.active {
+    color: var(--accent);
+    border-bottom-color: var(--accent);
+  }
+
+  .tab-count {
+    font-size: 0.7rem;
+    font-weight: 600;
+    padding: 0.05rem 0.4rem;
+    border-radius: 10px;
+    background: var(--bg-card);
+    color: var(--text-dim);
+  }
+
+  .tab.active .tab-count {
+    background: var(--accent);
+    color: #fff;
+  }
+
   .history-section {
     margin-bottom: 1.25rem;
   }
 
-  .section-header {
-    margin-bottom: 0.75rem;
-  }
-
-  .section-header h3 {
-    margin: 0 0 0.2rem;
-    font-size: 1rem;
+  .history-section .hint {
+    margin: 0 0 0.75rem;
+    font-size: 0.85rem;
+    color: var(--text-dim);
   }
 
   .history-header h2 {

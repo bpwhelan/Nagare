@@ -241,6 +241,7 @@ fn open_connection(path: &Path) -> anyhow::Result<Connection> {
             server_kind TEXT NOT NULL,
             item_id TEXT NOT NULL,
             title TEXT NOT NULL,
+            series_name TEXT,
             media_source_id TEXT NOT NULL,
             file_path TEXT,
             duration_ms INTEGER,
@@ -283,7 +284,37 @@ fn open_connection(path: &Path) -> anyhow::Result<Connection> {
         ",
     )
     .context("Failed to initialize SQLite schema")?;
+
+    // Migrations for columns added after the initial schema shipped.
+    add_column_if_missing(&conn, "media_history", "series_name", "TEXT")?;
+
     Ok(conn)
+}
+
+/// Add `column` to `table` if it is not already present. SQLite's
+/// `CREATE TABLE IF NOT EXISTS` never alters an existing table, so new columns
+/// need an explicit, idempotent migration.
+fn add_column_if_missing(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    decl: &str,
+) -> anyhow::Result<()> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let exists = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .filter_map(Result::ok)
+        .any(|name| name == column);
+    drop(stmt);
+
+    if !exists {
+        conn.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"),
+            [],
+        )
+        .with_context(|| format!("Failed to add column {column} to {table}"))?;
+    }
+    Ok(())
 }
 
 fn load_config_or_default_sync(
@@ -379,17 +410,19 @@ fn save_session_history_conn(
                 server_kind,
                 item_id,
                 title,
+                series_name,
                 media_source_id,
                 file_path,
                 duration_ms,
                 subtitle_count,
                 last_position_ms,
                 last_seen
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
             ON CONFLICT(history_id) DO UPDATE SET
                 server_kind = excluded.server_kind,
                 item_id = excluded.item_id,
                 title = excluded.title,
+                series_name = excluded.series_name,
                 media_source_id = excluded.media_source_id,
                 file_path = excluded.file_path,
                 duration_ms = excluded.duration_ms,
@@ -402,6 +435,7 @@ fn save_session_history_conn(
                 entry.server_kind.as_str(),
                 entry.item_id,
                 entry.title,
+                entry.series_name,
                 entry.media_source_id,
                 entry.file_path,
                 entry.duration_ms,
@@ -447,7 +481,8 @@ fn load_history_map(conn: &Connection) -> anyhow::Result<HashMap<String, History
             duration_ms,
             subtitle_count,
             last_position_ms,
-            last_seen
+            last_seen,
+            series_name
         FROM media_history
         ",
     )?;
@@ -466,6 +501,7 @@ fn load_history_map(conn: &Connection) -> anyhow::Result<HashMap<String, History
             })?,
             item_id: row.get(2)?,
             title: row.get(3)?,
+            series_name: row.get(10)?,
             media_source_id: row.get(4)?,
             file_path: row.get(5)?,
             duration_ms: row.get(6)?,
