@@ -1227,8 +1227,7 @@ async fn perform_enrichment(
         info!("[enhance {}] Note fields updated", note_id);
 
         let mut tags_to_add: Vec<String> = config.anki.add_tags.clone();
-        let series_tag_parent = config.anki.series_tag_parent.trim();
-        if !series_tag_parent.is_empty() {
+        if config.anki.series_tag_enabled {
             // Prefer the series name reported by the media server; fall back to
             // the bare title for movies / one-offs that have no series.
             let series_source = media_ctx.series_name.as_deref().unwrap_or(&media_ctx.title);
@@ -1239,7 +1238,12 @@ async fn perform_enrichment(
                     note_id
                 );
             } else {
-                tags_to_add.push(format!("{}::{}", series_tag_parent, series));
+                let parent = config.anki.series_tag_parent.trim();
+                if parent.is_empty() {
+                    tags_to_add.push(series);
+                } else {
+                    tags_to_add.push(format!("{}::{}", parent, series));
+                }
             }
         }
         if !tags_to_add.is_empty() {

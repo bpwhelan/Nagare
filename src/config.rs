@@ -112,8 +112,13 @@ pub struct AnkiConfig {
     #[serde(default)]
     pub add_tags: Vec<String>,
 
-    /// Parent tag under which a per-series tag is added, derived from the show
-    /// title (e.g. "anime" produces `anime::Series_Name`). Empty disables it.
+    /// When enabled, a per-series tag is added, derived from the show title.
+    #[serde(default)]
+    pub series_tag_enabled: bool,
+
+    /// Optional parent tag under which the per-series tag is nested
+    /// (e.g. "anime" produces `anime::Series_Name`). Empty means the series
+    /// name is used as a top-level tag. Only applies when `series_tag_enabled`.
     #[serde(default)]
     pub series_tag_parent: String,
 
@@ -443,6 +448,7 @@ impl Default for AnkiConfig {
             url: default_ankiconnect_url(),
             fields: AnkiFieldMapping::default(),
             add_tags: Vec::new(),
+            series_tag_enabled: false,
             series_tag_parent: String::new(),
             ignore_tags: Vec::new(),
             require_tags: Vec::new(),
