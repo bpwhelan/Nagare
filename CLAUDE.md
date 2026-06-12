@@ -45,8 +45,10 @@ them whole.
 - Config is persisted via SQLite, not a flat file; `Config::save_to` is legacy.
   The `mining.auto_approve` field is a migrated client-local setting and is
   stripped server-side.
-- Series tagging (`anki.series_tag_parent`): when set, enrichment adds a
-  `parent::Series_Name` tag in `perform_enrichment`. The series name comes from
+- Series tagging (`anki.series_tag_enabled` / `anki.series_tag_parent`): when
+  enabled, enrichment adds a per-series tag in `perform_enrichment`. With a
+  non-empty parent it is `parent::Series_Name`; with an empty parent it is just
+  `Series_Name`. The series name comes from
   the media server's metadata (`NowPlaying.series_name`), plumbed through
   `NowPlayingState` / `HistoryEntry` (persisted in the `media_history` table) and
   `MediaContext`; movies fall back to the bare title.

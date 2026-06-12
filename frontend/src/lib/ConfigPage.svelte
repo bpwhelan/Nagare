@@ -43,6 +43,7 @@
     if (!config.anki.fields) config.anki.fields = {};
     if (!config.path_mappings) config.path_mappings = [];
     if (!config.anki.add_tags) config.anki.add_tags = [];
+    if (config.anki.series_tag_enabled == null) config.anki.series_tag_enabled = false;
     if (config.anki.series_tag_parent == null) config.anki.series_tag_parent = '';
     if (!config.anki.ignore_tags) config.anki.ignore_tags = [];
     if (!config.anki.require_tags) config.anki.require_tags = [];
@@ -424,10 +425,18 @@
       </div>
 
       <div class="field">
-        <label for="series-tag-parent">Series Tag Parent <span class="hint">(optional — adds <code>parent::Series_Name</code> per show)</span></label>
-        <input id="series-tag-parent" type="text" placeholder="e.g. anime — leave empty to disable"
-          bind:value={config.anki.series_tag_parent} />
+        <div class="checkbox-row">
+          <input id="series-tag-enabled" type="checkbox" bind:checked={config.anki.series_tag_enabled} />
+          <label for="series-tag-enabled">Add a per-series tag to each card</label>
+        </div>
       </div>
+      {#if config.anki.series_tag_enabled}
+        <div class="field">
+          <label for="series-tag-parent">Parent Tag <span class="hint">(optional — <code>parent::Series_Name</code>; empty uses <code>Series_Name</code> alone)</span></label>
+          <input id="series-tag-parent" type="text" placeholder="e.g. anime"
+            bind:value={config.anki.series_tag_parent} />
+        </div>
+      {/if}
 
       <div class="field">
         <!-- svelte-ignore a11y_label_has_associated_control -->
