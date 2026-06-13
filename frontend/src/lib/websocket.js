@@ -1,8 +1,10 @@
 import { get } from 'svelte/store';
-import { activeHistoryItemId, sessionState, pendingCards, connected, ankiStatus, enhancementQueue, syncPositionFromSessionState, isSeekLocked, isPlayLocked, applySubtitlePayload, applyAudioTracksPayload, showErrorToast, showToast } from './stores.js';
+import { activeHistoryItemId, sessionState, pendingCards, connected, ankiStatus, enhancementQueue, syncPositionFromSessionState, isSeekLocked, isPlayLocked, applySubtitlePayload, applyAudioTracksPayload, showErrorToast, showToast, forceResync } from './stores.js';
 
 let ws = null;
 let reconnectTimer = null;
+let lastMessageAt = 0;
+let resyncWatchdog = null;
 
 export function connectWebSocket() {
   if (ws && ws.readyState === WebSocket.OPEN) return;
@@ -25,6 +27,8 @@ export function connectWebSocket() {
     connected.set(false);
     ankiStatus.set({ state: 'unknown', message: null });
     enhancementQueue.set([]);
+    // Drop the stale playback clock so the fresh `init` snapshot re-anchors cleanly.
+    forceResync();
     console.log('WebSocket disconnected, reconnecting in 2s...');
     reconnectTimer = setTimeout(connectWebSocket, 2000);
   };
@@ -34,6 +38,7 @@ export function connectWebSocket() {
   };
 
   ws.onmessage = (event) => {
+    lastMessageAt = Date.now();
     try {
       const msg = JSON.parse(event.data);
       handleMessage(msg);
@@ -41,6 +46,53 @@ export function connectWebSocket() {
       console.error('Failed to parse WS message:', e);
     }
   };
+}
+
+/** Tear down the current socket and reconnect immediately, skipping the backoff timer. */
+function reconnectNow() {
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+  if (ws) {
+    // Detach handlers so the imminent close doesn't schedule a duplicate reconnect.
+    ws.onclose = null;
+    ws.onerror = null;
+    try { ws.close(); } catch (_) { /* ignore */ }
+    ws = null;
+  }
+  connectWebSocket();
+}
+
+/**
+ * Called when the page returns to the foreground (e.g. mobile tab resumed).
+ * Mobile browsers freeze timers and can leave the WebSocket in a "zombie" state
+ * that no longer delivers messages, so the local playback clock drifts out of
+ * sync. Re-anchor on the next server snapshot and revive the socket if needed.
+ */
+export function resyncFromBackground() {
+  // Re-anchor to whatever the server reports next, discarding drifted projection.
+  forceResync();
+
+  // Dead or closing socket: reconnect right away instead of waiting out the backoff.
+  if (!ws || ws.readyState === WebSocket.CLOSING || ws.readyState === WebSocket.CLOSED) {
+    reconnectNow();
+    return;
+  }
+
+  // Socket claims to be open. It may be a zombie after backgrounding — watch for a
+  // fresh message and force a reconnect if none arrives shortly (the server pushes
+  // state every 50ms while connected).
+  if (ws.readyState === WebSocket.OPEN) {
+    const seenAt = lastMessageAt;
+    clearTimeout(resyncWatchdog);
+    resyncWatchdog = setTimeout(() => {
+      if (lastMessageAt === seenAt) {
+        console.log('No WS traffic after resume, reconnecting');
+        reconnectNow();
+      }
+    }, 1500);
+  }
 }
 
 function handleMessage(msg) {
@@ -125,5 +177,9 @@ export function disconnect() {
   if (reconnectTimer) {
     clearTimeout(reconnectTimer);
     reconnectTimer = null;
+  }
+  if (resyncWatchdog) {
+    clearTimeout(resyncWatchdog);
+    resyncWatchdog = null;
   }
 }
