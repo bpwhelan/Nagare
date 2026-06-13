@@ -1,6 +1,6 @@
 <script>
   import { onMount, onDestroy } from 'svelte';
-  import { connectWebSocket, disconnect } from './lib/websocket.js';
+  import { connectWebSocket, disconnect, resyncFromBackground } from './lib/websocket.js';
   import { getConfig, getDialogByCardId, getDialogByNoteId, getHistorySubtitles, getPendingEnrichments } from './lib/api.js';
   import {
     activeHistoryItemId,
@@ -50,10 +50,21 @@
     }
   }
 
+  function handlePageVisible() {
+    if (document.visibilityState === 'visible') {
+      resyncFromBackground();
+    }
+  }
+
   onMount(async () => {
     startYomitanObserver();
     connectWebSocket();
     syncRouteFromLocation();
+
+    // Re-sync with the server session when the tab is foregrounded again — mobile
+    // browsers suspend timers/sockets in the background, leaving subs out of sync.
+    document.addEventListener('visibilitychange', handlePageVisible);
+    window.addEventListener('pageshow', handlePageVisible);
 
     try {
       const [config, pending] = await Promise.all([
@@ -68,6 +79,8 @@
   });
 
   onDestroy(() => {
+    document.removeEventListener('visibilitychange', handlePageVisible);
+    window.removeEventListener('pageshow', handlePageVisible);
     disconnect();
     stopYomitanObserver();
   });

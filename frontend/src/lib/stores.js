@@ -320,6 +320,17 @@ export function syncPositionFromSessionState(state) {
   syncActiveLineWithPosition(nextPosition);
 }
 
+/**
+ * Discard the local playback clock so the next authoritative server snapshot
+ * re-anchors us unconditionally. Used when returning from the background, where
+ * suspended timers / a frozen WebSocket can leave the projected position drifted
+ * out of sync with the real server playback position.
+ */
+export function forceResync() {
+  _playbackAnchor = null;
+  _lastServerObservation = null;
+}
+
 setInterval(() => {
   if (isSeekLocked()) return;
 
