@@ -1,5 +1,6 @@
 <script>
   import { onMount, onDestroy } from 'svelte';
+  import { fade } from 'svelte/transition';
   import { connectWebSocket, disconnect, resyncFromBackground } from './lib/websocket.js';
   import { getConfig, getDialogByCardId, getDialogByNoteId, getHistorySubtitles, getPendingEnrichments } from './lib/api.js';
   import {
@@ -11,6 +12,7 @@
     currentView,
     dialogCard,
     durationMs,
+    enhancementFlash,
     enhancementQueue,
     isPlaying,
     nowPlayingTitle,
@@ -155,6 +157,9 @@
       <div class="connection" class:online={$connected}>
         {$connected ? '●' : '○'}
       </div>
+      {#if $enhancementFlash}
+        <span class="enhance-check" role="status" aria-label="Card enhanced" transition:fade={{ duration: 200 }}>✓</span>
+      {/if}
       <SessionSelector />
     </div>
     <div class="topbar-right">
@@ -336,6 +341,13 @@
 
   .connection.online {
     color: var(--success);
+  }
+
+  .enhance-check {
+    color: var(--success);
+    font-weight: 700;
+    font-size: 0.95rem;
+    line-height: 1;
   }
 
   .desktop-nav {

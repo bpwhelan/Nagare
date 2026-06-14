@@ -13,7 +13,6 @@
     positionMs,
     replaceRoute,
     showErrorToast,
-    showToast,
     subtitles,
     nativeSubtitles,
     isPlaying,
@@ -340,9 +339,9 @@
 
     console.log('[EnrichDialog] Confirming note', noteId, payload);
 
-    // Close dialog immediately — enhancement runs in the background
+    // Close dialog immediately — enhancement runs in the background. Queuing is
+    // silent; the processing banner already shows pending/running items.
     closeDialogAfterDispatch(noteId, isHistoryCard);
-    showToast('success', isHistoryCard ? 'Save queued in background' : 'Enhancement queued');
 
     // Queue the enrichment — calls are serialized to avoid connection pool exhaustion
     queueEnrichCard(payload);

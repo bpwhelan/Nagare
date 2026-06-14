@@ -1,5 +1,5 @@
 import { get } from 'svelte/store';
-import { activeHistoryItemId, sessionState, pendingCards, connected, ankiStatus, enhancementQueue, syncPositionFromSessionState, isSeekLocked, isPlayLocked, applySubtitlePayload, applyAudioTracksPayload, showErrorToast, showToast, forceResync } from './stores.js';
+import { activeHistoryItemId, sessionState, pendingCards, connected, ankiStatus, enhancementQueue, syncPositionFromSessionState, isSeekLocked, isPlayLocked, applySubtitlePayload, applyAudioTracksPayload, showErrorToast, flashEnhancementSuccess, forceResync } from './stores.js';
 
 let ws = null;
 let reconnectTimer = null;
@@ -152,7 +152,8 @@ function handleMessage(msg) {
         const r = msg.enhancement_result;
         console.log('[WS] enhancement_result:', r);
         if (r.success) {
-          showToast('success', r.message);
+          // No toast — just a brief checkmark next to the connection status.
+          flashEnhancementSuccess();
         } else {
           showErrorToast(r.message);
         }

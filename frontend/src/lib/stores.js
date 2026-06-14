@@ -138,6 +138,17 @@ export function applySubtitlePayload(payload) {
   subtitleOffsetMs.set(payload?.subtitle_offset_ms ?? 0);
 }
 
+// Brief "✓" flash shown next to the connection status after a successful
+// enhancement — replaces the success toast so mobile isn't spammed.
+export const enhancementFlash = writable(false);
+let _flashTimer = null;
+/** Flash the success checkmark in the topbar for a few seconds. */
+export function flashEnhancementSuccess(duration = 3000) {
+  enhancementFlash.set(true);
+  clearTimeout(_flashTimer);
+  _flashTimer = setTimeout(() => enhancementFlash.set(false), duration);
+}
+
 // Toasts
 let _toastId = 0;
 export const toasts = writable(/** @type {{ id: number, type: 'success'|'error', message: string }[]} */ ([]));
