@@ -648,22 +648,13 @@ async fn prepare_enrichment_candidate(
     let (matched_line_index, history_id) = matched?;
 
     let config = state.config.read().await.clone();
-    let card_ids = match provided_card_ids.filter(|ids| !ids.is_empty()) {
-        Some(ids) => ids,
-        None => {
-            let anki_client = state.anki_client.read().await.clone();
-            anki_client
-                .find_cards_for_note(event.note_id)
-                .await
-                .unwrap_or_else(|error| {
-                    warn!(
-                        "Failed to look up card ids for note {}: {}",
-                        event.note_id, error
-                    );
-                    Vec::new()
-                })
-        }
-    };
+    // Don't block the dialog on an AnkiConnect `findCards` round-trip. The card
+    // ids are only needed for open-by-card-id routing and as an enrich-time
+    // fallback (re-fetched in `save_mining_history_entry` regardless), so when
+    // the beacon didn't include them we leave the list empty here and let
+    // `run_new_card_processor` backfill it in the background. This keeps the
+    // notification → dialog latency to the in-memory subtitle match only.
+    let card_ids = provided_card_ids.unwrap_or_default();
 
     Some(EnrichmentDialogState {
         event,
@@ -1274,7 +1265,44 @@ pub async fn run_new_card_processor(
             continue;
         };
 
+        // Surface the dialog immediately; resolve card ids out of band when the
+        // beacon didn't supply them so the AnkiConnect lookup stays off the
+        // notification → dialog path.
+        let needs_card_ids = candidate.card_ids.is_empty();
+        let note_id = candidate.event.note_id;
         queue_pending_enrichment(&state, candidate).await;
+
+        if needs_card_ids {
+            let state = state.clone();
+            tokio::spawn(async move {
+                backfill_pending_card_ids(&state, note_id).await;
+            });
+        }
+    }
+}
+
+/// Resolve the Anki card ids for a freshly-detected note out of band and patch
+/// them into the pending enrichment entry. Keeping this off the critical path
+/// lets the dialog surface immediately; the only consumer of these ids before
+/// enrichment is open-by-card-id routing, which falls back to the note-id path
+/// if it races ahead of this backfill.
+async fn backfill_pending_card_ids(state: &Arc<AppState>, note_id: i64) {
+    let client = state.anki_client.read().await.clone();
+    let ids = match client.find_cards_for_note(note_id).await {
+        Ok(ids) if !ids.is_empty() => ids,
+        Ok(_) => return,
+        Err(error) => {
+            warn!("Failed to backfill card ids for note {}: {}", note_id, error);
+            return;
+        }
+    };
+
+    let mut pending = state.pending_enrichments.write().await;
+    if let Some(entry) = pending
+        .iter_mut()
+        .find(|entry| entry.event.note_id == note_id)
+    {
+        entry.card_ids = ids;
     }
 }
 
