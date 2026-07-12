@@ -112,6 +112,15 @@ export async function getConfig() {
   return api('/api/config');
 }
 
+/**
+ * List the users available on each enabled media server for the per-server
+ * allowlist. Connection settings must be saved first.
+ * @returns {Promise<Array<{ server_kind: string, users: Array<{id: string, name: string}>, error?: string }>>}
+ */
+export async function getServerUsers() {
+  return api('/api/users');
+}
+
 export async function seekTo(positionMs) {
   return api('/api/seek', {
     method: 'POST',

@@ -547,15 +547,27 @@ impl SessionManager {
     }
 
     async fn collect_server_sessions(&self, servers: ServerMap) -> Vec<ServerSession> {
+        let config = self.config.read().await.clone();
         let mut sessions = Vec::<ServerSession>::new();
         for (kind, server) in servers {
             match server.get_sessions().await {
                 Ok(fetched) => {
-                    sessions.extend(fetched.into_iter().map(|session| ServerSession {
-                        kind,
-                        server: server.clone(),
-                        session,
-                    }));
+                    sessions.extend(
+                        fetched
+                            .into_iter()
+                            .filter(|session| {
+                                config.is_user_allowed(
+                                    kind,
+                                    session.user_id.as_deref(),
+                                    session.user_name.as_deref(),
+                                )
+                            })
+                            .map(|session| ServerSession {
+                                kind,
+                                server: server.clone(),
+                                session,
+                            }),
+                    );
                 }
                 Err(e) => {
                     warn!("Failed to fetch {kind} sessions: {}", e);
@@ -1194,23 +1206,43 @@ impl SessionManager {
                     .cloned()
             })
         } else {
-            // Auto-select: prefer target-language sessions, fall back to any playing session
-            let target_match = sessions
-                .iter()
-                .find(|s| {
-                    s.session
-                        .now_playing
-                        .as_ref()
-                        .map(|np| np.has_audio_language(&target_lang))
-                        .unwrap_or(false)
+            // Sticky auto-select: if a session is already active and still
+            // playing, keep tracking it. Re-picking every poll causes the
+            // active session to flicker between multiple concurrent sessions
+            // (server session ordering is not stable across requests).
+            let previous_active_id = self.state.read().await.active_session_id.clone();
+            let sticky = previous_active_id.as_deref().and_then(|id| {
+                split_scoped_id(id).and_then(|(kind, raw_id)| {
+                    sessions
+                        .iter()
+                        .find(|s| {
+                            s.kind == kind
+                                && s.session.id == raw_id
+                                && s.session.now_playing.is_some()
+                        })
+                        .cloned()
                 })
-                .cloned();
+            });
 
-            target_match.or_else(|| {
+            sticky.or_else(|| {
+                // No valid current session — pick a fresh one, preferring a
+                // target-language session, falling back to any playing session.
                 sessions
                     .iter()
-                    .find(|s| s.session.now_playing.is_some())
+                    .find(|s| {
+                        s.session
+                            .now_playing
+                            .as_ref()
+                            .map(|np| np.has_audio_language(&target_lang))
+                            .unwrap_or(false)
+                    })
                     .cloned()
+                    .or_else(|| {
+                        sessions
+                            .iter()
+                            .find(|s| s.session.now_playing.is_some())
+                            .cloned()
+                    })
             })
         };
 

@@ -38,6 +38,7 @@ export const selectedSubtitleCandidateId = writable(/** @type {string|null} */ (
 export const subtitleSelectionMode = writable(/** @type {'auto'|'manual'} */ ('auto'));
 export const subtitleOffsetMs = writable(0);
 export const activeLineIndex = writable(/** @type {number|null} */ (null));
+export const timelineRecenterRequest = writable(0);
 export const pendingCards = writable(/** @type {NewCardWithMatch[]} */ ([]));
 export const connected = writable(false);
 export const ankiStatus = writable(/** @type {AnkiStatus} */ ({
@@ -340,6 +341,10 @@ export function syncPositionFromSessionState(state) {
 export function forceResync() {
   _playbackAnchor = null;
   _lastServerObservation = null;
+}
+
+export function requestTimelineRecenter() {
+  timelineRecenterRequest.update(value => value + 1);
 }
 
 setInterval(() => {

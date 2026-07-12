@@ -82,6 +82,9 @@ pub struct EmbyConfig {
     pub enabled: bool,
     pub url: String,
     pub api_key: String,
+    /// User IDs to monitor. Empty means all users on the server.
+    #[serde(default)]
+    pub users: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -90,6 +93,9 @@ pub struct JellyfinConfig {
     pub enabled: bool,
     pub url: String,
     pub api_key: String,
+    /// User IDs to monitor. Empty means all users on the server.
+    #[serde(default)]
+    pub users: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -98,6 +104,9 @@ pub struct PlexConfig {
     pub enabled: bool,
     pub url: String,
     pub token: String,
+    /// User IDs (account IDs) to monitor. Empty means all users on the server.
+    #[serde(default)]
+    pub users: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -439,6 +448,61 @@ impl Config {
     /// Whether a media server is configured.
     pub fn has_server(&self) -> bool {
         !self.enabled_server_kinds().is_empty()
+    }
+
+    /// The configured user-ID allowlist for a server (empty = all users).
+    pub fn allowed_users(&self, kind: MediaServerKind) -> &[String] {
+        match kind {
+            MediaServerKind::Emby => self.emby.as_ref().map(|c| c.users.as_slice()),
+            MediaServerKind::Jellyfin => self.jellyfin.as_ref().map(|c| c.users.as_slice()),
+            MediaServerKind::Plex => self.plex.as_ref().map(|c| c.users.as_slice()),
+        }
+        .unwrap_or(&[])
+    }
+
+    /// Whether a session belonging to `user_id`/`user_name` on `kind` should be
+    /// monitored. An empty allowlist matches every user. Matching is done
+    /// against the user ID first, falling back to the display name.
+    pub fn is_user_allowed(
+        &self,
+        kind: MediaServerKind,
+        user_id: Option<&str>,
+        user_name: Option<&str>,
+    ) -> bool {
+        let allowed = self.allowed_users(kind);
+        if allowed.is_empty() {
+            return true;
+        }
+        allowed.iter().any(|entry| {
+            user_id.map(|id| id == entry).unwrap_or(false)
+                || user_name.map(|name| name == entry).unwrap_or(false)
+        })
+    }
+
+    /// Whether the connection parameters (URL/key/enabled) of any server differ
+    /// from `other`, ignoring unrelated fields such as the user allowlist. Used
+    /// to decide whether media-server clients need to be rebuilt.
+    pub fn server_connection_changed(&self, other: &Self) -> bool {
+        let emby = match (&self.emby, &other.emby) {
+            (Some(a), Some(b)) => {
+                a.url != b.url || a.api_key != b.api_key || a.enabled != b.enabled
+            }
+            (None, None) => false,
+            _ => true,
+        };
+        let jellyfin = match (&self.jellyfin, &other.jellyfin) {
+            (Some(a), Some(b)) => {
+                a.url != b.url || a.api_key != b.api_key || a.enabled != b.enabled
+            }
+            (None, None) => false,
+            _ => true,
+        };
+        let plex = match (&self.plex, &other.plex) {
+            (Some(a), Some(b)) => a.url != b.url || a.token != b.token || a.enabled != b.enabled,
+            (None, None) => false,
+            _ => true,
+        };
+        emby || jellyfin || plex
     }
 }
 

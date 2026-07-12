@@ -1,6 +1,6 @@
 <script>
   import { onDestroy } from 'svelte';
-  import { subtitles, nativeSubtitles, subtitleCandidates, selectedSubtitleCandidateId, subtitleSelectionMode, subtitleOffsetMs, activeHistoryItemId, activeLineIndex, positionMs, pauseOnHover, pauseOnSeek, disableSubtitleSeeking, isPlaying, sessionState, showErrorToast, setOptimisticPosition, setOptimisticPlayState, applySubtitlePayload, yomitanPopupVisible, nowPlayingTitle, showNativeSubtitles, showDownloadButton } from './stores.js';
+  import { subtitles, nativeSubtitles, subtitleCandidates, selectedSubtitleCandidateId, subtitleSelectionMode, subtitleOffsetMs, activeHistoryItemId, activeLineIndex, timelineRecenterRequest, positionMs, pauseOnHover, pauseOnSeek, disableSubtitleSeeking, isPlaying, sessionState, showErrorToast, setOptimisticPosition, setOptimisticPlayState, applySubtitlePayload, yomitanPopupVisible, nowPlayingTitle, showNativeSubtitles, showDownloadButton } from './stores.js';
   import { fireSeek, firePlayPause, playPause, selectSubtitleTrack, setSubtitleOffset } from './api.js';
   import { formatTime, nativeLinesForRange } from './utils.js';
   import AudioTrackSelector from './AudioTrackSelector.svelte';
@@ -11,6 +11,8 @@
   let autoScroll = true;
   let userScrolling = false;
   let scrollTimeout;
+  let programmaticScrollUntil = 0;
+  let lastRecenterRequest = 0;
   let controlsExpanded = false;
   let dismissingPopupPointerId = null;
   let consumeNextLineClick = false;
@@ -32,18 +34,31 @@
     scrollToLine($activeLineIndex);
   }
 
-  function scrollToLine(index) {
-    if (!container || userScrolling) return;
+  $: if ($timelineRecenterRequest !== lastRecenterRequest) {
+    lastRecenterRequest = $timelineRecenterRequest;
+    if ($timelineRecenterRequest > 0 && $activeLineIndex != null && autoScroll && container) {
+      clearTimeout(scrollTimeout);
+      userScrolling = false;
+      requestAnimationFrame(() => {
+        scrollToLine($activeLineIndex, { force: true, behavior: 'auto' });
+      });
+    }
+  }
+
+  function scrollToLine(index, { force = false, behavior = 'smooth' } = {}) {
+    if (!container || (!force && userScrolling)) return;
     const el = container.querySelector(`[data-index="${index}"]`);
     if (el) {
       const containerRect = container.getBoundingClientRect();
       const elRect = el.getBoundingClientRect();
       const offset = elRect.top - containerRect.top - (containerRect.height / 2) + (elRect.height / 2);
-      container.scrollTo({ top: container.scrollTop + offset, behavior: 'smooth' });
+      programmaticScrollUntil = Date.now() + (behavior === 'smooth' ? 1000 : 200);
+      container.scrollTo({ top: container.scrollTop + offset, behavior });
     }
   }
 
   function handleScroll() {
+    if (Date.now() < programmaticScrollUntil) return;
     userScrolling = true;
     clearTimeout(scrollTimeout);
     scrollTimeout = setTimeout(() => {

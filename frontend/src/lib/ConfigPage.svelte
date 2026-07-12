@@ -1,6 +1,6 @@
 <script>
   import { onMount } from 'svelte';
-  import { getConfig, updateConfig } from './api.js';
+  import { getConfig, updateConfig, getServerUsers } from './api.js';
   import { applyMiningConfig, autoApprove, pauseOnEnhance, showNativeSubtitles, showDownloadButton, showErrorToast, showToast } from './stores.js';
 
   const AUTO_APPROVE_STORAGE_KEY = 'opt_autoApprove';
@@ -28,10 +28,13 @@
     }
   });
 
+  // Per-server fetched user lists: { emby: { loading, error, users: [] }, ... }
+  let serverUsers = {};
+
   function createServerConfig(kind) {
     return kind === 'plex'
-      ? { enabled: false, url: '', token: '' }
-      : { enabled: false, url: '', api_key: '' };
+      ? { enabled: false, url: '', token: '', users: [] }
+      : { enabled: false, url: '', api_key: '', users: [] };
   }
 
   function normalizeConfig() {
@@ -39,6 +42,9 @@
     config.emby = config.emby || createServerConfig('emby');
     config.jellyfin = config.jellyfin || createServerConfig('jellyfin');
     config.plex = config.plex || createServerConfig('plex');
+    for (const kind of ['emby', 'jellyfin', 'plex']) {
+      if (!Array.isArray(config[kind].users)) config[kind].users = [];
+    }
     if (!config.anki) config.anki = {};
     if (!config.anki.fields) config.anki.fields = {};
     if (!config.path_mappings) config.path_mappings = [];
@@ -76,6 +82,46 @@
   function toggleServer(kind, enabled) {
     config[kind] = config[kind] || createServerConfig(kind);
     config[kind].enabled = enabled;
+    config = { ...config };
+  }
+
+  async function loadServerUsers() {
+    const kinds = ['emby', 'jellyfin', 'plex'].filter((k) => config[k]?.enabled);
+    if (kinds.length === 0) {
+      showErrorToast('Enable and save a server connection first');
+      return;
+    }
+    for (const k of kinds) serverUsers[k] = { loading: true, users: [], error: null };
+    serverUsers = { ...serverUsers };
+
+    try {
+      const list = await getServerUsers();
+      const next = {};
+      for (const entry of list) {
+        next[entry.server_kind] = {
+          loading: false,
+          users: entry.users || [],
+          error: entry.error || null,
+        };
+      }
+      serverUsers = next;
+    } catch (e) {
+      showErrorToast('Failed to load users: ' + e.message);
+      for (const k of kinds) {
+        serverUsers[k] = { loading: false, users: [], error: 'Request failed' };
+      }
+      serverUsers = { ...serverUsers };
+    }
+  }
+
+  function toggleUser(kind, userId, checked) {
+    config[kind] = config[kind] || createServerConfig(kind);
+    const users = config[kind].users || [];
+    if (checked) {
+      if (!users.includes(userId)) config[kind].users = [...users, userId];
+    } else {
+      config[kind].users = users.filter((u) => u !== userId);
+    }
     config = { ...config };
   }
 
@@ -170,6 +216,40 @@
     {#if activeTab === 'server'}
     <p class="hint tab-hint">Saved to the Nagare server and shared across clients.</p>
 
+    {#snippet userSelector(kind)}
+      {@const sel = config[kind]?.users || []}
+      {@const su = serverUsers[kind]}
+      <div class="field">
+        <span class="field-label">Users to monitor</span>
+        <p class="hint">Leave all unchecked to monitor every user on this server.</p>
+        {#if su?.loading}
+          <p class="hint">Loading users…</p>
+        {:else if su?.error}
+          <p class="hint error-text">{su.error}</p>
+        {:else if su?.users?.length}
+          <div class="user-list">
+            {#each su.users as u}
+              <label class="user-item">
+                <input
+                  type="checkbox"
+                  checked={sel.includes(u.id)}
+                  on:change={(e) => toggleUser(kind, u.id, e.target.checked)}
+                />
+                <span>{u.name}</span>
+              </label>
+            {/each}
+          </div>
+        {:else if su}
+          <p class="hint">No users found on this server.</p>
+        {:else if sel.length}
+          <p class="hint">{sel.length} user{sel.length === 1 ? '' : 's'} selected. Load users to edit.</p>
+        {/if}
+        <button type="button" class="btn-small" on:click={loadServerUsers}>
+          {su ? 'Reload users' : 'Load users'}
+        </button>
+      </div>
+    {/snippet}
+
     <!-- ── Media Servers ────────────────────────────── -->
     <section class="section">
       <h2>Media Servers</h2>
@@ -210,6 +290,7 @@
             on:input={(e) => updateServerField('emby', 'api_key', e.target.value)}
           />
         </div>
+        {#if config.emby.enabled}{@render userSelector('emby')}{/if}
       </div>
 
       <div class="server-card" class:enabled={config.jellyfin.enabled}>
@@ -247,6 +328,7 @@
             on:input={(e) => updateServerField('jellyfin', 'api_key', e.target.value)}
           />
         </div>
+        {#if config.jellyfin.enabled}{@render userSelector('jellyfin')}{/if}
       </div>
 
       <div class="server-card" class:enabled={config.plex.enabled}>
@@ -284,6 +366,7 @@
             on:input={(e) => updateServerField('plex', 'token', e.target.value)}
           />
         </div>
+        {#if config.plex.enabled}{@render userSelector('plex')}{/if}
       </div>
     </section>
 
@@ -640,11 +723,43 @@
     margin-bottom: 0;
   }
 
-  .field > label {
+  .field > label,
+  .field > .field-label {
     display: block;
     font-size: 0.85rem;
     color: var(--text-secondary);
     margin-bottom: 0.25rem;
+  }
+
+  .user-list {
+    display: flex;
+    flex-direction: column;
+    gap: 0.3rem;
+    margin-bottom: 0.5rem;
+    max-height: 220px;
+    overflow-y: auto;
+    padding: 0.5rem 0.6rem;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--bg-primary);
+  }
+
+  .user-item {
+    display: flex;
+    align-items: center;
+    gap: 0.45rem;
+    font-size: 0.85rem;
+    color: var(--text-primary);
+    cursor: pointer;
+  }
+
+  .user-item input {
+    cursor: pointer;
+  }
+
+  .error-text {
+    color: var(--danger, #e5534b);
+    opacity: 1;
   }
 
   .hint {

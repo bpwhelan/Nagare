@@ -4,7 +4,7 @@ use crate::anki::{
 };
 use crate::config::{Config, MediaServerKind};
 use crate::media;
-use crate::media_server::{MediaServer, ServerMap};
+use crate::media_server::{MediaServer, MediaUser, ServerMap};
 use crate::mining::{
     AppDatabase, EnrichmentDialogState, EnrichmentSource, MiningHistoryEntry, MiningHistorySummary,
 };
@@ -89,6 +89,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/enrich/pending", get(get_pending_enrichments))
         .route("/api/config", get(get_config))
         .route("/api/config", put(update_config))
+        .route("/api/users", get(get_server_users))
         .route("/api/seek", post(seek_to_line))
         .route("/api/play-pause", post(play_pause))
         .route("/api/subtitle/matches", post(subtitle_matches))
@@ -1422,6 +1423,41 @@ async fn get_config(State(state): State<Arc<AppState>>) -> Json<Config> {
     Json(config.clone())
 }
 
+#[derive(Serialize)]
+struct ServerUsers {
+    server_kind: MediaServerKind,
+    users: Vec<MediaUser>,
+    /// Populated when the user list could not be fetched from the server.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+/// List the users available on each enabled media server, for the per-server
+/// user allowlist UI. Connection settings must be saved first, as this reads
+/// from the live server clients.
+async fn get_server_users(State(state): State<Arc<AppState>>) -> Json<Vec<ServerUsers>> {
+    let servers = state.servers.read().await.clone();
+    let mut result = Vec::new();
+    for (kind, server) in servers {
+        match server.get_users().await {
+            Ok(users) => result.push(ServerUsers {
+                server_kind: kind,
+                users,
+                error: None,
+            }),
+            Err(e) => {
+                warn!("Failed to fetch users for {kind}: {}", e);
+                result.push(ServerUsers {
+                    server_kind: kind,
+                    users: Vec::new(),
+                    error: Some(e.to_string()),
+                });
+            }
+        }
+    }
+    Json(result)
+}
+
 async fn update_config(
     State(state): State<Arc<AppState>>,
     Json(new_config): Json<Config>,
@@ -1429,9 +1465,9 @@ async fn update_config(
     // Detect if server config changed
     let (server_changed, anki_url_changed) = {
         let old = state.config.read().await;
-        let server_changed = old.emby != new_config.emby
-            || old.jellyfin != new_config.jellyfin
-            || old.plex != new_config.plex;
+        // Only rebuild clients when connection parameters change; the per-server
+        // user allowlist is applied live during polling and needs no rebuild.
+        let server_changed = old.server_connection_changed(&new_config);
         let anki_url_changed = old.anki.url != new_config.anki.url;
         (server_changed, anki_url_changed)
     };

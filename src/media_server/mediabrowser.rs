@@ -184,6 +184,35 @@ impl MediaServer for MediaBrowserClient {
         Ok(sessions)
     }
 
+    async fn get_users(&self) -> anyhow::Result<Vec<MediaUser>> {
+        let resp = self
+            .http
+            .get(self.url("/Users"))
+            .query(&[self.auth_param()])
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            anyhow::bail!("Failed to fetch users: HTTP {}", resp.status());
+        }
+
+        let body: Value = resp.json().await?;
+        let users = body
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| {
+                        let id = v["Id"].as_str()?.to_string();
+                        let name = v["Name"].as_str().unwrap_or("Unknown").to_string();
+                        Some(MediaUser { id, name })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        Ok(users)
+    }
+
     async fn get_item_info(
         &self,
         item_id: &str,
