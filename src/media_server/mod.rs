@@ -17,6 +17,8 @@ pub type ServerMap = BTreeMap<MediaServerKind, Arc<dyn MediaServer>>;
 pub trait MediaServer: Send + Sync {
     fn kind(&self) -> MediaServerKind;
     async fn get_sessions(&self) -> anyhow::Result<Vec<Session>>;
+    /// List the users known to this server (for the per-server user allowlist).
+    async fn get_users(&self) -> anyhow::Result<Vec<MediaUser>>;
     async fn get_item_info(&self, item_id: &str, user_id: Option<&str>)
     -> anyhow::Result<ItemInfo>;
     async fn get_subtitles(
@@ -45,6 +47,13 @@ impl SubtitleFormat {
             SubtitleFormat::Srt => "srt",
         }
     }
+}
+
+/// A user account on a media server, used to populate the per-server allowlist.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MediaUser {
+    pub id: String,
+    pub name: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

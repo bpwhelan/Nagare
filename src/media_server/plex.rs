@@ -718,6 +718,38 @@ impl MediaServer for PlexClient {
         Ok(sessions)
     }
 
+    async fn get_users(&self) -> anyhow::Result<Vec<MediaUser>> {
+        let resp = self
+            .with_plex_headers(self.http.get(self.url("/accounts")))
+            .header("Accept", "application/json")
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            anyhow::bail!("Failed to fetch accounts: HTTP {}", resp.status());
+        }
+
+        let body: Value = resp.json().await?;
+        let users = body["MediaContainer"]["Account"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| {
+                        let id = Self::value_as_u64(&v["id"])?.to_string();
+                        let name = v["name"].as_str().unwrap_or("").trim().to_string();
+                        // Skip the synthetic "Guest"/anonymous account (id 0) with no name.
+                        if name.is_empty() {
+                            return None;
+                        }
+                        Some(MediaUser { id, name })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        Ok(users)
+    }
+
     async fn get_item_info(
         &self,
         item_id: &str,

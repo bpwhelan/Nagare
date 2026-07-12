@@ -2,7 +2,7 @@
   import { onMount, onDestroy } from 'svelte';
   import { fade } from 'svelte/transition';
   import { connectWebSocket, disconnect, resyncFromBackground } from './lib/websocket.js';
-  import { getConfig, getDialogByCardId, getDialogByNoteId, getHistorySubtitles, getPendingEnrichments } from './lib/api.js';
+  import { getConfig, getDialogByCardId, getDialogByNoteId, getHistorySubtitles, getPendingEnrichments, getState } from './lib/api.js';
   import {
     activeHistoryItemId,
     ankiStatus,
@@ -18,8 +18,11 @@
     nowPlayingTitle,
     pendingCards,
     positionMs,
+    requestTimelineRecenter,
     route,
+    sessionState,
     showErrorToast,
+    syncPositionFromSessionState,
     syncRouteFromLocation,
   } from './lib/stores.js';
   import { formatTimeFull } from './lib/utils.js';
@@ -35,6 +38,12 @@
 
   let lastRouteKey = null;
   let routeRequestId = 0;
+  let foregroundRecoveryId = 0;
+  let lastForegroundRecoveryAt = 0;
+  let foregroundRecoveryTimers = [];
+
+  const FOREGROUND_RECOVERY_DEBOUNCE_MS = 500;
+  const FOREGROUND_RECOVERY_DELAYS_MS = [0, 700, 2000];
 
   // Mobile: show full chrome when paused, auto-hide when playing resumes
   let mobileChrome = true;
@@ -52,10 +61,43 @@
     }
   }
 
-  function handlePageVisible() {
-    if (document.visibilityState === 'visible') {
-      resyncFromBackground();
+  function clearForegroundRecoveryTimers() {
+    for (const timer of foregroundRecoveryTimers) {
+      clearTimeout(timer);
     }
+    foregroundRecoveryTimers = [];
+  }
+
+  async function refreshForegroundPosition(recoveryId) {
+    try {
+      const state = await getState();
+      if (recoveryId !== foregroundRecoveryId) return;
+
+      sessionState.set(state);
+      syncPositionFromSessionState(state);
+
+      if ($currentView === 'timeline' && !$activeHistoryItemId) {
+        requestTimelineRecenter();
+      }
+    } catch (e) {
+      console.warn('Failed to refresh playback position after foregrounding:', e);
+    }
+  }
+
+  function handlePageVisible() {
+    if (document.visibilityState !== 'visible') return;
+
+    const now = Date.now();
+    if (now - lastForegroundRecoveryAt < FOREGROUND_RECOVERY_DEBOUNCE_MS) return;
+
+    lastForegroundRecoveryAt = now;
+    const recoveryId = ++foregroundRecoveryId;
+    resyncFromBackground();
+
+    clearForegroundRecoveryTimers();
+    foregroundRecoveryTimers = FOREGROUND_RECOVERY_DELAYS_MS.map(delay =>
+      setTimeout(() => refreshForegroundPosition(recoveryId), delay)
+    );
   }
 
   onMount(async () => {
@@ -67,6 +109,7 @@
     // browsers suspend timers/sockets in the background, leaving subs out of sync.
     document.addEventListener('visibilitychange', handlePageVisible);
     window.addEventListener('pageshow', handlePageVisible);
+    window.addEventListener('focus', handlePageVisible);
 
     try {
       const [config, pending] = await Promise.all([
@@ -83,6 +126,8 @@
   onDestroy(() => {
     document.removeEventListener('visibilitychange', handlePageVisible);
     window.removeEventListener('pageshow', handlePageVisible);
+    window.removeEventListener('focus', handlePageVisible);
+    clearForegroundRecoveryTimers();
     disconnect();
     stopYomitanObserver();
   });
