@@ -7,6 +7,7 @@ mod mining;
 mod plex_websocket;
 mod session;
 mod subtitle;
+mod tadoku;
 
 use crate::anki::{AnkiBeaconEvent, AnkiClient, AnkiStatus, NewCardNotification};
 use crate::api::AppState;
@@ -243,6 +244,12 @@ async fn main() -> anyhow::Result<()> {
     let worker_state = app_state.clone();
     tokio::spawn(async move {
         api::run_enhancement_worker_pool(worker_state, enhancement_rx).await;
+    });
+
+    let tadoku_config = config.clone();
+    let tadoku_db = db.clone();
+    tokio::spawn(async move {
+        tadoku::run_exporter(tadoku_config, tadoku_db).await;
     });
 
     // Build router

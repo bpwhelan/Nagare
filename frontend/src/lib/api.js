@@ -210,6 +210,13 @@ export async function updateConfig(config) {
   });
 }
 
+export async function testTadokuConnection(config) {
+  return api('/api/tadoku/test', {
+    method: 'POST',
+    body: JSON.stringify(config),
+  });
+}
+
 // === Audio track management ===
 
 export async function getAudioTracks() {
