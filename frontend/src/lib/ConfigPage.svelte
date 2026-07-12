@@ -1,6 +1,6 @@
 <script>
   import { onMount } from 'svelte';
-  import { getConfig, updateConfig, getServerUsers } from './api.js';
+  import { getConfig, updateConfig, getServerUsers, testTadokuConnection } from './api.js';
   import { applyMiningConfig, autoApprove, pauseOnEnhance, showNativeSubtitles, showDownloadButton, showErrorToast, showToast } from './stores.js';
 
   const AUTO_APPROVE_STORAGE_KEY = 'opt_autoApprove';
@@ -8,11 +8,13 @@
   let config = null;
   let loading = true;
   let saving = false;
+  let testingTadoku = false;
   let activeTab = 'server';
 
   const TABS = [
     { id: 'server', label: 'Server' },
     { id: 'anki', label: 'Anki & Media' },
+    { id: 'tadoku', label: 'Tadoku' },
     { id: 'frontend', label: 'Frontend' },
   ];
 
@@ -55,6 +57,13 @@
     if (!config.anki.require_tags) config.anki.require_tags = [];
     if (!config.anki.note_types) config.anki.note_types = [];
     if (!config.mining) config.mining = {};
+    if (!config.tadoku) config.tadoku = {};
+    if (config.tadoku.enabled == null) config.tadoku.enabled = false;
+    if (config.tadoku.session_cookie == null) config.tadoku.session_cookie = '';
+    if (config.tadoku.language_code == null) config.tadoku.language_code = config.target_language || 'jpn';
+    if (config.tadoku.export_hour_eastern == null) config.tadoku.export_hour_eastern = 20;
+    if (!config.tadoku.api_url) config.tadoku.api_url = 'https://tadoku.app/api/internal/immersion';
+    if (!config.tadoku.session_url) config.tadoku.session_url = 'https://account.tadoku.app/kratos/sessions/whoami';
     if (config.mining.audio_start_offset_ms == null) config.mining.audio_start_offset_ms = 100;
     if (config.mining.audio_end_offset_ms == null) config.mining.audio_end_offset_ms = 500;
     if (config.mining.audio_codec == null) config.mining.audio_codec = 'mp3';
@@ -181,6 +190,23 @@
       showErrorToast('Failed to save: ' + e.message);
     } finally {
       saving = false;
+    }
+  }
+
+  async function testTadoku() {
+    testingTadoku = true;
+    try {
+      const result = await testTadokuConnection(config.tadoku);
+      if (result.ok) {
+        const name = result.connection?.display_name || result.connection?.user_id || 'your account';
+        showToast('success', `Connected to Tadoku as ${name}`);
+      } else {
+        showErrorToast(result.error || 'Tadoku connection failed');
+      }
+    } catch (e) {
+      showErrorToast('Tadoku connection failed: ' + e.message);
+    } finally {
+      testingTadoku = false;
     }
   }
 
@@ -406,6 +432,46 @@
         </div>
       {/each}
       <button class="btn-small" on:click={addPathMapping}>+ Add Mapping</button>
+    </section>
+    {/if}
+
+    {#if activeTab === 'tadoku'}
+    <p class="hint tab-hint">Nagare creates one listening log per show from newly completed episodes each day.</p>
+
+    <section class="section">
+      <h2>Tadoku Export</h2>
+      <div class="field">
+        <div class="checkbox-row">
+          <input id="tadoku-enabled" type="checkbox" bind:checked={config.tadoku.enabled} />
+          <label for="tadoku-enabled">Export completed episodes automatically</label>
+        </div>
+        <p class="hint">Episodes are considered completed at 80% watched. Each episode is exported only once. The first export includes eligible episodes already in Nagare history.</p>
+      </div>
+      <div class="field">
+        <label for="tadoku-cookie">Tadoku Session Cookie</label>
+        <input id="tadoku-cookie" type="password" placeholder="ory_kratos_session value"
+          bind:value={config.tadoku.session_cookie} />
+        <p class="hint">Copy <code>ory_kratos_session</code> from your signed-in Tadoku browser cookies. Tadoku may expire it, in which case you will need to replace it.</p>
+      </div>
+      <div class="field">
+        <label for="tadoku-language">Language <span class="hint">(ISO 639-3)</span></label>
+        <input id="tadoku-language" type="text" placeholder="jpn"
+          bind:value={config.tadoku.language_code} />
+      </div>
+      <div class="field">
+        <label for="tadoku-hour">Daily Export Hour <span class="hint">(Eastern time, 0–23)</span></label>
+        <input id="tadoku-hour" type="number" min="0" max="23" step="1"
+          bind:value={config.tadoku.export_hour_eastern} />
+        <p class="hint">The default is 20 (8 PM). Daylight-saving time is handled automatically.</p>
+      </div>
+      <div class="field">
+        <label for="tadoku-api-url">API URL</label>
+        <input id="tadoku-api-url" type="url"
+          bind:value={config.tadoku.api_url} />
+      </div>
+      <button type="button" class="btn-small" disabled={testingTadoku} on:click={testTadoku}>
+        {testingTadoku ? 'Testing…' : 'Test connection'}
+      </button>
     </section>
     {/if}
 

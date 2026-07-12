@@ -33,6 +33,9 @@ pub struct Config {
 
     #[serde(default)]
     pub mining: MiningConfig,
+
+    #[serde(default)]
+    pub tadoku: TadokuConfig,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -221,6 +224,31 @@ pub struct MiningConfig {
     pub auto_approve: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TadokuConfig {
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// The value of Tadoku's `ory_kratos_session` cookie. A complete Cookie
+    /// header is accepted as well, which is useful for self-hosted instances.
+    #[serde(default)]
+    pub session_cookie: String,
+
+    /// ISO 639-3 language code used for exported listening logs.
+    #[serde(default = "default_target_language")]
+    pub language_code: String,
+
+    /// Hour of day in America/New_York. The scheduler observes DST.
+    #[serde(default = "default_tadoku_export_hour")]
+    pub export_hour_eastern: u32,
+
+    #[serde(default = "default_tadoku_api_url")]
+    pub api_url: String,
+
+    #[serde(default = "default_tadoku_session_url")]
+    pub session_url: String,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum AudioCodec {
@@ -347,6 +375,7 @@ impl Default for Config {
             path_mappings: Vec::new(),
             media_access_mode: default_media_access_mode(),
             mining: MiningConfig::default(),
+            tadoku: TadokuConfig::default(),
         }
     }
 }
@@ -552,6 +581,19 @@ impl Default for MiningConfig {
     }
 }
 
+impl Default for TadokuConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            session_cookie: String::new(),
+            language_code: default_target_language(),
+            export_hour_eastern: default_tadoku_export_hour(),
+            api_url: default_tadoku_api_url(),
+            session_url: default_tadoku_session_url(),
+        }
+    }
+}
+
 fn default_listen_address() -> String {
     "0.0.0.0:9470".to_string()
 }
@@ -602,4 +644,13 @@ fn default_static_screenshot_format() -> StaticScreenshotFormat {
 }
 fn default_true() -> bool {
     true
+}
+fn default_tadoku_export_hour() -> u32 {
+    20
+}
+fn default_tadoku_api_url() -> String {
+    "https://tadoku.app/api/internal/immersion".to_string()
+}
+fn default_tadoku_session_url() -> String {
+    "https://account.tadoku.app/kratos/sessions/whoami".to_string()
 }

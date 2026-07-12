@@ -2,7 +2,7 @@ use crate::anki::{
     AnkiBeaconEvent, AnkiBeaconEventKind, AnkiClient, AnkiStatus, NewCardEvent,
     NewCardNotification, note_info_to_event,
 };
-use crate::config::{Config, MediaServerKind};
+use crate::config::{Config, MediaServerKind, TadokuConfig};
 use crate::media;
 use crate::media_server::{MediaServer, MediaUser, ServerMap};
 use crate::mining::{
@@ -89,6 +89,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/enrich/pending", get(get_pending_enrichments))
         .route("/api/config", get(get_config))
         .route("/api/config", put(update_config))
+        .route("/api/tadoku/test", post(test_tadoku_connection))
         .route("/api/users", get(get_server_users))
         .route("/api/seek", post(seek_to_line))
         .route("/api/play-pause", post(play_pause))
@@ -1421,6 +1422,13 @@ async fn skip_enrichment(
 async fn get_config(State(state): State<Arc<AppState>>) -> Json<Config> {
     let config = state.config.read().await;
     Json(config.clone())
+}
+
+async fn test_tadoku_connection(Json(config): Json<TadokuConfig>) -> Json<serde_json::Value> {
+    match crate::tadoku::test_connection(config).await {
+        Ok(info) => Json(serde_json::json!({"ok": true, "connection": info})),
+        Err(error) => Json(serde_json::json!({"ok": false, "error": error.to_string()})),
+    }
 }
 
 #[derive(Serialize)]

@@ -59,6 +59,7 @@ Nagare watches your active media server playback sessions, displays a live subti
 - Yomitan-aware pause behavior. (Must turn off Secure Popup in Yomitan) 
 - Watch history for mining after playback ends
 - Multi-server support (Emby + Jellyfin + Plex simultaneously)
+- Daily Tadoku listening-log export, grouped by show with duplicate protection
 
 
 ## Roadmap
@@ -133,6 +134,7 @@ All configuration is managed through the web UI Config page and stored in `data/
 1. **Media server** — URL and API key (Emby/Jellyfin) or token (Plex)
 2. **AnkiConnect** — URL and field mappings (`Sentence`, `SentenceAudio`, `Picture`)
 3. **Media access** — `auto`, `disk`, or `api` mode; add path mappings if server and Nagare see different file paths
+4. **Tadoku (optional)** — enable daily export and paste the `ory_kratos_session` cookie from a signed-in Tadoku browser session. The default schedule is 8 PM Eastern.
 
 ## How it works
 

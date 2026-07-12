@@ -6,7 +6,7 @@ use anyhow::Context;
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use tracing::warn;
 
@@ -72,6 +72,15 @@ pub struct MiningHistorySummary {
     pub history_id: String,
     pub server_kind: MediaServerKind,
     pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TadokuExportBatch {
+    pub batch_id: String,
+    pub series_name: String,
+    pub description: String,
+    pub duration_seconds: i32,
+    pub language_code: String,
 }
 
 impl MiningHistoryEntry {
@@ -193,6 +202,116 @@ impl AppDatabase {
             .await
             .context("SQLite mined-note card lookup task failed")?
     }
+
+    pub async fn prepare_tadoku_batches(
+        &self,
+        export_date: String,
+        language_code: String,
+    ) -> anyhow::Result<Vec<TadokuExportBatch>> {
+        let db_path = self.db_path.clone();
+        tokio::task::spawn_blocking(move || {
+            prepare_tadoku_batches_sync(&db_path, &export_date, &language_code)
+        })
+        .await
+        .context("SQLite Tadoku batch preparation task failed")?
+    }
+
+    pub async fn mark_tadoku_batch_completed(
+        &self,
+        batch_id: String,
+        log_id: String,
+    ) -> anyhow::Result<()> {
+        let db_path = self.db_path.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = open_connection(&db_path)?;
+            conn.execute(
+                "UPDATE tadoku_export_batches SET status = 'completed', tadoku_log_id = ?2, last_error = NULL, updated_at = ?3 WHERE batch_id = ?1",
+                params![batch_id, log_id, Utc::now().to_rfc3339()],
+            )?;
+            Ok(())
+        })
+        .await
+        .context("SQLite Tadoku completion task failed")?
+    }
+
+    pub async fn mark_tadoku_batch_failed(
+        &self,
+        batch_id: String,
+        message: String,
+    ) -> anyhow::Result<()> {
+        let db_path = self.db_path.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = open_connection(&db_path)?;
+            conn.execute(
+                "UPDATE tadoku_export_batches SET last_error = ?2, updated_at = ?3 WHERE batch_id = ?1",
+                params![batch_id, message, Utc::now().to_rfc3339()],
+            )?;
+            Ok(())
+        })
+        .await
+        .context("SQLite Tadoku failure task failed")?
+    }
+
+    pub async fn tadoku_export_due(&self, export_date: String) -> anyhow::Result<bool> {
+        let db_path = self.db_path.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = open_connection(&db_path)?;
+            let row: Option<(String, String)> = conn
+                .query_row(
+                    "SELECT status, last_attempt_at FROM tadoku_export_runs WHERE export_date = ?1",
+                    [&export_date],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            let Some((status, last_attempt)) = row else {
+                return Ok(true);
+            };
+            if status == "completed" {
+                return Ok(false);
+            }
+            let last_attempt = parse_timestamp(&last_attempt)?;
+            Ok(Utc::now().signed_duration_since(last_attempt) >= chrono::Duration::minutes(30))
+        })
+        .await
+        .context("SQLite Tadoku due check task failed")?
+    }
+
+    pub async fn mark_tadoku_run_started(&self, export_date: String) -> anyhow::Result<()> {
+        self.save_tadoku_run(export_date, "running", None).await
+    }
+
+    pub async fn mark_tadoku_run_finished(
+        &self,
+        export_date: String,
+        error: Option<String>,
+    ) -> anyhow::Result<()> {
+        let status = if error.is_some() {
+            "failed"
+        } else {
+            "completed"
+        };
+        self.save_tadoku_run(export_date, status, error).await
+    }
+
+    async fn save_tadoku_run(
+        &self,
+        export_date: String,
+        status: &'static str,
+        error: Option<String>,
+    ) -> anyhow::Result<()> {
+        let db_path = self.db_path.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = open_connection(&db_path)?;
+            let now = Utc::now().to_rfc3339();
+            conn.execute(
+                "INSERT INTO tadoku_export_runs (export_date, status, last_attempt_at, last_error) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(export_date) DO UPDATE SET status = excluded.status, last_attempt_at = excluded.last_attempt_at, last_error = excluded.last_error",
+                params![export_date, status, now, error],
+            )?;
+            Ok(())
+        })
+        .await
+        .context("SQLite Tadoku run update task failed")?
+    }
 }
 
 fn init_database(path: &Path, legacy_db_path: Option<&Path>) -> anyhow::Result<()> {
@@ -281,6 +400,34 @@ fn open_connection(path: &Path) -> anyhow::Result<Connection> {
             note_id INTEGER NOT NULL REFERENCES mined_notes(note_id) ON DELETE CASCADE
         );
         CREATE INDEX IF NOT EXISTS idx_mined_notes_updated_at ON mined_notes(updated_at DESC);
+
+        CREATE TABLE IF NOT EXISTS tadoku_export_batches (
+            batch_id TEXT PRIMARY KEY,
+            export_date TEXT NOT NULL,
+            series_name TEXT NOT NULL,
+            description TEXT NOT NULL,
+            duration_seconds INTEGER NOT NULL,
+            language_code TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            tadoku_log_id TEXT,
+            last_error TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_tadoku_batches_status ON tadoku_export_batches(status, created_at);
+
+        CREATE TABLE IF NOT EXISTS tadoku_export_items (
+            history_id TEXT PRIMARY KEY,
+            batch_id TEXT NOT NULL REFERENCES tadoku_export_batches(batch_id),
+            watched_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS tadoku_export_runs (
+            export_date TEXT PRIMARY KEY,
+            status TEXT NOT NULL,
+            last_attempt_at TEXT NOT NULL,
+            last_error TEXT
+        );
         ",
     )
     .context("Failed to initialize SQLite schema")?;
@@ -466,6 +613,151 @@ fn save_session_history_conn(
     tx.commit()
         .context("Failed to commit SQLite history transaction")?;
     Ok(())
+}
+
+fn prepare_tadoku_batches_sync(
+    db_path: &Path,
+    export_date: &str,
+    language_code: &str,
+) -> anyhow::Result<Vec<TadokuExportBatch>> {
+    let mut conn = open_connection(db_path)?;
+    let tx = conn
+        .transaction()
+        .context("Failed to start Tadoku export transaction")?;
+
+    let mut groups: BTreeMap<String, Vec<(String, String, i64)>> = BTreeMap::new();
+    {
+        let mut stmt = tx.prepare(
+            "
+            SELECT
+                history_id,
+                COALESCE(NULLIF(series_name, ''), title) AS show_name,
+                title,
+                last_seen,
+                MIN(MAX(last_position_ms, 0), duration_ms) AS watched_ms
+            FROM media_history
+            WHERE duration_ms IS NOT NULL
+              AND duration_ms > 0
+              AND last_position_ms > 0
+              AND last_position_ms * 100 >= duration_ms * 80
+              AND NOT EXISTS (
+                  SELECT 1 FROM tadoku_export_items tei
+                  WHERE tei.history_id = media_history.history_id
+              )
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM tadoku_export_items tei
+                  JOIN media_history exported ON exported.history_id = tei.history_id
+                  WHERE LOWER(COALESCE(NULLIF(exported.series_name, ''), exported.title)) =
+                        LOWER(COALESCE(NULLIF(media_history.series_name, ''), media_history.title))
+                    AND LOWER(exported.title) = LOWER(media_history.title)
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM tadoku_export_batches teb
+                  WHERE teb.status = 'pending'
+                    AND teb.series_name = COALESCE(NULLIF(media_history.series_name, ''), media_history.title)
+                    AND teb.language_code = ?1
+              )
+            ORDER BY show_name, last_seen
+            ",
+        )?;
+        let rows = stmt.query_map([language_code], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })?;
+        let mut seen_content = HashSet::new();
+        for row in rows {
+            let (history_id, show_name, title, watched_at, watched_ms) = row?;
+            let content_key = format!(
+                "{}\u{1f}{}",
+                show_name.trim().to_lowercase(),
+                title.trim().to_lowercase()
+            );
+            if !seen_content.insert(content_key) {
+                continue;
+            }
+            groups
+                .entry(show_name)
+                .or_default()
+                .push((history_id, watched_at, watched_ms));
+        }
+    }
+
+    let now = Utc::now().to_rfc3339();
+    for (series_name, items) in groups {
+        let batch_id = uuid::Uuid::new_v4().to_string();
+        let duration_seconds = items
+            .iter()
+            .map(|(_, _, watched_ms)| watched_ms / 1_000)
+            .sum::<i64>()
+            .clamp(1, i32::MAX as i64) as i32;
+        let description = tadoku_batch_description(&series_name, items.len(), &batch_id);
+
+        tx.execute(
+            "
+            INSERT INTO tadoku_export_batches (
+                batch_id, export_date, series_name, description,
+                duration_seconds, language_code, status, created_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7, ?7)
+            ",
+            params![
+                batch_id,
+                export_date,
+                series_name,
+                description,
+                duration_seconds,
+                language_code,
+                now,
+            ],
+        )?;
+
+        for (history_id, watched_at, _) in items {
+            tx.execute(
+                "INSERT INTO tadoku_export_items (history_id, batch_id, watched_at) VALUES (?1, ?2, ?3)",
+                params![history_id, batch_id, watched_at],
+            )?;
+        }
+    }
+
+    tx.commit()
+        .context("Failed to commit Tadoku export transaction")?;
+
+    let conn = open_connection(db_path)?;
+    let mut stmt = conn.prepare(
+        "
+        SELECT batch_id, series_name, description, duration_seconds, language_code
+        FROM tadoku_export_batches
+        WHERE status = 'pending'
+        ORDER BY created_at, series_name
+        ",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(TadokuExportBatch {
+            batch_id: row.get(0)?,
+            series_name: row.get(1)?,
+            description: row.get(2)?,
+            duration_seconds: row.get(3)?,
+            language_code: row.get(4)?,
+        })
+    })?;
+    Ok(rows.collect::<Result<Vec<_>, _>>()?)
+}
+
+fn tadoku_batch_description(series_name: &str, episode_count: usize, batch_id: &str) -> String {
+    let noun = if episode_count == 1 {
+        "episode"
+    } else {
+        "episodes"
+    };
+    format!(
+        "{} ({} {}) [Nagare:{}]",
+        series_name, episode_count, noun, batch_id
+    )
 }
 
 fn load_history_map(conn: &Connection) -> anyhow::Result<HashMap<String, HistoryEntry>> {
@@ -785,6 +1077,68 @@ fn parse_timestamp(raw: &str) -> Result<DateTime<Utc>, std::io::Error> {
                 format!("Invalid timestamp '{}': {}", raw, error),
             )
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{open_connection, prepare_tadoku_batches_sync, save_session_history_sync};
+    use crate::config::MediaServerKind;
+    use crate::session::HistoryEntry;
+    use chrono::Utc;
+    use rusqlite::params;
+    use std::collections::HashMap;
+
+    fn history_entry(id: &str, series: &str, position_ms: i64) -> HistoryEntry {
+        HistoryEntry {
+            history_id: format!("plex|{id}"),
+            server_kind: MediaServerKind::Plex,
+            item_id: id.to_string(),
+            title: format!("Episode {id}"),
+            series_name: Some(series.to_string()),
+            media_source_id: format!("source-{id}"),
+            file_path: None,
+            duration_ms: Some(100_000),
+            subtitle_count: 0,
+            last_position_ms: position_ms,
+            last_seen: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn groups_completed_episodes_and_never_claims_them_twice() {
+        let path = std::env::temp_dir().join(format!(
+            "nagare-tadoku-test-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let mut history = HashMap::new();
+        history.insert("plex|1".to_string(), history_entry("1", "Frieren", 90_000));
+        history.insert("plex|2".to_string(), history_entry("2", "Frieren", 90_000));
+        history.insert("plex|3".to_string(), history_entry("3", "Frieren", 50_000));
+        let mut duplicate = history_entry("1", "Frieren", 90_000);
+        duplicate.history_id = "jellyfin|copy-of-1".to_string();
+        duplicate.server_kind = MediaServerKind::Jellyfin;
+        duplicate.item_id = "copy-of-1".to_string();
+        history.insert(duplicate.history_id.clone(), duplicate);
+        save_session_history_sync(&path, &history, None).unwrap();
+
+        let first = prepare_tadoku_batches_sync(&path, "2026-07-12", "jpn").unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].series_name, "Frieren");
+        assert_eq!(first[0].duration_seconds, 180);
+        assert!(first[0].description.contains("2 episodes"));
+
+        let conn = open_connection(&path).unwrap();
+        conn.execute(
+            "UPDATE tadoku_export_batches SET status = 'completed' WHERE batch_id = ?1",
+            params![first[0].batch_id],
+        )
+        .unwrap();
+        drop(conn);
+
+        let second = prepare_tadoku_batches_sync(&path, "2026-07-12", "jpn").unwrap();
+        assert!(second.is_empty());
+        std::fs::remove_file(path).unwrap();
+    }
 }
 
 fn load_json_or_default<T>(path: &Path) -> T
