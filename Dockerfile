@@ -7,7 +7,7 @@ COPY frontend/ ./
 RUN npm run build
 
 # ── Stage 2: Build Rust backend ─────────────────────────────
-FROM rust:1.87-alpine AS backend-build
+FROM rust:1.97-alpine AS backend-build
 RUN apk add --no-cache musl-dev pkgconfig openssl-dev openssl-libs-static
 WORKDIR /app
 COPY Cargo.toml Cargo.lock build.rs ./
