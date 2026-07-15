@@ -134,7 +134,7 @@ All configuration is managed through the web UI Config page and stored in `data/
 1. **Media server** — URL and API key (Emby/Jellyfin) or token (Plex)
 2. **AnkiConnect** — URL and field mappings (`Sentence`, `SentenceAudio`, `Picture`)
 3. **Media access** — `auto`, `disk`, or `api` mode; add path mappings if server and Nagare see different file paths
-4. **Tadoku (optional)** — save your Tadoku username and password, then choose manual review or automatic daily sync. Nagare signs in and refreshes the browser session automatically. Manual review lets you approve or permanently decline individual ready episodes; automatic sync defaults to 8 PM Eastern. Episodes completed before this sync workflow is installed are ignored.
+4. **Tadoku (optional)** — save your Tadoku username and password, then choose manual review or automatic daily sync. Nagare signs in and refreshes the browser session automatically. Manual review lets you approve or permanently decline individual ready episodes; automatic sync defaults to 8 PM Eastern. When the review workflow is first enabled, episodes completed after the previous successful sync are queued.
 
 ## How it works
 

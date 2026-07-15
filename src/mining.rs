@@ -508,7 +508,12 @@ fn initialize_tadoku_candidate_cutoff(conn: &mut Connection) -> anyhow::Result<(
         [],
         |row| row.get(0),
     )?;
-    if already_initialized {
+    let previous_sync_migration_applied: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM app_metadata WHERE key = 'tadoku_candidate_cutoff_previous_sync_v1')",
+        [],
+        |row| row.get(0),
+    )?;
+    if already_initialized && previous_sync_migration_applied {
         return Ok(());
     }
 
@@ -516,16 +521,65 @@ fn initialize_tadoku_candidate_cutoff(conn: &mut Connection) -> anyhow::Result<(
         .transaction()
         .context("Failed to start Tadoku cutoff migration")?;
     let now = Utc::now().to_rfc3339();
-    tx.execute(
-        "INSERT INTO app_metadata (key, value) VALUES ('tadoku_candidate_cutoff', ?1)",
-        [&now],
-    )?;
-    // Pending batches predate per-episode review and must not be retried after
-    // the feature is introduced. Completed batches remain as duplicate guards.
-    tx.execute(
-        "UPDATE tadoku_export_batches SET status = 'declined', updated_at = ?1 WHERE status = 'pending'",
-        [&now],
-    )?;
+    let initial_cutoff = if already_initialized {
+        tx.query_row(
+            "SELECT value FROM app_metadata WHERE key = 'tadoku_candidate_cutoff'",
+            [],
+            |row| row.get::<_, String>(0),
+        )?
+    } else {
+        tx.execute(
+            "INSERT INTO app_metadata (key, value) VALUES ('tadoku_candidate_cutoff', ?1)",
+            [&now],
+        )?;
+        // Pending batches predate per-episode review and must not be retried after
+        // the feature is introduced. Completed batches remain as duplicate guards.
+        tx.execute(
+            "UPDATE tadoku_export_batches SET status = 'declined', updated_at = ?1 WHERE status = 'pending'",
+            [&now],
+        )?;
+        now.clone()
+    };
+
+    if !previous_sync_migration_applied {
+        // The review workflow originally used its installation time as the cutoff.
+        // That loses episodes watched after the preceding daily sync but before an
+        // upgrade/restart. Anchor it to the latest successful sync that predates the
+        // original cutoff instead. The batch fallback also covers older databases
+        // that have export items but no recorded export run.
+        let previous_sync: Option<String> = tx
+            .query_row(
+                "
+                SELECT synced_at
+                FROM (
+                    SELECT last_attempt_at AS synced_at
+                    FROM tadoku_export_runs
+                    WHERE status = 'completed'
+                    UNION ALL
+                    SELECT updated_at AS synced_at
+                    FROM tadoku_export_batches
+                    WHERE status = 'completed'
+                )
+                WHERE julianday(synced_at) < julianday(?1)
+                ORDER BY julianday(synced_at) DESC
+                LIMIT 1
+                ",
+                [&initial_cutoff],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(previous_sync) = previous_sync {
+            tx.execute(
+                "UPDATE app_metadata SET value = ?1 WHERE key = 'tadoku_candidate_cutoff'",
+                [&previous_sync],
+            )?;
+        }
+        tx.execute(
+            "INSERT INTO app_metadata (key, value) VALUES ('tadoku_candidate_cutoff_previous_sync_v1', ?1)",
+            [&now],
+        )?;
+    }
+
     tx.commit()
         .context("Failed to commit Tadoku cutoff migration")?;
     Ok(())
@@ -1677,6 +1731,75 @@ mod tests {
         );
         assert_eq!(description, "NARUTO 疾風伝 S10E10-13");
         assert!(!description.contains("Nagare:"));
+    }
+
+    #[test]
+    fn cutoff_migration_includes_episodes_watched_after_previous_sync() {
+        let path = std::env::temp_dir().join(format!(
+            "nagare-tadoku-previous-sync-cutoff-test-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let conn = open_connection(&path).unwrap();
+        let installation_cutoff: String = conn
+            .query_row(
+                "SELECT value FROM app_metadata WHERE key = 'tadoku_candidate_cutoff'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(conn);
+
+        let installation_cutoff = chrono::DateTime::parse_from_rfc3339(&installation_cutoff)
+            .unwrap()
+            .with_timezone(&Utc);
+        let previous_sync = installation_cutoff - chrono::Duration::hours(1);
+        let watched_at = installation_cutoff - chrono::Duration::minutes(30);
+        let empty_run_after_install = installation_cutoff + chrono::Duration::minutes(10);
+
+        let mut episode = history_entry("after-sync", "Frieren", 90_000);
+        episode.last_seen = watched_at;
+        let history = HashMap::from([(episode.history_id.clone(), episode)]);
+        save_session_history_sync(&path, &history, None).unwrap();
+
+        let conn = open_connection(&path).unwrap();
+        conn.execute(
+            "INSERT INTO tadoku_export_runs (export_date, status, last_attempt_at) VALUES (?1, 'completed', ?2)",
+            params!["2026-07-13", previous_sync.to_rfc3339()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tadoku_export_runs (export_date, status, last_attempt_at) VALUES (?1, 'completed', ?2)",
+            params!["2026-07-14", empty_run_after_install.to_rfc3339()],
+        )
+        .unwrap();
+        conn.execute(
+            "DELETE FROM app_metadata WHERE key = 'tadoku_candidate_cutoff_previous_sync_v1'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        drop(open_connection(&path).unwrap());
+
+        let candidates = list_tadoku_candidates_sync(&path, "jpn").unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].history_id, "plex|after-sync");
+
+        let conn = open_connection(&path).unwrap();
+        let migrated_cutoff: String = conn
+            .query_row(
+                "SELECT value FROM app_metadata WHERE key = 'tadoku_candidate_cutoff'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let migrated_cutoff = chrono::DateTime::parse_from_rfc3339(&migrated_cutoff)
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(migrated_cutoff, previous_sync);
+
+        drop(conn);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
