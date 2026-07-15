@@ -90,6 +90,11 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/config", get(get_config))
         .route("/api/config", put(update_config))
         .route("/api/tadoku/test", post(test_tadoku_connection))
+        .route("/api/tadoku/auth/refresh", post(refresh_tadoku_authentication))
+        .route("/api/tadoku/auth/clear", post(clear_tadoku_authentication))
+        .route("/api/tadoku/candidates", get(get_tadoku_candidates))
+        .route("/api/tadoku/sync", post(sync_tadoku_candidates))
+        .route("/api/tadoku/decline", post(decline_tadoku_candidates))
         .route("/api/users", get(get_server_users))
         .route("/api/seek", post(seek_to_line))
         .route("/api/play-pause", post(play_pause))
@@ -1419,14 +1424,130 @@ async fn skip_enrichment(
     Json(serde_json::json!({"ok": true}))
 }
 
-async fn get_config(State(state): State<Arc<AppState>>) -> Json<Config> {
+async fn get_config(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let config = state.config.read().await;
-    Json(config.clone())
+    Json(public_config_json(&config))
 }
 
-async fn test_tadoku_connection(Json(config): Json<TadokuConfig>) -> Json<serde_json::Value> {
-    match crate::tadoku::test_connection(config).await {
+fn public_config_json(config: &Config) -> serde_json::Value {
+    let password_configured = config.tadoku.has_credentials();
+    let mut value = serde_json::to_value(config).expect("Config is serializable");
+    if let Some(tadoku) = value.get_mut("tadoku").and_then(|value| value.as_object_mut()) {
+        tadoku.remove("password");
+        tadoku.remove("session_cookie");
+        tadoku.insert(
+            "password_configured".to_string(),
+            serde_json::json!(password_configured),
+        );
+    }
+    value
+}
+
+async fn test_tadoku_connection(
+    State(state): State<Arc<AppState>>,
+) -> Json<serde_json::Value> {
+    match crate::tadoku::test_connection(state.config.clone(), state.db.clone()).await {
         Ok(info) => Json(serde_json::json!({"ok": true, "connection": info})),
+        Err(error) => Json(serde_json::json!({"ok": false, "error": error.to_string()})),
+    }
+}
+
+async fn refresh_tadoku_authentication(
+    State(state): State<Arc<AppState>>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if !state.config.read().await.tadoku.has_credentials() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "authenticated": false,
+                "error": "Save a Tadoku username and password first"
+            })),
+        );
+    }
+    match crate::tadoku::refresh_authentication(state.config.clone(), state.db.clone()).await {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"authenticated": true})),
+        ),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"authenticated": false, "error": error.to_string()})),
+        ),
+    }
+}
+
+async fn clear_tadoku_authentication(
+    State(state): State<Arc<AppState>>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let mut config = state.config.write().await;
+    let previous = config.tadoku.clone();
+    config.tadoku.username.clear();
+    config.tadoku.password.clear();
+    config.tadoku.session_cookie.clear();
+    if let Err(error) = state.db.save_config(config.clone()).await {
+        config.tadoku = previous;
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"ok": false, "error": format!("Failed to clear Tadoku login: {error}")})),
+        );
+    }
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({"ok": true})),
+    )
+}
+
+async fn get_tadoku_candidates(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let language_code = state
+        .config
+        .read()
+        .await
+        .tadoku
+        .language_code
+        .trim()
+        .to_ascii_lowercase();
+    match state.db.list_tadoku_candidates(language_code).await {
+        Ok(candidates) => Json(serde_json::json!({"ok": true, "candidates": candidates})),
+        Err(error) => Json(serde_json::json!({"ok": false, "error": error.to_string()})),
+    }
+}
+
+#[derive(Deserialize)]
+struct TadokuSyncRequest {
+    history_ids: Vec<String>,
+}
+
+async fn sync_tadoku_candidates(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<TadokuSyncRequest>,
+) -> Json<serde_json::Value> {
+    match crate::tadoku::export_selected(
+        state.config.clone(),
+        state.db.clone(),
+        request.history_ids,
+    )
+    .await
+    {
+        Ok(count) => Json(serde_json::json!({"ok": true, "synced_logs": count})),
+        Err(error) => Json(serde_json::json!({"ok": false, "error": error.to_string()})),
+    }
+}
+
+#[derive(Deserialize)]
+struct TadokuDeclineRequest {
+    history_ids: Vec<String>,
+}
+
+async fn decline_tadoku_candidates(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<TadokuDeclineRequest>,
+) -> Json<serde_json::Value> {
+    match state
+        .db
+        .decline_tadoku_candidates(request.history_ids)
+        .await
+    {
+        Ok(count) => Json(serde_json::json!({"ok": true, "declined_episodes": count})),
         Err(error) => Json(serde_json::json!({"ok": false, "error": error.to_string()})),
     }
 }
@@ -1468,11 +1589,13 @@ async fn get_server_users(State(state): State<Arc<AppState>>) -> Json<Vec<Server
 
 async fn update_config(
     State(state): State<Arc<AppState>>,
-    Json(new_config): Json<Config>,
+    Json(mut new_config): Json<Config>,
 ) -> Json<serde_json::Value> {
+    new_config.tadoku.normalize();
     // Detect if server config changed
     let (server_changed, anki_url_changed) = {
         let old = state.config.read().await;
+        merge_tadoku_secrets(&old.tadoku, &mut new_config.tadoku);
         // Only rebuild clients when connection parameters change; the per-server
         // user allowlist is applied live during polling and needs no rebuild.
         let server_changed = old.server_connection_changed(&new_config);
@@ -1520,6 +1643,86 @@ async fn update_config(
 
     info!("Configuration updated via web UI");
     Json(serde_json::json!({"ok": true}))
+}
+
+fn merge_tadoku_secrets(old: &TadokuConfig, new: &mut TadokuConfig) {
+    if new.username.is_empty() {
+        new.password.clear();
+        new.session_cookie.clear();
+        return;
+    }
+
+    let username_changed = new.username != old.username;
+    let password_changed = !new.password.is_empty() && new.password != old.password;
+    if new.password.is_empty() {
+        new.password.clone_from(&old.password);
+    }
+    if username_changed || password_changed {
+        new.session_cookie.clear();
+    } else {
+        new.session_cookie.clone_from(&old.session_cookie);
+    }
+}
+
+#[cfg(test)]
+mod tadoku_settings_tests {
+    use super::{merge_tadoku_secrets, public_config_json};
+    use crate::config::{Config, TadokuConfig};
+
+    fn saved_tadoku() -> TadokuConfig {
+        TadokuConfig {
+            username: "reader".to_string(),
+            password: "saved-password".to_string(),
+            session_cookie: "saved-cookie".to_string(),
+            ..TadokuConfig::default()
+        }
+    }
+
+    #[test]
+    fn settings_response_contains_username_but_no_secrets() {
+        let mut config = Config::default();
+        config.tadoku = saved_tadoku();
+        let value = public_config_json(&config);
+        assert_eq!(value["tadoku"]["username"], "reader");
+        assert_eq!(value["tadoku"]["password_configured"], true);
+        assert!(value["tadoku"].get("password").is_none());
+        assert!(value["tadoku"].get("session_cookie").is_none());
+    }
+
+    #[test]
+    fn blank_password_preserves_saved_password_and_cookie() {
+        let old = saved_tadoku();
+        let mut new = TadokuConfig {
+            username: old.username.clone(),
+            password: String::new(),
+            session_cookie: "untrusted-browser-value".to_string(),
+            ..TadokuConfig::default()
+        };
+        merge_tadoku_secrets(&old, &mut new);
+        assert_eq!(new.password, "saved-password");
+        assert_eq!(new.session_cookie, "saved-cookie");
+    }
+
+    #[test]
+    fn changing_or_clearing_credentials_invalidates_session() {
+        let old = saved_tadoku();
+        let mut changed = TadokuConfig {
+            username: old.username.clone(),
+            password: "replacement-password".to_string(),
+            session_cookie: old.session_cookie.clone(),
+            ..TadokuConfig::default()
+        };
+        merge_tadoku_secrets(&old, &mut changed);
+        assert!(changed.session_cookie.is_empty());
+
+        let mut cleared = TadokuConfig::default();
+        cleared.password = "should-not-survive".to_string();
+        cleared.session_cookie = "should-not-survive".to_string();
+        merge_tadoku_secrets(&old, &mut cleared);
+        assert!(cleared.username.is_empty());
+        assert!(cleared.password.is_empty());
+        assert!(cleared.session_cookie.is_empty());
+    }
 }
 
 #[derive(Deserialize)]
