@@ -210,10 +210,35 @@ export async function updateConfig(config) {
   });
 }
 
-export async function testTadokuConnection(config) {
+export async function testTadokuConnection() {
   return api('/api/tadoku/test', {
     method: 'POST',
-    body: JSON.stringify(config),
+  });
+}
+
+export async function refreshTadokuLogin() {
+  return api('/api/tadoku/auth/refresh', { method: 'POST' });
+}
+
+export async function clearTadokuLogin() {
+  return api('/api/tadoku/auth/clear', { method: 'POST' });
+}
+
+export async function getTadokuCandidates() {
+  return api('/api/tadoku/candidates');
+}
+
+export async function syncTadokuCandidates(historyIds) {
+  return api('/api/tadoku/sync', {
+    method: 'POST',
+    body: JSON.stringify({ history_ids: historyIds }),
+  });
+}
+
+export async function declineTadokuCandidates(historyIds) {
+  return api('/api/tadoku/decline', {
+    method: 'POST',
+    body: JSON.stringify({ history_ids: historyIds }),
   });
 }
 

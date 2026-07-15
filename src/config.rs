@@ -229,8 +229,17 @@ pub struct TadokuConfig {
     #[serde(default)]
     pub enabled: bool,
 
-    /// The value of Tadoku's `ory_kratos_session` cookie. A complete Cookie
-    /// header is accepted as well, which is useful for self-hosted instances.
+    /// Tadoku username or email used by the browser login flow.
+    #[serde(default)]
+    pub username: String,
+
+    /// Tadoku password. This is persisted in the existing application config,
+    /// but is redacted from settings API responses.
+    #[serde(default)]
+    pub password: String,
+
+    /// Internal browser session cookie obtained after credential login. This
+    /// is never returned by the settings API.
     #[serde(default)]
     pub session_cookie: String,
 
@@ -585,12 +594,41 @@ impl Default for TadokuConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            username: String::new(),
+            password: String::new(),
             session_cookie: String::new(),
             language_code: default_target_language(),
             export_hour_eastern: default_tadoku_export_hour(),
             api_url: default_tadoku_api_url(),
             session_url: default_tadoku_session_url(),
         }
+    }
+}
+
+impl TadokuConfig {
+    pub fn has_credentials(&self) -> bool {
+        !self.username.trim().is_empty() && !self.password.is_empty()
+    }
+
+    /// Normalize known Tadoku production URLs. The OpenAPI document still
+    /// advertises `/api/immersion`, while the deployed web app currently
+    /// routes the service through `/api/internal/immersion`.
+    pub fn normalize(&mut self) {
+        self.username = self.username.trim().to_string();
+        let api_url = self.api_url.trim().trim_end_matches('/');
+        self.api_url = match api_url {
+            "" | "https://tadoku.app/api/immersion" | "https://tadoku.app/api/internal" => {
+                default_tadoku_api_url()
+            }
+            value => value.to_string(),
+        };
+        if self.session_url.trim().is_empty() {
+            self.session_url = default_tadoku_session_url();
+        } else {
+            self.session_url = self.session_url.trim().to_string();
+        }
+        self.language_code = self.language_code.trim().to_ascii_lowercase();
+        self.export_hour_eastern = self.export_hour_eastern.min(23);
     }
 }
 

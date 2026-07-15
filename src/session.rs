@@ -1,6 +1,6 @@
 use crate::config::{Config, MediaServerKind};
 use crate::media_server::{
-    ItemInfo, MediaServer, MediaStream, ServerMap, Session, StreamType, SubtitleFormat,
+    ItemInfo, MediaServer, MediaStream, NowPlaying, ServerMap, Session, StreamType, SubtitleFormat,
 };
 use crate::mining::AppDatabase;
 use crate::subtitle::{SubtitleTrack, parse_subtitle};
@@ -150,6 +150,14 @@ pub fn scoped_session_id(kind: MediaServerKind, session_id: &str) -> String {
 pub fn split_scoped_id(scoped_id: &str) -> Option<(MediaServerKind, &str)> {
     let (kind, raw_id) = scoped_id.split_once('|')?;
     Some((MediaServerKind::parse(kind)?, raw_id))
+}
+
+fn is_ignored_episode(now_playing: &NowPlaying) -> bool {
+    let is_episode = now_playing.media_type.eq_ignore_ascii_case("episode")
+        || now_playing.series_name.is_some()
+        || now_playing.episode_index.is_some();
+
+    is_episode && now_playing.name.trim().eq_ignore_ascii_case("theme")
 }
 
 pub struct SessionManager {
@@ -561,6 +569,9 @@ impl SessionManager {
                                     session.user_id.as_deref(),
                                     session.user_name.as_deref(),
                                 )
+                            })
+                            .filter(|session| {
+                                !session.now_playing.as_ref().is_some_and(is_ignored_episode)
                             })
                             .map(|session| ServerSession {
                                 kind,
@@ -1896,5 +1907,42 @@ pub async fn run_session_poller(manager: Arc<SessionManager>) {
     loop {
         manager.poll_once().await;
         tokio::time::sleep(manager.poll_interval().await).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_ignored_episode;
+    use crate::media_server::NowPlaying;
+
+    fn now_playing(name: &str, media_type: &str, series_name: Option<&str>) -> NowPlaying {
+        NowPlaying {
+            item_id: "item-1".to_string(),
+            name: name.to_string(),
+            series_name: series_name.map(str::to_string),
+            season_index: Some(1),
+            episode_index: series_name.map(|_| 1),
+            media_type: media_type.to_string(),
+            run_time_ticks: None,
+            media_streams: Vec::new(),
+            media_source_id: None,
+            path: None,
+        }
+    }
+
+    #[test]
+    fn ignores_theme_episode_regardless_of_case() {
+        let episode = now_playing(" Theme ", "Video", Some("Example Series"));
+
+        assert!(is_ignored_episode(&episode));
+    }
+
+    #[test]
+    fn does_not_ignore_other_episodes_or_theme_movies() {
+        let other_episode = now_playing("Pilot", "Episode", Some("Example Series"));
+        let theme_movie = now_playing("Theme", "Movie", None);
+
+        assert!(!is_ignored_episode(&other_episode));
+        assert!(!is_ignored_episode(&theme_movie));
     }
 }

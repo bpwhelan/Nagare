@@ -1,14 +1,36 @@
 <script>
-  import { onMount } from 'svelte';
-  import { getConfig, updateConfig, getServerUsers, testTadokuConnection } from './api.js';
+  import { onDestroy, onMount } from 'svelte';
+  import {
+    getConfig,
+    updateConfig,
+    getServerUsers,
+    testTadokuConnection,
+    refreshTadokuLogin,
+    clearTadokuLogin,
+    getTadokuCandidates,
+    syncTadokuCandidates,
+    declineTadokuCandidates,
+  } from './api.js';
   import { applyMiningConfig, autoApprove, pauseOnEnhance, showNativeSubtitles, showDownloadButton, showErrorToast, showToast } from './stores.js';
 
   const AUTO_APPROVE_STORAGE_KEY = 'opt_autoApprove';
+  const AUTO_SAVE_DELAY_MS = 700;
 
   let config = null;
   let loading = true;
-  let saving = false;
+  let saveError = '';
+  let saveTimer = null;
+  let saveLoopPromise = null;
+  let queuedConfig = null;
+  let lastSavedConfig = null;
   let testingTadoku = false;
+  let refreshingTadoku = false;
+  let clearingTadoku = false;
+  let loadingTadokuCandidates = false;
+  let syncingTadoku = false;
+  let decliningTadoku = false;
+  let tadokuCandidates = [];
+  let selectedTadokuIds = [];
   let activeTab = 'server';
 
   const TABS = [
@@ -23,12 +45,23 @@
       config = await getConfig();
       migrateAutoApprove(config?.mining?.auto_approve);
       normalizeConfig();
+      lastSavedConfig = serializeConfig(config);
     } catch (e) {
       console.error('Failed to load config:', e);
     } finally {
       loading = false;
     }
   });
+
+  onDestroy(() => {
+    if (saveTimer) clearTimeout(saveTimer);
+    saveTimer = null;
+    if (queuedConfig) startSaveLoop();
+  });
+
+  $: if (!loading && config) {
+    queueConfigSave(serializeConfig(config));
+  }
 
   // Per-server fetched user lists: { emby: { loading, error, users: [] }, ... }
   let serverUsers = {};
@@ -59,10 +92,22 @@
     if (!config.mining) config.mining = {};
     if (!config.tadoku) config.tadoku = {};
     if (config.tadoku.enabled == null) config.tadoku.enabled = false;
-    if (config.tadoku.session_cookie == null) config.tadoku.session_cookie = '';
+    if (config.tadoku.username == null) config.tadoku.username = '';
+    if (config.tadoku.password == null) config.tadoku.password = '';
+    if (config.tadoku.password_configured == null) config.tadoku.password_configured = false;
+    delete config.tadoku.session_cookie;
     if (config.tadoku.language_code == null) config.tadoku.language_code = config.target_language || 'jpn';
     if (config.tadoku.export_hour_eastern == null) config.tadoku.export_hour_eastern = 20;
-    if (!config.tadoku.api_url) config.tadoku.api_url = 'https://tadoku.app/api/internal/immersion';
+    const obsoleteTadokuUrls = [
+      '',
+      'https://tadoku.app/api/immersion',
+      'https://tadoku.app/api/immersion/',
+      'https://tadoku.app/api/internal',
+      'https://tadoku.app/api/internal/',
+    ];
+    if (obsoleteTadokuUrls.includes(config.tadoku.api_url || '')) {
+      config.tadoku.api_url = 'https://tadoku.app/api/internal/immersion';
+    }
     if (!config.tadoku.session_url) config.tadoku.session_url = 'https://account.tadoku.app/kratos/sessions/whoami';
     if (config.mining.audio_start_offset_ms == null) config.mining.audio_start_offset_ms = 100;
     if (config.mining.audio_end_offset_ms == null) config.mining.audio_end_offset_ms = 500;
@@ -97,9 +142,11 @@
   async function loadServerUsers() {
     const kinds = ['emby', 'jellyfin', 'plex'].filter((k) => config[k]?.enabled);
     if (kinds.length === 0) {
-      showErrorToast('Enable and save a server connection first');
+      showErrorToast('Enable a server connection first');
       return;
     }
+    await startSaveLoop();
+    if (saveError) return;
     for (const k of kinds) serverUsers[k] = { loading: true, users: [], error: null };
     serverUsers = { ...serverUsers };
 
@@ -169,34 +216,98 @@
     config.anki.note_types = config.anki.note_types.filter((_, i) => i !== index);
   }
 
-  async function save() {
-    saving = true;
-    try {
-      const payload = {
-        ...config,
-        mining: { ...config.mining },
-      };
-      delete payload.mining.auto_approve;
+  function createConfigPayload(source) {
+    const payload = {
+      ...source,
+      mining: { ...source.mining },
+      tadoku: { ...source.tadoku },
+    };
+    delete payload.mining.auto_approve;
+    delete payload.tadoku.password_configured;
+    delete payload.tadoku.session_cookie;
+    return payload;
+  }
 
+  function serializeConfig(source) {
+    return JSON.stringify(createConfigPayload(source));
+  }
+
+  function queueConfigSave(serialized) {
+    if (lastSavedConfig == null) {
+      lastSavedConfig = serialized;
+      return;
+    }
+
+    if (serialized === lastSavedConfig) {
+      queuedConfig = null;
+      if (saveTimer) clearTimeout(saveTimer);
+      saveTimer = null;
+      return;
+    }
+
+    queuedConfig = serialized;
+    saveError = '';
+    if (saveTimer) clearTimeout(saveTimer);
+    saveTimer = setTimeout(() => {
+      saveTimer = null;
+      startSaveLoop();
+    }, AUTO_SAVE_DELAY_MS);
+  }
+
+  async function persistConfig(serialized) {
+    const payload = JSON.parse(serialized);
+    try {
       const result = await updateConfig(payload);
-      if (result.ok) {
-        applyMiningConfig(payload.mining);
-        config = payload;
-        showToast('success', 'Server configuration saved');
-      } else {
-        showErrorToast(result.error || 'Failed to save');
+      if (!result.ok) throw new Error(result.error || 'Failed to save');
+      applyMiningConfig(payload.mining);
+      if (payload.tadoku?.username && payload.tadoku?.password) {
+        config.tadoku.password_configured = true;
       }
+      return true;
     } catch (e) {
-      showErrorToast('Failed to save: ' + e.message);
+      saveError = e.message || 'Failed to save';
+      showErrorToast('Failed to save settings: ' + saveError);
+      return false;
+    }
+  }
+
+  async function startSaveLoop() {
+    if (saveTimer) clearTimeout(saveTimer);
+    saveTimer = null;
+    if (saveLoopPromise) return saveLoopPromise;
+
+    saveLoopPromise = (async () => {
+      while (queuedConfig && queuedConfig !== lastSavedConfig) {
+        const serialized = queuedConfig;
+        queuedConfig = null;
+
+        const saved = await persistConfig(serialized);
+        if (!saved) {
+          queuedConfig = null;
+          break;
+        }
+        lastSavedConfig = serialized;
+
+        const currentConfig = serializeConfig(config);
+        if (currentConfig !== lastSavedConfig) {
+          queuedConfig = currentConfig;
+        }
+      }
+    })();
+
+    try {
+      await saveLoopPromise;
     } finally {
-      saving = false;
+      saveLoopPromise = null;
     }
   }
 
   async function testTadoku() {
     testingTadoku = true;
     try {
-      const result = await testTadokuConnection(config.tadoku);
+      await startSaveLoop();
+      if (saveError) return;
+      const result = await testTadokuConnection();
       if (result.ok) {
         const name = result.connection?.display_name || result.connection?.user_id || 'your account';
         showToast('success', `Connected to Tadoku as ${name}`);
@@ -208,6 +319,126 @@
     } finally {
       testingTadoku = false;
     }
+  }
+
+  async function refreshTadoku() {
+    refreshingTadoku = true;
+    try {
+      await startSaveLoop();
+      if (saveError) return;
+      const result = await refreshTadokuLogin();
+      if (!result.authenticated) throw new Error(result.error || 'Could not refresh Tadoku login');
+      config.tadoku.password_configured = true;
+      showToast('success', 'Tadoku login refreshed');
+    } catch (e) {
+      showErrorToast(e.message || 'Could not refresh Tadoku login');
+    } finally {
+      refreshingTadoku = false;
+    }
+  }
+
+  async function clearTadoku() {
+    clearingTadoku = true;
+    try {
+      if (saveTimer) clearTimeout(saveTimer);
+      saveTimer = null;
+      queuedConfig = null;
+      if (saveLoopPromise) await saveLoopPromise;
+      const result = await clearTadokuLogin();
+      if (!result.ok) throw new Error(result.error || 'Could not clear Tadoku login');
+      config.tadoku.username = '';
+      config.tadoku.password = '';
+      config.tadoku.password_configured = false;
+      showToast('success', 'Saved Tadoku login cleared');
+    } catch (e) {
+      showErrorToast(e.message || 'Could not clear Tadoku login');
+    } finally {
+      clearingTadoku = false;
+    }
+  }
+
+  async function openTab(tab) {
+    activeTab = tab;
+    if (tab === 'tadoku') await loadTadokuCandidates();
+  }
+
+  async function loadTadokuCandidates() {
+    loadingTadokuCandidates = true;
+    try {
+      const result = await getTadokuCandidates();
+      if (!result.ok) throw new Error(result.error || 'Could not load episodes');
+      tadokuCandidates = result.candidates || [];
+      const available = new Set(tadokuCandidates.map((candidate) => candidate.history_id));
+      selectedTadokuIds = selectedTadokuIds.filter((id) => available.has(id));
+    } catch (e) {
+      tadokuCandidates = [];
+      selectedTadokuIds = [];
+      showErrorToast('Failed to load Tadoku episodes: ' + e.message);
+    } finally {
+      loadingTadokuCandidates = false;
+    }
+  }
+
+  function toggleTadokuCandidate(historyId, checked) {
+    if (checked) {
+      if (!selectedTadokuIds.includes(historyId)) {
+        selectedTadokuIds = [...selectedTadokuIds, historyId];
+      }
+    } else {
+      selectedTadokuIds = selectedTadokuIds.filter((id) => id !== historyId);
+    }
+  }
+
+  async function syncTadokuEpisodes(historyIds) {
+    if (historyIds.length === 0 || syncingTadoku || decliningTadoku) return;
+    syncingTadoku = true;
+    try {
+      await startSaveLoop();
+      if (saveError) return;
+      const result = await syncTadokuCandidates(historyIds);
+      if (!result.ok) throw new Error(result.error || 'Tadoku sync failed');
+      const logCount = result.synced_logs || 0;
+      showToast(
+        'success',
+        `Synced ${logCount} Tadoku ${logCount === 1 ? 'log' : 'logs'}`,
+      );
+      selectedTadokuIds = [];
+    } catch (e) {
+      showErrorToast('Tadoku sync failed: ' + e.message);
+    } finally {
+      syncingTadoku = false;
+      await loadTadokuCandidates();
+    }
+  }
+
+  async function declineTadokuEpisodes(historyIds) {
+    if (historyIds.length === 0 || syncingTadoku || decliningTadoku) return;
+    decliningTadoku = true;
+    try {
+      const result = await declineTadokuCandidates(historyIds);
+      if (!result.ok) throw new Error(result.error || 'Could not decline episodes');
+      const count = result.declined_episodes || 0;
+      showToast(
+        'success',
+        `Declined ${count} Tadoku ${count === 1 ? 'episode' : 'episodes'}`,
+      );
+      selectedTadokuIds = [];
+    } catch (e) {
+      showErrorToast('Failed to decline Tadoku episodes: ' + e.message);
+    } finally {
+      decliningTadoku = false;
+      await loadTadokuCandidates();
+    }
+  }
+
+  function formatTadokuDuration(durationSeconds) {
+    const minutes = Math.max(1, Math.round((durationSeconds || 0) / 60));
+    return `${minutes} ${minutes === 1 ? 'minute' : 'minutes'}`;
+  }
+
+  function formatTadokuDate(value) {
+    const date = new Date(value);
+    return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
   }
 
   function handleTagKeydown(e, field) {
@@ -234,7 +465,7 @@
         <button
           class="tab"
           class:active={activeTab === tab.id}
-          on:click={() => (activeTab = tab.id)}
+          on:click={() => openTab(tab.id)}
         >{tab.label}</button>
       {/each}
     </div>
@@ -436,42 +667,145 @@
     {/if}
 
     {#if activeTab === 'tadoku'}
-    <p class="hint tab-hint">Nagare creates one listening log per show from newly completed episodes each day.</p>
+    <p class="hint tab-hint">Review completed episodes yourself or let Nagare sync them on a daily schedule.</p>
 
     <section class="section">
-      <h2>Tadoku Export</h2>
-      <div class="field">
-        <div class="checkbox-row">
-          <input id="tadoku-enabled" type="checkbox" bind:checked={config.tadoku.enabled} />
-          <label for="tadoku-enabled">Export completed episodes automatically</label>
+      <h2>Sync Mode</h2>
+      <div class="tadoku-mode-grid">
+        <button
+          type="button"
+          class="tadoku-mode"
+          class:selected={!config.tadoku.enabled}
+          aria-pressed={!config.tadoku.enabled}
+          on:click={() => (config.tadoku.enabled = false)}
+        >
+          <strong>Manual review</strong>
+          <span>Choose each completed episode before it is sent.</span>
+        </button>
+        <button
+          type="button"
+          class="tadoku-mode"
+          class:selected={config.tadoku.enabled}
+          aria-pressed={config.tadoku.enabled}
+          on:click={() => (config.tadoku.enabled = true)}
+        >
+          <strong>Automatic sync</strong>
+          <span>Send all ready episodes once per day.</span>
+        </button>
+      </div>
+      <p class="hint">Episodes are ready at 80% watched and can only be synced once. Durations round up to the next whole minute.</p>
+    </section>
+
+    {#if !config.tadoku.enabled}
+    <section class="section">
+      <div class="tadoku-review-heading">
+        <div>
+          <h2>Episodes Ready to Sync</h2>
+          <p class="hint">Checked episodes are grouped into one Tadoku listening log per show.</p>
         </div>
-        <p class="hint">Episodes are considered completed at 80% watched. Each episode is exported only once. The first export includes eligible episodes already in Nagare history.</p>
+        <button type="button" class="btn-small" disabled={loadingTadokuCandidates || syncingTadoku || decliningTadoku} on:click={loadTadokuCandidates}>
+          {loadingTadokuCandidates ? 'Loading…' : 'Refresh'}
+        </button>
+      </div>
+
+      {#if loadingTadokuCandidates}
+        <p class="hint">Loading completed episodes…</p>
+      {:else if tadokuCandidates.length === 0}
+        <div class="tadoku-empty">No completed episodes are waiting to sync.</div>
+      {:else}
+        <div class="tadoku-candidate-list">
+          {#each tadokuCandidates as candidate}
+            <label class="tadoku-candidate">
+              <input
+                type="checkbox"
+                checked={selectedTadokuIds.includes(candidate.history_id)}
+                disabled={syncingTadoku || decliningTadoku}
+                on:change={(event) => toggleTadokuCandidate(candidate.history_id, event.currentTarget.checked)}
+              />
+              <span class="tadoku-candidate-copy">
+                <strong>
+                  {candidate.title}
+                  {#if candidate.pending_retry}<em>Retry</em>{/if}
+                </strong>
+                <span>{candidate.series_name} · {formatTadokuDuration(candidate.duration_seconds)}</span>
+                <small>Completed {formatTadokuDate(candidate.watched_at)}</small>
+                {#if candidate.last_error}<small class="error-text">Last attempt: {candidate.last_error}</small>{/if}
+              </span>
+            </label>
+          {/each}
+        </div>
+        <div class="tadoku-review-actions">
+          <button
+            type="button"
+            class="btn-small tadoku-decline"
+            disabled={syncingTadoku || decliningTadoku || selectedTadokuIds.length === 0}
+            on:click={() => declineTadokuEpisodes(selectedTadokuIds)}
+          >
+            {decliningTadoku ? 'Declining…' : `Decline selected (${selectedTadokuIds.length})`}
+          </button>
+          <button
+            type="button"
+            class="btn-small"
+            disabled={syncingTadoku || decliningTadoku || selectedTadokuIds.length === 0}
+            on:click={() => syncTadokuEpisodes(selectedTadokuIds)}
+          >
+            {syncingTadoku ? 'Syncing…' : `Sync selected (${selectedTadokuIds.length})`}
+          </button>
+          <button
+            type="button"
+            class="btn-small tadoku-sync-all"
+            disabled={syncingTadoku || decliningTadoku}
+            on:click={() => syncTadokuEpisodes(tadokuCandidates.map((candidate) => candidate.history_id))}
+          >Sync all ({tadokuCandidates.length})</button>
+        </div>
+        <p class="hint tadoku-decline-hint">Declined episodes stay in Nagare history and will never be sent to Tadoku.</p>
+      {/if}
+    </section>
+    {/if}
+
+    <section class="section">
+      <h2>Tadoku Connection</h2>
+      <div class="field">
+        <label for="tadoku-username">Username or email</label>
+        <input id="tadoku-username" type="text" autocomplete="username"
+          bind:value={config.tadoku.username} />
       </div>
       <div class="field">
-        <label for="tadoku-cookie">Tadoku Session Cookie</label>
-        <input id="tadoku-cookie" type="password" placeholder="ory_kratos_session value"
-          bind:value={config.tadoku.session_cookie} />
-        <p class="hint">Copy <code>ory_kratos_session</code> from your signed-in Tadoku browser cookies. Tadoku may expire it, in which case you will need to replace it.</p>
+        <label for="tadoku-password">Password</label>
+        <input id="tadoku-password" type="password" autocomplete="current-password"
+          placeholder={config.tadoku.password_configured ? 'Saved — leave blank to keep it' : ''}
+          bind:value={config.tadoku.password} />
+        <p class="hint">Nagare signs in automatically and keeps the Tadoku browser session fresh. Leave this blank to preserve an already saved password.</p>
       </div>
       <div class="field">
         <label for="tadoku-language">Language <span class="hint">(ISO 639-3)</span></label>
         <input id="tadoku-language" type="text" placeholder="jpn"
           bind:value={config.tadoku.language_code} />
       </div>
+      {#if config.tadoku.enabled}
       <div class="field">
         <label for="tadoku-hour">Daily Export Hour <span class="hint">(Eastern time, 0–23)</span></label>
         <input id="tadoku-hour" type="number" min="0" max="23" step="1"
           bind:value={config.tadoku.export_hour_eastern} />
         <p class="hint">The default is 20 (8 PM). Daylight-saving time is handled automatically.</p>
       </div>
+      {/if}
       <div class="field">
         <label for="tadoku-api-url">API URL</label>
         <input id="tadoku-api-url" type="url"
           bind:value={config.tadoku.api_url} />
       </div>
-      <button type="button" class="btn-small" disabled={testingTadoku} on:click={testTadoku}>
-        {testingTadoku ? 'Testing…' : 'Test connection'}
-      </button>
+      <div class="tadoku-connection-actions">
+        <button type="button" class="btn-small" disabled={testingTadoku || refreshingTadoku || clearingTadoku} on:click={testTadoku}>
+          {testingTadoku ? 'Testing…' : 'Test connection'}
+        </button>
+        <button type="button" class="btn-small" disabled={testingTadoku || refreshingTadoku || clearingTadoku || !config.tadoku.username || (!config.tadoku.password && !config.tadoku.password_configured)} on:click={refreshTadoku}>
+          {refreshingTadoku ? 'Refreshing…' : 'Refresh Tadoku login'}
+        </button>
+        <button type="button" class="btn-small tadoku-clear" disabled={testingTadoku || refreshingTadoku || clearingTadoku || (!config.tadoku.username && !config.tadoku.password_configured)} on:click={clearTadoku}>
+          {clearingTadoku ? 'Clearing…' : 'Clear saved login'}
+        </button>
+      </div>
     </section>
     {/if}
 
@@ -707,14 +1041,6 @@
     </section>
     {/if}
 
-    <!-- ── Save Button (server-backed tabs only) ─────── -->
-    {#if activeTab !== 'frontend'}
-      <div class="save-bar">
-        <button class="btn-save" on:click={save} disabled={saving}>
-          {saving ? 'Saving...' : 'Save Server Settings'}
-        </button>
-      </div>
-    {/if}
   {:else}
     <p class="error">Failed to load configuration</p>
   {/if}
@@ -723,9 +1049,9 @@
 <style>
   .config-page {
     padding: 1.5rem;
-    max-width: 640px;
+    width: 100%;
+    box-sizing: border-box;
     overflow-y: auto;
-    padding-bottom: 5rem;
   }
 
   .section {
@@ -898,6 +1224,164 @@
     margin-bottom: 0 !important;
   }
 
+  .tadoku-mode-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 0.6rem;
+    margin-bottom: 0.65rem;
+  }
+
+  .tadoku-connection-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+  }
+
+  .tadoku-clear {
+    color: var(--danger, #e5534b);
+    border-color: color-mix(in srgb, var(--danger, #e5534b) 55%, var(--border));
+  }
+
+  .tadoku-mode {
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+    padding: 0.75rem;
+    text-align: left;
+    color: var(--text-primary);
+    background: var(--bg-primary);
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    cursor: pointer;
+  }
+
+  .tadoku-mode:hover,
+  .tadoku-mode.selected {
+    border-color: var(--accent);
+  }
+
+  .tadoku-mode.selected {
+    background: color-mix(in srgb, var(--accent) 8%, var(--bg-primary));
+  }
+
+  .tadoku-mode span {
+    color: var(--text-secondary);
+    font-size: 0.75rem;
+    line-height: 1.35;
+  }
+
+  .tadoku-review-heading,
+  .tadoku-review-actions {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.75rem;
+  }
+
+  .tadoku-review-heading {
+    align-items: flex-start;
+    margin-bottom: 0.75rem;
+  }
+
+  .tadoku-review-heading h2,
+  .tadoku-review-heading p {
+    margin-bottom: 0;
+  }
+
+  .tadoku-candidate-list {
+    display: flex;
+    flex-direction: column;
+    max-height: 360px;
+    overflow-y: auto;
+    border: 1px solid var(--border);
+    border-radius: 7px;
+  }
+
+  .tadoku-candidate {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.65rem;
+    padding: 0.7rem;
+    cursor: pointer;
+    background: var(--bg-primary);
+    border-bottom: 1px solid var(--border);
+  }
+
+  .tadoku-candidate:last-child {
+    border-bottom: none;
+  }
+
+  .tadoku-candidate:hover {
+    background: var(--bg-hover);
+  }
+
+  .tadoku-candidate input {
+    margin-top: 0.2rem;
+  }
+
+  .tadoku-candidate-copy {
+    display: flex;
+    min-width: 0;
+    flex-direction: column;
+    gap: 0.1rem;
+    font-size: 0.82rem;
+  }
+
+  .tadoku-candidate-copy > span,
+  .tadoku-candidate-copy small {
+    color: var(--text-secondary);
+  }
+
+  .tadoku-candidate-copy em {
+    display: inline-block;
+    margin-left: 0.35rem;
+    padding: 0.05rem 0.3rem;
+    color: var(--accent);
+    background: color-mix(in srgb, var(--accent) 12%, transparent);
+    border-radius: 999px;
+    font-size: 0.65rem;
+    font-style: normal;
+    font-weight: 600;
+    vertical-align: middle;
+  }
+
+  .tadoku-candidate-copy small {
+    font-size: 0.7rem;
+    opacity: 0.75;
+  }
+
+  .tadoku-review-actions {
+    justify-content: flex-end;
+    flex-wrap: wrap;
+    margin-top: 0.75rem;
+  }
+
+  .tadoku-decline {
+    margin-right: auto;
+    color: var(--danger, #e5534b);
+    border-color: color-mix(in srgb, var(--danger, #e5534b) 55%, var(--border));
+  }
+
+  .tadoku-decline-hint {
+    margin: 0.5rem 0 0;
+  }
+
+  .tadoku-sync-all {
+    color: white;
+    background: var(--accent);
+    border-color: var(--accent);
+  }
+
+  .tadoku-empty {
+    padding: 1.25rem 0.75rem;
+    color: var(--text-secondary);
+    background: var(--bg-primary);
+    border: 1px dashed var(--border);
+    border-radius: 7px;
+    text-align: center;
+    font-size: 0.82rem;
+  }
+
   .mapping-row {
     display: flex;
     align-items: center;
@@ -986,36 +1470,6 @@
     flex: 1;
   }
 
-  .save-bar {
-    position: sticky;
-    bottom: 0;
-    padding: 0.75rem 0;
-    background: var(--bg-primary);
-    border-top: 1px solid var(--border);
-    margin-top: 1rem;
-  }
-
-  .btn-save {
-    width: 100%;
-    padding: 0.6rem 1rem;
-    font-size: 0.9rem;
-    font-weight: 600;
-    background: var(--accent);
-    color: white;
-    border: none;
-    border-radius: 6px;
-    cursor: pointer;
-  }
-
-  .btn-save:hover {
-    opacity: 0.9;
-  }
-
-  .btn-save:disabled {
-    opacity: 0.5;
-    cursor: not-allowed;
-  }
-
   .error {
     color: var(--accent);
   }
@@ -1024,12 +1478,15 @@
   @media (max-width: 768px) {
     .config-page {
       padding: 0.75rem;
-      padding-bottom: 4rem;
     }
 
     .section {
       padding: 0.75rem;
       margin-bottom: 1rem;
+    }
+
+    .tadoku-mode-grid {
+      grid-template-columns: 1fr;
     }
 
     .tab {
@@ -1064,11 +1521,6 @@
     .tag-input-row input {
       flex: 1 1 0;
       min-width: 0;
-    }
-
-    .btn-save {
-      min-height: 44px;
-      font-size: 1rem;
     }
 
     input[type="text"],
