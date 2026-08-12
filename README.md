@@ -159,6 +159,12 @@ All configuration is managed through the web UI Config page and stored in `data/
 3. **Media access** — `auto`, `disk`, or `api` mode; add path mappings if server and Nagare see different file paths
 4. **Tadoku (optional)** — save your Tadoku username and password, then choose manual review or automatic daily sync. Nagare signs in and refreshes the browser session automatically. Manual review lets you approve or permanently decline individual ready episodes; automatic sync defaults to 8 PM Eastern. When the review workflow is first enabled, episodes completed after the previous successful sync are queued. Tadoku tags can also be assigned from case-insensitive file-path matches; by default, paths containing `anime` receive the `anime` tag.
 
+### AudioBookShelf downloaded playback
+
+AudioBookShelf does not expose an open playback session while its Android app plays a downloaded book. Instead, the app writes a `Local` listening-session row when playback is paused. Nagare polls that listening history every three seconds, resolves the row's library item to the exact server-side MP3/M4B track, and loads a same-basename sidecar subtitle such as `Book 01.srt` through the configured path mappings. The detected paused session remains available in Nagare for 15 minutes after its last AudioBookShelf update.
+
+This discovery uses the administrator-only `/api/sessions` endpoint, so the configured AudioBookShelf token must belong to an administrator. Nagare monitors the newest listening row for each selected user; a newer streamed row replaces an older downloaded one.
+
 ## How it works
 
 1. Nagare polls your media server(s) for active playback sessions

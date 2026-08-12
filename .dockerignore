@@ -13,4 +13,5 @@ config.toml
 *.log
 *.sqlite*
 *.zip
+audiobookshelf
 

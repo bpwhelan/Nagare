@@ -3,7 +3,7 @@ use anyhow::{Context, bail};
 use async_trait::async_trait;
 use reqwest::{Client, Response};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
@@ -12,14 +12,15 @@ use tokio::sync::RwLock;
 /// clock. Allow more than one reporting interval before treating a session as
 /// probably paused. The reported position itself must never be projected.
 const PLAYBACK_STALE_AFTER_MS: i64 = 25_000;
-/// Downloaded playback is saved as a listening-history session rather than an
-/// open session. Poll that slower endpoint at most once per second; the mobile
-/// app itself only syncs local progress every 15 seconds on an unmetered link.
-const LOCAL_SESSION_POLL_INTERVAL_MS: i64 = 1_000;
-/// ABS does not explicitly close a downloaded playback session. Keep a recent
-/// one visible while its user is online, but do not resurrect old history as a
-/// current player indefinitely.
-const LOCAL_SESSION_VISIBLE_AFTER_MS: i64 = 10 * 60 * 1_000;
+/// Downloaded playback is saved as listening history only when the Android app
+/// pauses. Poll that slower endpoint every few seconds instead of on every live
+/// session refresh.
+const LOCAL_SESSION_POLL_INTERVAL_MS: i64 = 3_000;
+/// ABS does not expose an open session for downloaded playback. Hold the newest
+/// local history row on Nagare's side long enough to mine after pausing, but do
+/// not resurrect old listening history as a current player indefinitely.
+const LOCAL_SESSION_VISIBLE_AFTER_MS: i64 = 15 * 60 * 1_000;
+const LISTENING_SESSION_PAGE_SIZE: usize = 100;
 const LOCAL_PLAY_METHOD: u64 = 3;
 
 #[derive(Debug, Clone)]
@@ -124,62 +125,23 @@ impl AudiobookshelfClient {
             }
         }
 
-        let response = self.get("/api/users/online").await?;
+        let response = self
+            .get(&format!(
+                "/api/sessions?itemsPerPage={LISTENING_SESSION_PAGE_SIZE}&page=0&sort=updatedAt&desc=1"
+            ))
+            .await?;
         if !response.status().is_success() {
             bail!(
-                "Failed to fetch AudioBookShelf online users: HTTP {}. An admin API token is required",
+                "Failed to fetch AudioBookShelf listening sessions: HTTP {}. An admin API token is required",
                 response.status()
             );
         }
         let body: Value = response.json().await?;
-        let online_users = body["usersOnline"]
+        let history = body["sessions"]
             .as_array()
-            .context("AudioBookShelf /api/users/online response omitted usersOnline")?;
-
-        let mut sessions = Vec::new();
-        for user in online_users {
-            let Some(user_id) = user["id"].as_str() else {
-                continue;
-            };
-            let response = self
-                .get(&format!(
-                    "/api/users/{user_id}/listening-sessions?itemsPerPage=1&page=0"
-                ))
-                .await?;
-            if !response.status().is_success() {
-                tracing::warn!(
-                    "Failed to fetch recent AudioBookShelf sessions for user {}: HTTP {}",
-                    user_id,
-                    response.status()
-                );
-                continue;
-            }
-
-            let body: Value = response.json().await?;
-            let Some(mut session) = body["sessions"]
-                .as_array()
-                .and_then(|items| items.first())
-                .cloned()
-            else {
-                continue;
-            };
-            if session["playMethod"].as_u64() != Some(LOCAL_PLAY_METHOD) {
-                continue;
-            }
-
-            // Current ABS versions attach this object already. Fill it for
-            // older versions so the normal session parser can expose the user.
-            if !session["user"].is_object() {
-                session["user"] = serde_json::json!({
-                    "id": user_id,
-                    "username": user["username"].as_str().unwrap_or("Unknown")
-                });
-            }
-            if session["userId"].as_str().is_none() {
-                session["userId"] = Value::String(user_id.to_string());
-            }
-            sessions.push(session);
-        }
+            .context("AudioBookShelf /api/sessions response omitted sessions")?;
+        let previous = self.local_sessions.read().await.sessions.clone();
+        let sessions = Self::merge_local_session_history(&previous, history, now_ms);
 
         *self.local_sessions.write().await = AbsLocalSessionSnapshot {
             fetched_at_ms: now_ms,
@@ -192,11 +154,59 @@ impl AudiobookshelfClient {
         session["updatedAt"].as_i64().unwrap_or(0)
     }
 
+    fn session_user_id(session: &Value) -> Option<&str> {
+        session["userId"]
+            .as_str()
+            .or_else(|| session["user"]["id"].as_str())
+    }
+
+    fn merge_local_session_history(
+        previous: &[Value],
+        history: &[Value],
+        now_ms: i64,
+    ) -> Vec<Value> {
+        // Keep a previously detected row if a short response or transient ABS
+        // database delay omits it. Its own updatedAt timestamp still enforces
+        // the 15-minute lifetime.
+        let mut held: HashMap<String, Value> = previous
+            .iter()
+            .filter(|session| Self::is_visible_local_session(session, now_ms))
+            .filter_map(|session| {
+                Self::session_user_id(session).map(|id| (id.to_string(), session.clone()))
+            })
+            .collect();
+
+        let mut newest = history.to_vec();
+        newest.sort_by_key(|session| std::cmp::Reverse(Self::session_updated_at(session)));
+        let mut users_seen = HashSet::new();
+        for mut session in newest {
+            let Some(user_id) = Self::session_user_id(&session).map(str::to_string) else {
+                continue;
+            };
+            if !users_seen.insert(user_id.clone()) {
+                continue;
+            }
+
+            // The first history row is authoritative for this user. A newer
+            // streamed session supersedes a held local row.
+            held.remove(&user_id);
+            if !Self::is_visible_local_session(&session, now_ms) {
+                continue;
+            }
+            if session["userId"].as_str().is_none() {
+                session["userId"] = Value::String(user_id.clone());
+            }
+            held.insert(user_id, session);
+        }
+
+        let mut sessions: Vec<Value> = held.into_values().collect();
+        sessions.sort_by_key(|session| std::cmp::Reverse(Self::session_updated_at(session)));
+        sessions
+    }
+
     fn same_user(left: &Value, right: &Value) -> bool {
-        left["userId"].as_str().is_some_and(|left_id| {
-            right["userId"]
-                .as_str()
-                .is_some_and(|right_id| left_id == right_id)
+        Self::session_user_id(left).is_some_and(|left_id| {
+            Self::session_user_id(right).is_some_and(|right_id| left_id == right_id)
         })
     }
 
@@ -223,6 +233,21 @@ impl AudiobookshelfClient {
         session["playMethod"].as_u64() == Some(LOCAL_PLAY_METHOD)
             && now_ms.saturating_sub(Self::session_updated_at(session))
                 <= LOCAL_SESSION_VISIBLE_AFTER_MS
+    }
+
+    fn local_session_with_library_item(
+        session: &Value,
+        library_item: Value,
+    ) -> anyhow::Result<Value> {
+        let audio_tracks = library_item["media"]["tracks"]
+            .as_array()
+            .filter(|tracks| !tracks.is_empty())
+            .cloned()
+            .context("AudioBookShelf library item omitted media tracks")?;
+        let mut expanded = session.clone();
+        expanded["audioTracks"] = Value::Array(audio_tracks);
+        expanded["libraryItem"] = library_item;
+        Ok(expanded)
     }
 
     fn language_by_track(library_item: &Value) -> HashMap<u32, String> {
@@ -326,13 +351,33 @@ impl AudiobookshelfClient {
             return Ok(details);
         }
 
-        // Legacy online-user records and downloaded listening sessions may
-        // already contain all audio tracks even when libraryItem is omitted.
+        // Legacy online-user records may already contain all audio tracks even
+        // when libraryItem is omitted.
         let details_value = if open_session["audioTracks"]
             .as_array()
             .is_some_and(|tracks| !tracks.is_empty())
         {
             open_session.clone()
+        } else if open_session["playMethod"].as_u64() == Some(LOCAL_PLAY_METHOD) {
+            // Paused Android downloads are persisted as listening-history rows.
+            // Their audioTracks array is empty and they are not addressable via
+            // /api/session/:id, so resolve the actual server-side file from the
+            // expanded library item instead.
+            let library_item_id = open_session["libraryItemId"]
+                .as_str()
+                .context("AudioBookShelf local session omitted libraryItemId")?;
+            let response = self
+                .get(&format!("/api/items/{library_item_id}?expanded=1"))
+                .await?;
+            if !response.status().is_success() {
+                bail!(
+                    "Failed to fetch AudioBookShelf library item {} for local session {}: HTTP {}",
+                    library_item_id,
+                    session_id,
+                    response.status()
+                );
+            }
+            Self::local_session_with_library_item(open_session, response.json().await?)?
         } else {
             let response = self.get(&format!("/api/session/{session_id}")).await?;
             if !response.status().is_success() {
@@ -411,7 +456,13 @@ impl AudiobookshelfClient {
         now_ms: i64,
     ) -> Option<(Session, ItemInfo)> {
         let id = value["id"].as_str()?.to_string();
-        let (global_position_seconds, is_paused) = Self::reported_position_seconds(value, now_ms);
+        let (global_position_seconds, mut is_paused) =
+            Self::reported_position_seconds(value, now_ms);
+        // Local listening rows are emitted on pause, not while the downloaded
+        // player is active, so never present them as a live playing clock.
+        if value["playMethod"].as_u64() == Some(LOCAL_PLAY_METHOD) {
+            is_paused = true;
+        }
         let track = Self::active_track(&details.audio_tracks, global_position_seconds)?;
         let local_position_seconds =
             (global_position_seconds - track.start_offset_seconds).max(0.0);
@@ -708,6 +759,36 @@ mod tests {
         })
     }
 
+    fn expanded_library_item() -> Value {
+        json!({
+            "id": "book-1",
+            "path": "/audiobooks/Japanese Audiobook",
+            "mediaType": "book",
+            "media": {
+                "metadata": {
+                    "title": "Downloaded Japanese Audiobook",
+                    "seriesName": "Japanese Series"
+                },
+                "audioFiles": [{
+                    "index": 1,
+                    "language": "jpn"
+                }],
+                "tracks": [{
+                    "index": 1,
+                    "startOffset": 0.0,
+                    "duration": 600.0,
+                    "title": "Japanese Audiobook.m4b",
+                    "contentUrl": "/api/items/book-1/file/123",
+                    "codec": "aac",
+                    "metadata": {
+                        "filename": "Japanese Audiobook.m4b",
+                        "path": "/audiobooks/Japanese Audiobook/Japanese Audiobook.m4b"
+                    }
+                }]
+            }
+        })
+    }
+
     #[test]
     fn extracts_current_and_legacy_open_session_arrays() {
         let sessions = vec![json!({ "id": "session-1" })];
@@ -738,6 +819,72 @@ mod tests {
         assert_eq!(details.series_name.as_deref(), Some("Japanese Series"));
         assert_eq!(details.audio_tracks.len(), 1);
         assert_eq!(details.audio_tracks[0].language.as_deref(), Some("jpn"));
+    }
+
+    #[test]
+    fn resolves_empty_downloaded_tracks_from_expanded_library_item() {
+        let mut session = local_session();
+        session["audioTracks"] = json!([]);
+        let expanded = AudiobookshelfClient::local_session_with_library_item(
+            &session,
+            expanded_library_item(),
+        )
+        .unwrap();
+        let details = AudiobookshelfClient::parse_session_details(&expanded).unwrap();
+
+        assert_eq!(details.audio_tracks.len(), 1);
+        assert_eq!(details.audio_tracks[0].index, 1);
+        assert_eq!(details.audio_tracks[0].language.as_deref(), Some("jpn"));
+        assert_eq!(
+            details.audio_tracks[0].path,
+            "/audiobooks/Japanese Audiobook/Japanese Audiobook.m4b"
+        );
+    }
+
+    #[test]
+    fn holds_latest_local_session_per_user_for_fifteen_minutes() {
+        let mut older = local_session();
+        older["id"] = json!("older-local");
+        older["updatedAt"] = json!(10_000);
+        let mut newest = local_session();
+        newest["id"] = json!("newest-local");
+        newest["updatedAt"] = json!(20_000);
+
+        let sessions = AudiobookshelfClient::merge_local_session_history(
+            &[],
+            &[older, newest.clone()],
+            21_000,
+        );
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0]["id"], "newest-local");
+
+        let held = AudiobookshelfClient::merge_local_session_history(
+            &sessions,
+            &[],
+            20_000 + LOCAL_SESSION_VISIBLE_AFTER_MS,
+        );
+        assert_eq!(held.len(), 1);
+        let expired = AudiobookshelfClient::merge_local_session_history(
+            &held,
+            &[],
+            20_000 + LOCAL_SESSION_VISIBLE_AFTER_MS + 1,
+        );
+        assert!(expired.is_empty());
+    }
+
+    #[test]
+    fn newer_streamed_history_supersedes_held_local_session() {
+        let local = local_session();
+        let streamed = json!({
+            "id": "streamed-session",
+            "userId": "user-1",
+            "playMethod": 0,
+            "updatedAt": 30_000
+        });
+
+        let sessions =
+            AudiobookshelfClient::merge_local_session_history(&[local], &[streamed], 31_000);
+        assert!(sessions.is_empty());
     }
 
     #[test]
@@ -793,6 +940,17 @@ mod tests {
             AudiobookshelfClient::reported_position_seconds(&recent, 31_000),
             (100.0, true)
         );
+    }
+
+    #[test]
+    fn downloaded_listening_row_is_always_presented_as_paused() {
+        let client = AudiobookshelfClient::new("http://localhost", "token");
+        let session = local_session();
+        let details = AudiobookshelfClient::parse_session_details(&session).unwrap();
+        let (parsed, _) = client.parse_session(&session, &details, 21_000).unwrap();
+
+        assert!(parsed.play_state.is_paused);
+        assert_eq!(parsed.position_ms(), Some(75_000));
     }
 
     #[test]

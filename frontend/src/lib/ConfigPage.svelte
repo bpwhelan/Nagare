@@ -680,7 +680,7 @@
         <div class="server-head">
           <div>
             <h3>AudioBookShelf</h3>
-            <p class="hint">Estimated live position · local MP3/M4B sidecars</p>
+            <p class="hint">Streamed playback · paused Android downloads · local MP3/M4B sidecars</p>
           </div>
           <label class="toggle">
             <input
@@ -710,7 +710,7 @@
             value={config.audiobookshelf.token}
             on:input={(e) => updateServerField('audiobookshelf', 'token', e.target.value)}
           />
-          <p class="hint">An admin token is required because ABS restricts open-session discovery to administrators.</p>
+          <p class="hint">An admin token is required to discover open sessions and downloaded Android playback. Local listening rows are checked every 3 seconds and retained for 15 minutes after pausing.</p>
         </div>
         {#if config.audiobookshelf.enabled}{@render userSelector('audiobookshelf')}{/if}
       </div>

@@ -123,7 +123,7 @@ pub struct AudiobookshelfConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
     pub url: String,
-    /// An admin API token is required to enumerate open playback sessions.
+    /// An admin API token is required to enumerate open and listening-history sessions.
     pub token: String,
     /// User IDs to monitor. Empty means all users on the server.
     #[serde(default)]
