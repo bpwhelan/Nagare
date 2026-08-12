@@ -57,6 +57,7 @@ pub struct AudiobookshelfClient {
     session_details: RwLock<HashMap<String, AbsSessionDetails>>,
     item_info: RwLock<HashMap<String, ItemInfo>>,
     local_sessions: RwLock<AbsLocalSessionSnapshot>,
+    nagare_endpoint_available: RwLock<Option<bool>>,
 }
 
 impl AudiobookshelfClient {
@@ -68,6 +69,7 @@ impl AudiobookshelfClient {
             session_details: RwLock::new(HashMap::new()),
             item_info: RwLock::new(HashMap::new()),
             local_sessions: RwLock::new(AbsLocalSessionSnapshot::default()),
+            nagare_endpoint_available: RwLock::new(None),
         }
     }
 
@@ -89,6 +91,37 @@ impl AudiobookshelfClient {
             .or_else(|| body.get("openSessions"))
             .and_then(Value::as_array)
             .cloned()
+    }
+
+    async fn get_nagare_sessions(&self) -> anyhow::Result<Option<(i64, Vec<Value>)>> {
+        if *self.nagare_endpoint_available.read().await == Some(false) {
+            return Ok(None);
+        }
+
+        let response = self.get("/api/nagare/sessions").await?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            *self.nagare_endpoint_available.write().await = Some(false);
+            return Ok(None);
+        }
+        if !response.status().is_success() {
+            bail!(
+                "Failed to fetch Nagare AudioBookShelf sessions: HTTP {}",
+                response.status()
+            );
+        }
+
+        let body: Value = response.json().await?;
+        if body["schemaVersion"].as_u64() != Some(1) {
+            *self.nagare_endpoint_available.write().await = Some(false);
+            return Ok(None);
+        }
+        let server_time = body["serverTime"]
+            .as_i64()
+            .context("Nagare AudioBookShelf response omitted serverTime")?;
+        let sessions = Self::sessions_from_response(&body)
+            .context("Nagare AudioBookShelf response omitted sessions")?;
+        *self.nagare_endpoint_available.write().await = Some(true);
+        Ok(Some((server_time, sessions)))
     }
 
     async fn get_open_sessions(&self) -> anyhow::Result<Vec<Value>> {
@@ -148,6 +181,39 @@ impl AudiobookshelfClient {
             sessions: sessions.clone(),
         };
         Ok(sessions)
+    }
+
+    async fn get_legacy_discovered_sessions(&self, now_ms: i64) -> anyhow::Result<Vec<Value>> {
+        let mut open_sessions = self.get_open_sessions().await?;
+        let latest_local_sessions = match self.get_latest_local_sessions(now_ms).await {
+            Ok(sessions) => sessions,
+            Err(error) => {
+                tracing::warn!(
+                    "Failed to discover downloaded AudioBookShelf playback: {}",
+                    error
+                );
+                let mut snapshot = self.local_sessions.write().await;
+                snapshot.fetched_at_ms = now_ms;
+                snapshot.sessions.clone()
+            }
+        };
+
+        // A downloaded session never enters ABS's in-memory open-session list.
+        // The same Android player can therefore leave an older streamed session
+        // behind; hide that stale record in favor of the newer local one.
+        open_sessions.retain(|open| {
+            !latest_local_sessions
+                .iter()
+                .any(|local| Self::local_session_supersedes_open(local, open, now_ms))
+        });
+
+        let mut discovered_sessions: Vec<Value> = latest_local_sessions
+            .into_iter()
+            .filter(|session| Self::is_visible_local_session(session, now_ms))
+            .collect();
+        // Prefer a currently syncing local session during automatic selection.
+        discovered_sessions.extend(open_sessions);
+        Ok(discovered_sessions)
     }
 
     fn session_updated_at(session: &Value) -> i64 {
@@ -288,6 +354,7 @@ impl AudiobookshelfClient {
             .filter_map(|(ordinal, track)| {
                 let path = track["metadata"]["path"]
                     .as_str()
+                    .or_else(|| track["path"].as_str())
                     .or_else(|| {
                         (value["audioTracks"].as_array()?.len() == 1).then_some(item_path?)
                     })?
@@ -332,6 +399,7 @@ impl AudiobookshelfClient {
                 .to_string(),
             series_name: library_item["media"]["metadata"]["seriesName"]
                 .as_str()
+                .or_else(|| value["seriesName"].as_str())
                 .or_else(|| value["mediaMetadata"]["seriesName"].as_str())
                 .or_else(|| value["mediaMetadata"]["series"][0]["name"].as_str())
                 .map(str::trim)
@@ -456,8 +524,9 @@ impl AudiobookshelfClient {
         now_ms: i64,
     ) -> Option<(Session, ItemInfo)> {
         let id = value["id"].as_str()?.to_string();
-        let (global_position_seconds, mut is_paused) =
+        let (global_position_seconds, inferred_is_paused) =
             Self::reported_position_seconds(value, now_ms);
+        let mut is_paused = value["isPaused"].as_bool().unwrap_or(inferred_is_paused);
         // Local listening rows are emitted on pause, not while the downloaded
         // player is active, so never present them as a live playing clock.
         if value["playMethod"].as_u64() == Some(LOCAL_PLAY_METHOD) {
@@ -556,36 +625,21 @@ impl MediaServer for AudiobookshelfClient {
     }
 
     async fn get_sessions(&self) -> anyhow::Result<Vec<Session>> {
-        let now_ms = Self::now_ms();
-        let mut open_sessions = self.get_open_sessions().await?;
-        let latest_local_sessions = match self.get_latest_local_sessions(now_ms).await {
-            Ok(sessions) => sessions,
+        let (now_ms, discovered_sessions) = match self.get_nagare_sessions().await {
+            Ok(Some(snapshot)) => snapshot,
+            Ok(None) => {
+                let now_ms = Self::now_ms();
+                (now_ms, self.get_legacy_discovered_sessions(now_ms).await?)
+            }
             Err(error) => {
                 tracing::warn!(
-                    "Failed to discover downloaded AudioBookShelf playback: {}",
+                    "Failed to use Nagare AudioBookShelf endpoint; falling back to stock APIs: {}",
                     error
                 );
-                let mut snapshot = self.local_sessions.write().await;
-                snapshot.fetched_at_ms = now_ms;
-                snapshot.sessions.clone()
+                let now_ms = Self::now_ms();
+                (now_ms, self.get_legacy_discovered_sessions(now_ms).await?)
             }
         };
-
-        // A downloaded session never enters ABS's in-memory open-session list.
-        // The same Android player can therefore leave an older streamed session
-        // behind; hide that stale record in favor of the newer local one.
-        open_sessions.retain(|open| {
-            !latest_local_sessions
-                .iter()
-                .any(|local| Self::local_session_supersedes_open(local, open, now_ms))
-        });
-
-        let mut discovered_sessions: Vec<Value> = latest_local_sessions
-            .into_iter()
-            .filter(|session| Self::is_visible_local_session(session, now_ms))
-            .collect();
-        // Prefer a currently syncing local session during automatic selection.
-        discovered_sessions.extend(open_sessions);
 
         let active_ids: Vec<String> = discovered_sessions
             .iter()
@@ -819,6 +873,28 @@ mod tests {
         assert_eq!(details.series_name.as_deref(), Some("Japanese Series"));
         assert_eq!(details.audio_tracks.len(), 1);
         assert_eq!(details.audio_tracks[0].language.as_deref(), Some("jpn"));
+    }
+
+    #[test]
+    fn parses_tailored_nagare_session_contract() {
+        let mut session = local_session();
+        session["playMethod"] = json!(0);
+        session["seriesName"] = json!("Tailored Series");
+        session["mediaMetadata"] = Value::Null;
+        session["audioTracks"][0]["metadata"] = Value::Null;
+        session["audioTracks"][0]["path"] = json!("/tailored/Japanese Audiobook.m4b");
+        session["isPaused"] = json!(true);
+
+        let details = AudiobookshelfClient::parse_session_details(&session).unwrap();
+        assert_eq!(details.series_name.as_deref(), Some("Tailored Series"));
+        assert_eq!(
+            details.audio_tracks[0].path,
+            "/tailored/Japanese Audiobook.m4b"
+        );
+
+        let client = AudiobookshelfClient::new("http://localhost", "token");
+        let (parsed, _) = client.parse_session(&session, &details, 21_000).unwrap();
+        assert!(parsed.play_state.is_paused);
     }
 
     #[test]
