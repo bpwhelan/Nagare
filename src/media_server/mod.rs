@@ -1,3 +1,4 @@
+pub mod audiobookshelf;
 pub mod mediabrowser;
 pub mod plex;
 
@@ -7,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+pub use audiobookshelf::AudiobookshelfClient;
 pub use mediabrowser::{EmbyClient, JellyfinClient};
 pub use plex::PlexClient;
 
@@ -147,13 +149,89 @@ impl NowPlaying {
     }
 
     pub fn display_title(&self) -> String {
-        if let Some(ref series) = self.series_name {
+        let is_episode = self.media_type.eq_ignore_ascii_case("episode")
+            || self.season_index.is_some()
+            || self.episode_index.is_some();
+        if let Some(ref series) = self.series_name
+            && is_episode
+        {
             let s = self.season_index.unwrap_or(0);
-            let e = self.episode_index.unwrap_or(0);
+            let mut e = self.episode_index.unwrap_or(0);
+            // Jellyfin can report E00 for date-based shows whose season is the
+            // broadcast year, while retaining the real ordinal in a generic
+            // name such as "Episode 002".
+            if e == 0 && (1900..=9999).contains(&s) {
+                e = episode_number_from_name(&self.name)
+                    .filter(|episode| *episode > 0)
+                    .unwrap_or(e);
+            }
             format!("{series} S{s:02}E{e:02} - {}", self.name)
         } else {
             self.name.clone()
         }
+    }
+}
+
+pub(crate) fn episode_number_from_name(name: &str) -> Option<u32> {
+    let mut parts = name.split_whitespace();
+    let label = parts.next()?;
+    let number = parts.next()?;
+    if parts.next().is_some()
+        || !label.eq_ignore_ascii_case("episode")
+        || number.is_empty()
+        || !number.chars().all(|character| character.is_ascii_digit())
+    {
+        return None;
+    }
+    number.parse().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::NowPlaying;
+
+    fn episode(name: &str, season: u32, index: u32) -> NowPlaying {
+        NowPlaying {
+            item_id: "episode-1".to_string(),
+            name: name.to_string(),
+            series_name: Some("Weekly Show".to_string()),
+            season_index: Some(season),
+            episode_index: Some(index),
+            media_type: "Episode".to_string(),
+            run_time_ticks: None,
+            media_streams: Vec::new(),
+            media_source_id: None,
+            path: None,
+        }
+    }
+
+    #[test]
+    fn date_based_episode_uses_ordinal_from_generic_name_when_index_is_zero() {
+        assert_eq!(
+            episode("Episode 002", 2014, 0).display_title(),
+            "Weekly Show S2014E02 - Episode 002"
+        );
+    }
+
+    #[test]
+    fn metadata_index_wins_and_non_year_seasons_keep_episode_zero() {
+        assert_eq!(
+            episode("Episode 002", 2014, 7).display_title(),
+            "Weekly Show S2014E07 - Episode 002"
+        );
+        assert_eq!(
+            episode("Episode 002", 0, 0).display_title(),
+            "Weekly Show S00E00 - Episode 002"
+        );
+    }
+
+    #[test]
+    fn audiobook_series_metadata_does_not_add_tv_episode_numbers() {
+        let mut book = episode("Japanese Audiobook 01", 0, 0);
+        book.media_type = "book".to_string();
+        book.season_index = None;
+        book.episode_index = None;
+        assert_eq!(book.display_title(), "Japanese Audiobook 01");
     }
 }
 

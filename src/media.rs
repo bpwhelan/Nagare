@@ -42,6 +42,103 @@ pub struct GeneratedImage {
     pub format: StaticScreenshotFormat,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MediaProbe {
+    /// True only for a real visual video stream. Embedded audiobook cover art
+    /// (`attached_pic`) does not count.
+    pub has_visual_video: bool,
+    /// Embedded chapter containing the requested media position, if available.
+    pub chapter_title: Option<String>,
+}
+
+fn json_number(value: &serde_json::Value) -> Option<f64> {
+    value
+        .as_f64()
+        .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
+}
+
+fn parse_media_probe(value: &serde_json::Value, time_ms: i64) -> MediaProbe {
+    let has_visual_video = value["streams"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|stream| {
+            stream["codec_type"].as_str() == Some("video")
+                && stream["disposition"]["attached_pic"].as_i64() != Some(1)
+        });
+
+    let time_seconds = time_ms.max(0) as f64 / 1000.0;
+    let chapters = value["chapters"].as_array();
+    let chapter_title = chapters.and_then(|chapters| {
+        chapters
+            .iter()
+            .find(|chapter| {
+                let start = json_number(&chapter["start_time"]).unwrap_or(0.0);
+                let end = json_number(&chapter["end_time"]).unwrap_or(f64::INFINITY);
+                start <= time_seconds && time_seconds < end
+            })
+            .or_else(|| {
+                chapters.iter().rev().find(|chapter| {
+                    json_number(&chapter["start_time"]).unwrap_or(0.0) <= time_seconds
+                })
+            })
+            .and_then(|chapter| chapter["tags"]["title"].as_str())
+            .map(str::trim)
+            .filter(|title| !title.is_empty())
+            .map(String::from)
+    });
+
+    MediaProbe {
+        has_visual_video,
+        chapter_title,
+    }
+}
+
+/// Inspect streams and embedded chapters without decoding the media.
+pub async fn probe_media(source: &str, time_ms: i64) -> Result<MediaProbe> {
+    let mut cmd = Command::new("ffprobe");
+    for arg in http_input_args(source) {
+        cmd.arg(arg);
+    }
+    cmd.args([
+        "-v",
+        "error",
+        "-show_entries",
+        "stream=codec_type:stream_disposition=attached_pic:chapter=start_time,end_time:chapter_tags=title",
+        "-of",
+        "json",
+        source,
+    ]);
+    cmd.kill_on_drop(true);
+
+    let output = cmd.output().await?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "ffprobe exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    Ok(parse_media_probe(&value, time_ms))
+}
+
+/// Extension fallback for the rare case where ffprobe cannot inspect a source.
+pub fn is_likely_audio_only(source: &str) -> bool {
+    let source_without_query = source.split(['?', '#']).next().unwrap_or(source);
+    Path::new(source_without_query)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "aac" | "flac" | "m4a" | "m4b" | "mp3" | "ogg" | "opus" | "wav"
+            )
+        })
+        .unwrap_or(false)
+}
+
 /// Run an ffmpeg command, capturing stderr, returning a descriptive error on failure.
 async fn run_ffmpeg(mut cmd: Command) -> Result<()> {
     cmd.kill_on_drop(true);
@@ -466,4 +563,40 @@ pub fn to_base64(data: &[u8]) -> String {
 /// Clean up temporary files.
 pub async fn cleanup_temp_file(path: &Path) {
     let _ = tokio::fs::remove_file(path).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_likely_audio_only, parse_media_probe};
+    use serde_json::json;
+
+    #[test]
+    fn ignores_attached_cover_art_and_resolves_chapter_at_line_time() {
+        let value = json!({
+            "streams": [
+                {"codec_type": "audio", "disposition": {"attached_pic": 0}},
+                {"codec_type": "video", "disposition": {"attached_pic": 1}}
+            ],
+            "chapters": [
+                {"start_time": "0.0", "end_time": "26.052", "tags": {"title": "Chapter 1"}},
+                {"start_time": "26.052", "end_time": "80.0", "tags": {"title": "Chapter 2"}}
+            ]
+        });
+
+        let probe = parse_media_probe(&value, 30_000);
+        assert!(!probe.has_visual_video);
+        assert_eq!(probe.chapter_title.as_deref(), Some("Chapter 2"));
+    }
+
+    #[test]
+    fn recognizes_real_video_and_audio_extensions() {
+        let value = json!({
+            "streams": [
+                {"codec_type": "video", "disposition": {"attached_pic": 0}}
+            ]
+        });
+        assert!(parse_media_probe(&value, 0).has_visual_video);
+        assert!(is_likely_audio_only("book.m4b?token=secret"));
+        assert!(!is_likely_audio_only("episode.mkv"));
+    }
 }

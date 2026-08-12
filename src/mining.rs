@@ -2,7 +2,7 @@ use crate::anki::NewCardEvent;
 use crate::config::{Config, MediaServerKind};
 use crate::session::HistoryEntry;
 use crate::subtitle::SubtitleTrack;
-use anyhow::Context;
+use anyhow::{Context, bail};
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -81,6 +81,7 @@ pub struct TadokuExportBatch {
     pub description: String,
     pub duration_seconds: i32,
     pub language_code: String,
+    pub file_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -88,6 +89,7 @@ pub struct TadokuCandidate {
     pub history_id: String,
     pub series_name: String,
     pub title: String,
+    pub title_overridden: bool,
     pub watched_at: String,
     pub duration_seconds: i32,
     pub pending_retry: bool,
@@ -98,6 +100,7 @@ pub struct TadokuCandidate {
 struct TadokuCandidateRow {
     candidate: TadokuCandidate,
     duration_ms: i64,
+    file_path: Option<String>,
 }
 
 impl MiningHistoryEntry {
@@ -266,6 +269,19 @@ impl AppDatabase {
         tokio::task::spawn_blocking(move || decline_tadoku_candidates_sync(&db_path, &history_ids))
             .await
             .context("SQLite Tadoku decline task failed")?
+    }
+
+    pub async fn set_tadoku_candidate_title(
+        &self,
+        history_id: String,
+        title: Option<String>,
+    ) -> anyhow::Result<()> {
+        let db_path = self.db_path.clone();
+        tokio::task::spawn_blocking(move || {
+            set_tadoku_candidate_title_sync(&db_path, &history_id, title.as_deref())
+        })
+        .await
+        .context("SQLite Tadoku title override task failed")?
     }
 
     pub async fn mark_tadoku_batch_completed(
@@ -490,6 +506,12 @@ fn open_connection(path: &Path) -> anyhow::Result<Connection> {
             history_id TEXT PRIMARY KEY,
             decision TEXT NOT NULL CHECK (decision IN ('declined')),
             decided_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS tadoku_episode_overrides (
+            history_id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            updated_at TEXT NOT NULL
         );
         ",
     )
@@ -812,6 +834,10 @@ fn prepare_tadoku_batches_sync(
             &series_name,
             items.iter().map(|item| item.candidate.title.as_str()),
         );
+        let file_paths = items
+            .iter()
+            .filter_map(|item| item.file_path.clone())
+            .collect();
 
         tx.execute(
             "
@@ -844,6 +870,7 @@ fn prepare_tadoku_batches_sync(
             description,
             duration_seconds,
             language_code: language_code.to_string(),
+            file_paths,
         });
     }
 
@@ -871,9 +898,15 @@ fn prepare_tadoku_batches_sync(
             description: row.get(2)?,
             duration_seconds: row.get(3)?,
             language_code: row.get(4)?,
+            file_paths: Vec::new(),
         })
     })?;
-    Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    let mut batches = rows.collect::<Result<Vec<_>, _>>()?;
+    drop(stmt);
+    for batch in &mut batches {
+        batch.file_paths = tadoku_batch_file_paths(&conn, &batch.batch_id)?;
+    }
+    Ok(batches)
 }
 
 fn refresh_pending_tadoku_batches(conn: &Connection, language_code: &str) -> anyhow::Result<()> {
@@ -950,6 +983,79 @@ fn list_tadoku_candidates_sync(
             .then_with(|| left.title.cmp(&right.title))
     });
     Ok(candidates)
+}
+
+fn set_tadoku_candidate_title_sync(
+    db_path: &Path,
+    history_id: &str,
+    title: Option<&str>,
+) -> anyhow::Result<()> {
+    let mut conn = open_connection(db_path)?;
+    let tx = conn
+        .transaction()
+        .context("Failed to start Tadoku title override transaction")?;
+    let original_title: String = tx
+        .query_row(
+            "SELECT title FROM media_history WHERE history_id = ?1",
+            [history_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .with_context(|| format!("Tadoku episode '{}' was not found", history_id))?;
+
+    match title.map(str::trim) {
+        Some(title) if title.is_empty() => bail!("Tadoku title cannot be empty"),
+        Some(title) if title.chars().count() > 500 => {
+            bail!("Tadoku title cannot be longer than 500 characters")
+        }
+        Some(title) if title != original_title => {
+            tx.execute(
+                "
+                INSERT INTO tadoku_episode_overrides (history_id, title, updated_at)
+                VALUES (?1, ?2, ?3)
+                ON CONFLICT(history_id) DO UPDATE SET
+                    title = excluded.title,
+                    updated_at = excluded.updated_at
+                ",
+                params![history_id, title, Utc::now().to_rfc3339()],
+            )?;
+        }
+        _ => {
+            tx.execute(
+                "DELETE FROM tadoku_episode_overrides WHERE history_id = ?1",
+                [history_id],
+            )?;
+        }
+    }
+
+    // Pending batches have not reached Tadoku yet. Unpack any batch containing
+    // this episode so the next sync rebuilds its description from the override.
+    let pending_batch: Option<String> = tx
+        .query_row(
+            "
+            SELECT teb.batch_id
+            FROM tadoku_export_items tei
+            JOIN tadoku_export_batches teb ON teb.batch_id = tei.batch_id
+            WHERE tei.history_id = ?1 AND teb.status = 'pending'
+            ",
+            [history_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(batch_id) = pending_batch {
+        tx.execute(
+            "UPDATE tadoku_export_batches SET status = 'superseded', updated_at = ?2 WHERE batch_id = ?1",
+            params![batch_id, Utc::now().to_rfc3339()],
+        )?;
+        tx.execute(
+            "DELETE FROM tadoku_export_items WHERE batch_id = ?1",
+            [batch_id],
+        )?;
+    }
+
+    tx.commit()
+        .context("Failed to commit Tadoku title override transaction")?;
+    Ok(())
 }
 
 fn decline_tadoku_candidates_sync(db_path: &Path, history_ids: &[String]) -> anyhow::Result<usize> {
@@ -1033,13 +1139,15 @@ fn query_pending_tadoku_batches(
             description: row.get(2)?,
             duration_seconds: row.get(3)?,
             language_code: row.get(4)?,
+            file_paths: Vec::new(),
         })
     })?;
     let batches = rows.collect::<Result<Vec<_>, _>>()?;
     drop(stmt);
 
     let mut result = Vec::with_capacity(batches.len());
-    for batch in batches {
+    for mut batch in batches {
+        batch.file_paths = tadoku_batch_file_paths(conn, &batch.batch_id)?;
         let mut item_stmt =
             conn.prepare("SELECT history_id FROM tadoku_export_items WHERE batch_id = ?1")?;
         let history_ids = item_stmt
@@ -1050,6 +1158,20 @@ fn query_pending_tadoku_batches(
     Ok(result)
 }
 
+fn tadoku_batch_file_paths(conn: &Connection, batch_id: &str) -> anyhow::Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "
+        SELECT mh.file_path
+        FROM tadoku_export_items tei
+        JOIN media_history mh ON mh.history_id = tei.history_id
+        WHERE tei.batch_id = ?1 AND mh.file_path IS NOT NULL AND mh.file_path != ''
+        ",
+    )?;
+    Ok(stmt
+        .query_map([batch_id], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?)
+}
+
 fn query_pending_tadoku_candidates(
     conn: &Connection,
     language_code: &str,
@@ -1058,16 +1180,19 @@ fn query_pending_tadoku_candidates(
         "
         SELECT
             media_history.history_id,
-            COALESCE(NULLIF(media_history.series_name, ''), media_history.title) AS show_name,
-            media_history.title,
+            COALESCE(NULLIF(media_history.series_name, ''), tadoku_episode_overrides.title, media_history.title) AS show_name,
+            COALESCE(tadoku_episode_overrides.title, media_history.title) AS episode_title,
             tadoku_export_items.watched_at,
             media_history.duration_ms,
-            tadoku_export_batches.last_error
+            tadoku_export_batches.last_error,
+            tadoku_episode_overrides.title IS NOT NULL AS title_overridden
         FROM tadoku_export_items
         JOIN tadoku_export_batches
           ON tadoku_export_batches.batch_id = tadoku_export_items.batch_id
         JOIN media_history
           ON media_history.history_id = tadoku_export_items.history_id
+        LEFT JOIN tadoku_episode_overrides
+          ON tadoku_episode_overrides.history_id = media_history.history_id
         WHERE tadoku_export_batches.status = 'pending'
           AND tadoku_export_batches.language_code = ?1
           AND NOT EXISTS (
@@ -1083,6 +1208,7 @@ fn query_pending_tadoku_candidates(
             history_id: row.get(0)?,
             series_name: row.get(1)?,
             title: row.get(2)?,
+            title_overridden: row.get(6)?,
             watched_at: row.get(3)?,
             duration_seconds: tadoku_duration_seconds(i128::from(duration_ms)),
             pending_retry: true,
@@ -1099,17 +1225,21 @@ fn query_tadoku_candidates(
     let mut stmt = conn.prepare(
         "
         SELECT
-            history_id,
-            COALESCE(NULLIF(series_name, ''), title) AS show_name,
-            title,
-            last_seen,
-            duration_ms
+            media_history.history_id,
+            COALESCE(NULLIF(media_history.series_name, ''), tadoku_episode_overrides.title, media_history.title) AS show_name,
+            COALESCE(tadoku_episode_overrides.title, media_history.title) AS episode_title,
+            media_history.last_seen,
+            media_history.duration_ms,
+            media_history.file_path,
+            tadoku_episode_overrides.title IS NOT NULL AS title_overridden
         FROM media_history
-        WHERE duration_ms IS NOT NULL
-          AND duration_ms > 0
-          AND last_position_ms > 0
-          AND last_position_ms * 100 >= duration_ms * 80
-          AND julianday(last_seen) >= julianday((
+        LEFT JOIN tadoku_episode_overrides
+          ON tadoku_episode_overrides.history_id = media_history.history_id
+        WHERE media_history.duration_ms IS NOT NULL
+          AND media_history.duration_ms > 0
+          AND media_history.last_position_ms > 0
+          AND media_history.last_position_ms * 100 >= media_history.duration_ms * 80
+          AND julianday(media_history.last_seen) >= julianday((
               SELECT value FROM app_metadata WHERE key = 'tadoku_candidate_cutoff'
           ))
           AND NOT EXISTS (
@@ -1144,12 +1274,15 @@ fn query_tadoku_candidates(
             row.get::<_, String>(2)?,
             row.get::<_, String>(3)?,
             row.get::<_, i64>(4)?,
+            row.get::<_, Option<String>>(5)?,
+            row.get::<_, bool>(6)?,
         ))
     })?;
     let mut seen_content = HashSet::new();
     let mut candidates = Vec::new();
     for row in rows {
-        let (history_id, series_name, title, watched_at, duration_ms) = row?;
+        let (history_id, series_name, title, watched_at, duration_ms, file_path, title_overridden) =
+            row?;
         let content_key = format!(
             "{}\u{1f}{}",
             series_name.trim().to_lowercase(),
@@ -1163,12 +1296,14 @@ fn query_tadoku_candidates(
                 history_id,
                 series_name,
                 title,
+                title_overridden,
                 watched_at,
                 duration_seconds: tadoku_duration_seconds(i128::from(duration_ms)),
                 pending_retry: false,
                 last_error: None,
             },
             duration_ms,
+            file_path,
         });
     }
     Ok(candidates)
@@ -1183,6 +1318,13 @@ fn tadoku_batch_description<'a>(
     titles: impl IntoIterator<Item = &'a str>,
 ) -> String {
     let titles = titles.into_iter().collect::<Vec<_>>();
+    if !titles.is_empty()
+        && titles
+            .iter()
+            .all(|title| title.trim().eq_ignore_ascii_case(series_name.trim()))
+    {
+        return series_name.to_string();
+    }
     let parsed = titles
         .iter()
         .map(|title| parse_episode_number(series_name, title))
@@ -1242,7 +1384,19 @@ fn parse_episode_number(series_name: &str, title: &str) -> Option<(u32, u32)> {
     if season.is_empty() || episode.is_empty() || !season.chars().all(|c| c.is_ascii_digit()) {
         return None;
     }
-    Some((season.parse().ok()?, episode.parse().ok()?))
+    let season = season.parse().ok()?;
+    let mut episode = episode.parse().ok()?;
+    if episode == 0 && (1900..=9999).contains(&season) {
+        let episode_name = episode_and_title[episode_end..].trim_start();
+        let episode_name = episode_name
+            .strip_prefix('-')
+            .unwrap_or(episode_name)
+            .trim();
+        episode = crate::media_server::episode_number_from_name(episode_name)
+            .filter(|episode| *episode > 0)
+            .unwrap_or(episode);
+    }
+    Some((season, episode))
 }
 
 fn load_history_map(conn: &Connection) -> anyhow::Result<HashMap<String, HistoryEntry>> {
@@ -1568,7 +1722,7 @@ fn parse_timestamp(raw: &str) -> Result<DateTime<Utc>, std::io::Error> {
 mod tests {
     use super::{
         decline_tadoku_candidates_sync, list_tadoku_candidates_sync, open_connection,
-        prepare_tadoku_batches_sync, save_session_history_sync,
+        prepare_tadoku_batches_sync, save_session_history_sync, set_tadoku_candidate_title_sync,
     };
     use crate::config::MediaServerKind;
     use crate::session::HistoryEntry;
@@ -1600,13 +1754,16 @@ mod tests {
         ));
         drop(open_connection(&path).unwrap());
         let mut history = HashMap::new();
-        history.insert("plex|1".to_string(), history_entry("1", "Frieren", 90_001));
+        let mut first_episode = history_entry("1", "Frieren", 90_001);
+        first_episode.file_path = Some("/media/Anime/Frieren/episode01.mkv".to_string());
+        history.insert("plex|1".to_string(), first_episode);
         history.insert("plex|2".to_string(), history_entry("2", "Frieren", 90_000));
         history.insert("plex|3".to_string(), history_entry("3", "Frieren", 50_000));
         let mut duplicate = history_entry("1", "Frieren", 90_001);
         duplicate.history_id = "jellyfin|copy-of-1".to_string();
         duplicate.server_kind = MediaServerKind::Jellyfin;
         duplicate.item_id = "copy-of-1".to_string();
+        duplicate.file_path = Some("/media/Anime/Frieren/episode01.mkv".to_string());
         history.insert(duplicate.history_id.clone(), duplicate);
         save_session_history_sync(&path, &history, None).unwrap();
 
@@ -1615,6 +1772,12 @@ mod tests {
         assert_eq!(first[0].series_name, "Frieren");
         assert_eq!(first[0].duration_seconds, 200);
         assert_eq!(first[0].description, "Frieren — Episode 1; Episode 2");
+        assert!(
+            first[0]
+                .file_paths
+                .iter()
+                .any(|path| path.contains("Anime"))
+        );
         assert!(!first[0].description.contains("Nagare:"));
 
         let conn = open_connection(&path).unwrap();
@@ -1731,6 +1894,55 @@ mod tests {
         );
         assert_eq!(description, "NARUTO 疾風伝 S10E10-13");
         assert!(!description.contains("Nagare:"));
+    }
+
+    #[test]
+    fn tadoku_description_recovers_date_based_episode_number_from_name() {
+        let description = super::tadoku_batch_description(
+            "水曜日のダウンタウン",
+            ["水曜日のダウンタウン S2014E00 - Episode 002"],
+        );
+        assert_eq!(description, "水曜日のダウンタウン S2014E02");
+    }
+
+    #[test]
+    fn tadoku_description_does_not_repeat_a_title_used_as_the_series_fallback() {
+        let description =
+            super::tadoku_batch_description("Monster House - E2", ["Monster House - E2"]);
+        assert_eq!(description, "Monster House - E2");
+    }
+
+    #[test]
+    fn tadoku_title_override_is_used_for_candidates_and_batches() {
+        let path = std::env::temp_dir().join(format!(
+            "nagare-tadoku-title-override-test-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        drop(open_connection(&path).unwrap());
+
+        let mut episode = history_entry("monster-house-2", "", 90_000);
+        episode.title = "Monster House - E2".to_string();
+        episode.series_name = None;
+        let history = HashMap::from([(episode.history_id.clone(), episode)]);
+        save_session_history_sync(&path, &history, None).unwrap();
+
+        set_tadoku_candidate_title_sync(
+            &path,
+            "plex|monster-house-2",
+            Some("Monster House Episode 2"),
+        )
+        .unwrap();
+        let candidates = list_tadoku_candidates_sync(&path, "jpn").unwrap();
+        assert_eq!(candidates[0].title, "Monster House Episode 2");
+        assert_eq!(candidates[0].series_name, "Monster House Episode 2");
+        assert!(candidates[0].title_overridden);
+
+        let selected = HashSet::from(["plex|monster-house-2".to_string()]);
+        let batches =
+            prepare_tadoku_batches_sync(&path, "2026-07-17", "jpn", Some(&selected)).unwrap();
+        assert_eq!(batches[0].description, "Monster House Episode 2");
+
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -1857,9 +2069,11 @@ mod tests {
             .unwrap();
         assert_eq!(status, "declined");
         drop(conn);
-        assert!(list_tadoku_candidates_sync(&path, "jpn")
-            .unwrap()
-            .is_empty());
+        assert!(
+            list_tadoku_candidates_sync(&path, "jpn")
+                .unwrap()
+                .is_empty()
+        );
         std::fs::remove_file(path).unwrap();
     }
 
@@ -1881,8 +2095,7 @@ mod tests {
         let batches = prepare_tadoku_batches_sync(&path, "2026-07-12", "jpn", None).unwrap();
         assert_eq!(batches.len(), 1);
 
-        let declined =
-            decline_tadoku_candidates_sync(&path, &["plex|1".to_string()]).unwrap();
+        let declined = decline_tadoku_candidates_sync(&path, &["plex|1".to_string()]).unwrap();
         assert_eq!(declined, 1);
 
         let candidates = list_tadoku_candidates_sync(&path, "jpn").unwrap();

@@ -4,6 +4,7 @@
     activeHistoryItemId,
     audioEndOffset,
     audioStartOffset,
+    alwaysReuseMiningAssets,
     autoApprove,
     currentView,
     defaultGenerateAvif,
@@ -44,6 +45,9 @@
   let lastCardKey = null;
   let submitting = false;
   let lastAutoApprovedCardKey = null;
+  let lastMinedLine = null;
+  let reusePrompt = false;
+  let alwaysReuseFromPrompt = false;
 
   // Track which subtitle lines are included in the current selection
   // (the original matched line index + any appended prev/next lines)
@@ -59,6 +63,19 @@
   $: activeLine = $activeHistoryItemId
     ? ($subtitles[selectedHistoryMatch?.line_index ?? storedAnchorLineIndex ?? -1] || null)
     : (matchedLine || nearestFallback);
+
+  $: activeLineKey = activeLine
+    ? `${activeLine.start_ms}:${activeLine.end_ms}:${activeLine.text}`
+    : null;
+  $: isSameAsLastMine = Boolean(
+    card
+    && !isRouteCard
+    && card.source === 'pending'
+    && activeLineKey
+    && lastMinedLine
+    && lastMinedLine.itemId === mediaItemId
+    && lastMinedLine.lineKey === activeLineKey
+  );
 
   // Context lines showing included range highlighted
   $: contextLines = getContextLines(anchorLineIndex, includedLineFirst, includedLineLast, $subtitles);
@@ -178,6 +195,8 @@
     endMs = card.end_ms ?? 0;
     generateAvif = card.generate_avif ?? $defaultGenerateAvif;
     submitting = false;
+    reusePrompt = false;
+    alwaysReuseFromPrompt = false;
     cleanupAudio();
     cleanupScreenshot();
     if ($activeHistoryItemId && matchedIndex == null && includedLineFirst == null) {
@@ -321,8 +340,19 @@
     submitting = false;
   }
 
-  async function handleConfirm() {
+  async function handleConfirm(reuseAssetsFromNoteId = undefined) {
     if (!card || submitting) return;
+
+    if (isSameAsLastMine && reuseAssetsFromNoteId === undefined) {
+      if ($alwaysReuseMiningAssets) {
+        reuseAssetsFromNoteId = lastMinedLine.noteId;
+      } else {
+        reusePrompt = true;
+        alwaysReuseFromPrompt = false;
+        return;
+      }
+    }
+
     const noteId = card.event.note_id;
     const payload = {
       noteId,
@@ -335,7 +365,12 @@
       matchedLineIndex: matchedIndex,
       includedLineFirst,
       includedLineLast,
+      reuseAssetsFromNoteId,
     };
+
+    if (card.source === 'pending' && activeLineKey) {
+      lastMinedLine = { noteId, itemId: mediaItemId, lineKey: activeLineKey };
+    }
 
     console.log('[EnrichDialog] Confirming note', noteId, payload);
 
@@ -350,6 +385,7 @@
   async function handleSkip() {
     if (!card || submitting) return;
     submitting = true;
+    reusePrompt = false;
     if (pausedByDialog) {
       firePlayPause(false);
       pausedByDialog = false;
@@ -364,6 +400,11 @@
       closeRouteDialog(isHistoryCard);
     }
     submitting = false;
+  }
+
+  function confirmAssetReuse() {
+    if (alwaysReuseFromPrompt) alwaysReuseMiningAssets.set(true);
+    handleConfirm(lastMinedLine?.noteId ?? null);
   }
 
   // ── Audio preview ──
@@ -536,7 +577,24 @@
   });
 </script>
 
-{#if card && !shouldAutoApprovePending}
+{#if card && reusePrompt}
+  <div class="overlay reuse-overlay">
+    <div class="reuse-dialog" role="dialog" aria-modal="true" aria-labelledby="reuse-title">
+      <h2 id="reuse-title">Re-use mining assets?</h2>
+      <p>This is the same subtitle line as your previous mine. You can re-use its audio and image instead of generating them again.</p>
+      <label class="checkbox-label always-reuse-toggle">
+        <input type="checkbox" bind:checked={alwaysReuseFromPrompt} />
+        Always re-use assets for consecutive mines of the same line
+      </label>
+      <div class="actions reuse-actions">
+        <button on:click={() => handleConfirm(null)}>Generate New</button>
+        <button class="primary" on:click={confirmAssetReuse}>Re-use Assets</button>
+      </div>
+    </div>
+  </div>
+{/if}
+
+{#if card && !shouldAutoApprovePending && !reusePrompt}
   <div class="overlay">
     <div class="dialog">
       <div class="dialog-header">
@@ -714,7 +772,7 @@
         <button on:click={handleSkip} disabled={submitting}>
           {card.source === 'pending' ? 'Skip' : 'Close'}
         </button>
-        <button class="primary" on:click={handleConfirm} disabled={submitting}>
+        <button class="primary" on:click={() => handleConfirm()} disabled={submitting}>
           {submitting ? 'Saving...' : (isHistoryCard ? 'Save Changes' : 'Confirm & Enrich')}
         </button>
       </div>
@@ -732,6 +790,39 @@
     justify-content: center;
     z-index: 1000;
     padding: 1rem;
+  }
+
+  .reuse-overlay {
+    z-index: 1100;
+  }
+
+  .reuse-dialog {
+    width: min(460px, calc(100vw - 2rem));
+    border-radius: 12px;
+    background: var(--bg-card, #1f2937);
+    padding: 1.25rem;
+    box-shadow: 0 20px 60px rgba(0, 0, 0, 0.45);
+  }
+
+  .reuse-dialog h2 {
+    margin: 0 0 0.65rem;
+  }
+
+  .reuse-dialog p {
+    margin: 0 0 1rem;
+    color: var(--text-secondary, #cbd5e1);
+    line-height: 1.45;
+  }
+
+  .always-reuse-toggle {
+    margin-bottom: 1.1rem;
+  }
+
+  .reuse-actions {
+    position: static;
+    padding: 0;
+    border: 0;
+    background: transparent;
   }
 
   .dialog {

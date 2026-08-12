@@ -8,10 +8,11 @@
     refreshTadokuLogin,
     clearTadokuLogin,
     getTadokuCandidates,
+    updateTadokuCandidateTitle,
     syncTadokuCandidates,
     declineTadokuCandidates,
   } from './api.js';
-  import { applyMiningConfig, autoApprove, pauseOnEnhance, showNativeSubtitles, showDownloadButton, showErrorToast, showToast } from './stores.js';
+  import { alwaysReuseMiningAssets, applyMiningConfig, autoApprove, pauseOnEnhance, showNativeSubtitles, showDownloadButton, showErrorToast, showToast } from './stores.js';
 
   const AUTO_APPROVE_STORAGE_KEY = 'opt_autoApprove';
   const AUTO_SAVE_DELAY_MS = 700;
@@ -31,6 +32,9 @@
   let decliningTadoku = false;
   let tadokuCandidates = [];
   let selectedTadokuIds = [];
+  let editingTadokuId = null;
+  let tadokuTitleDraft = '';
+  let savingTadokuTitle = false;
   let activeTab = 'server';
 
   const TABS = [
@@ -67,7 +71,7 @@
   let serverUsers = {};
 
   function createServerConfig(kind) {
-    return kind === 'plex'
+    return kind === 'plex' || kind === 'audiobookshelf'
       ? { enabled: false, url: '', token: '', users: [] }
       : { enabled: false, url: '', api_key: '', users: [] };
   }
@@ -77,7 +81,8 @@
     config.emby = config.emby || createServerConfig('emby');
     config.jellyfin = config.jellyfin || createServerConfig('jellyfin');
     config.plex = config.plex || createServerConfig('plex');
-    for (const kind of ['emby', 'jellyfin', 'plex']) {
+    config.audiobookshelf = config.audiobookshelf || createServerConfig('audiobookshelf');
+    for (const kind of ['emby', 'jellyfin', 'plex', 'audiobookshelf']) {
       if (!Array.isArray(config[kind].users)) config[kind].users = [];
     }
     if (!config.anki) config.anki = {};
@@ -98,6 +103,9 @@
     delete config.tadoku.session_cookie;
     if (config.tadoku.language_code == null) config.tadoku.language_code = config.target_language || 'jpn';
     if (config.tadoku.export_hour_eastern == null) config.tadoku.export_hour_eastern = 20;
+    if (!Array.isArray(config.tadoku.path_tag_rules)) {
+      config.tadoku.path_tag_rules = [{ contains: 'anime', tag: 'anime' }];
+    }
     const obsoleteTadokuUrls = [
       '',
       'https://tadoku.app/api/immersion',
@@ -140,7 +148,7 @@
   }
 
   async function loadServerUsers() {
-    const kinds = ['emby', 'jellyfin', 'plex'].filter((k) => config[k]?.enabled);
+    const kinds = ['emby', 'jellyfin', 'plex', 'audiobookshelf'].filter((k) => config[k]?.enabled);
     if (kinds.length === 0) {
       showErrorToast('Enable a server connection first');
       return;
@@ -187,6 +195,17 @@
 
   function removePathMapping(index) {
     config.path_mappings = config.path_mappings.filter((_, i) => i !== index);
+  }
+
+  function addTadokuPathTagRule() {
+    config.tadoku.path_tag_rules = [
+      ...config.tadoku.path_tag_rules,
+      { contains: '', tag: '' },
+    ];
+  }
+
+  function removeTadokuPathTagRule(index) {
+    config.tadoku.path_tag_rules = config.tadoku.path_tag_rules.filter((_, i) => i !== index);
   }
 
   // Tag input helpers
@@ -389,6 +408,36 @@
     }
   }
 
+  function editTadokuTitle(candidate) {
+    editingTadokuId = candidate.history_id;
+    tadokuTitleDraft = candidate.title;
+  }
+
+  function cancelTadokuTitleEdit() {
+    editingTadokuId = null;
+    tadokuTitleDraft = '';
+  }
+
+  async function saveTadokuTitle(candidate, reset = false) {
+    const title = reset ? null : tadokuTitleDraft.trim();
+    if (!reset && !title) {
+      showErrorToast('Tadoku title cannot be empty');
+      return;
+    }
+    savingTadokuTitle = true;
+    try {
+      const result = await updateTadokuCandidateTitle(candidate.history_id, title);
+      if (!result.ok) throw new Error(result.error || 'Could not save title');
+      showToast('success', reset ? 'Tadoku title reset' : 'Tadoku title saved');
+      cancelTadokuTitleEdit();
+      await loadTadokuCandidates();
+    } catch (e) {
+      showErrorToast('Failed to update Tadoku title: ' + e.message);
+    } finally {
+      savingTadokuTitle = false;
+    }
+  }
+
   async function syncTadokuEpisodes(historyIds) {
     if (historyIds.length === 0 || syncingTadoku || decliningTadoku) return;
     syncingTadoku = true;
@@ -432,8 +481,9 @@
   }
 
   function formatTadokuDuration(durationSeconds) {
-    const minutes = Math.max(1, Math.round((durationSeconds || 0) / 60));
-    return `${minutes} ${minutes === 1 ? 'minute' : 'minutes'}`;
+    const seconds = Math.max(1, durationSeconds || 0);
+    const minutes = Math.ceil(seconds / 6) / 10;
+    return `${minutes.toFixed(1)} ${minutes === 1 ? 'minute' : 'minutes'}`;
   }
 
   function formatTadokuDate(value) {
@@ -510,7 +560,7 @@
     <!-- ── Media Servers ────────────────────────────── -->
     <section class="section">
       <h2>Media Servers</h2>
-      <p class="hint">Configure each service separately. You can enable one, two, or all three at the same time.</p>
+      <p class="hint">Configure each service separately. Any combination can be enabled at the same time.</p>
 
       <div class="server-card" class:enabled={config.emby.enabled}>
         <div class="server-head">
@@ -625,6 +675,45 @@
         </div>
         {#if config.plex.enabled}{@render userSelector('plex')}{/if}
       </div>
+
+      <div class="server-card" class:enabled={config.audiobookshelf.enabled}>
+        <div class="server-head">
+          <div>
+            <h3>AudioBookShelf</h3>
+            <p class="hint">Estimated live position · local MP3/M4B sidecars</p>
+          </div>
+          <label class="toggle">
+            <input
+              type="checkbox"
+              checked={config.audiobookshelf.enabled}
+              on:change={(e) => toggleServer('audiobookshelf', e.target.checked)}
+            />
+            <span>Enabled</span>
+          </label>
+        </div>
+        <div class="field">
+          <label for="audiobookshelf-url">Server URL</label>
+          <input
+            id="audiobookshelf-url"
+            type="url"
+            placeholder="http://192.168.1.44:13378"
+            value={config.audiobookshelf.url}
+            on:input={(e) => updateServerField('audiobookshelf', 'url', e.target.value)}
+          />
+        </div>
+        <div class="field">
+          <label for="audiobookshelf-token">Admin API Token</label>
+          <input
+            id="audiobookshelf-token"
+            type="password"
+            placeholder="Your AudioBookShelf admin token"
+            value={config.audiobookshelf.token}
+            on:input={(e) => updateServerField('audiobookshelf', 'token', e.target.value)}
+          />
+          <p class="hint">An admin token is required because ABS restricts open-session discovery to administrators.</p>
+        </div>
+        {#if config.audiobookshelf.enabled}{@render userSelector('audiobookshelf')}{/if}
+      </div>
     </section>
 
     <!-- ── General ──────────────────────────────────── -->
@@ -693,10 +782,9 @@
           <span>Send all ready episodes once per day.</span>
         </button>
       </div>
-      <p class="hint">Episodes are ready at 80% watched and can only be synced once. Durations round up to the next whole minute.</p>
+      <p class="hint">Episodes are ready at 80% watched and can only be synced once. Durations round up to the next tenth of a minute.</p>
     </section>
 
-    {#if !config.tadoku.enabled}
     <section class="section">
       <div class="tadoku-review-heading">
         <div>
@@ -715,23 +803,54 @@
       {:else}
         <div class="tadoku-candidate-list">
           {#each tadokuCandidates as candidate}
-            <label class="tadoku-candidate">
+            <div class="tadoku-candidate">
               <input
                 type="checkbox"
+                aria-label={`Select ${candidate.title}`}
                 checked={selectedTadokuIds.includes(candidate.history_id)}
-                disabled={syncingTadoku || decliningTadoku}
+                disabled={syncingTadoku || decliningTadoku || savingTadokuTitle}
                 on:change={(event) => toggleTadokuCandidate(candidate.history_id, event.currentTarget.checked)}
               />
               <span class="tadoku-candidate-copy">
-                <strong>
-                  {candidate.title}
-                  {#if candidate.pending_retry}<em>Retry</em>{/if}
-                </strong>
+                {#if editingTadokuId === candidate.history_id}
+                  <input
+                    class="tadoku-title-input"
+                    type="text"
+                    maxlength="500"
+                    aria-label="Tadoku log title"
+                    bind:value={tadokuTitleDraft}
+                    on:keydown={(event) => {
+                      if (event.key === 'Enter') saveTadokuTitle(candidate);
+                      if (event.key === 'Escape') cancelTadokuTitleEdit();
+                    }}
+                  />
+                  <span class="tadoku-title-actions">
+                    <button type="button" class="btn-small" disabled={savingTadokuTitle} on:click={() => saveTadokuTitle(candidate)}>Save</button>
+                    <button type="button" class="btn-small" disabled={savingTadokuTitle} on:click={cancelTadokuTitleEdit}>Cancel</button>
+                    {#if candidate.title_overridden}
+                      <button type="button" class="btn-small tadoku-title-reset" disabled={savingTadokuTitle} on:click={() => saveTadokuTitle(candidate, true)}>Reset</button>
+                    {/if}
+                  </span>
+                {:else}
+                  <strong>
+                    {candidate.title}
+                    {#if candidate.title_overridden}<em>Edited</em>{/if}
+                    {#if candidate.pending_retry}<em>Retry</em>{/if}
+                  </strong>
+                {/if}
                 <span>{candidate.series_name} · {formatTadokuDuration(candidate.duration_seconds)}</span>
                 <small>Completed {formatTadokuDate(candidate.watched_at)}</small>
                 {#if candidate.last_error}<small class="error-text">Last attempt: {candidate.last_error}</small>{/if}
               </span>
-            </label>
+              {#if editingTadokuId !== candidate.history_id}
+                <button
+                  type="button"
+                  class="btn-small tadoku-title-edit"
+                  disabled={syncingTadoku || decliningTadoku || savingTadokuTitle}
+                  on:click={() => editTadokuTitle(candidate)}
+                >Edit title</button>
+              {/if}
+            </div>
           {/each}
         </div>
         <div class="tadoku-review-actions">
@@ -761,7 +880,20 @@
         <p class="hint tadoku-decline-hint">Declined episodes stay in Nagare history and will never be sent to Tadoku.</p>
       {/if}
     </section>
-    {/if}
+
+    <section class="section">
+      <h2>Tags from File Paths</h2>
+      <p class="hint">Add a Tadoku tag when an episode's file path contains matching text (case-insensitive).</p>
+      {#each config.tadoku.path_tag_rules as rule, i}
+        <div class="mapping-row">
+          <input type="text" placeholder="Path contains (e.g. anime)" bind:value={rule.contains} />
+          <span class="arrow">→</span>
+          <input type="text" placeholder="Tadoku tag" bind:value={rule.tag} />
+          <button class="btn-icon" on:click={() => removeTadokuPathTagRule(i)} title="Remove">✕</button>
+        </div>
+      {/each}
+      <button class="btn-small" on:click={addTadokuPathTagRule}>+ Add Rule</button>
+    </section>
 
     <section class="section">
       <h2>Tadoku Connection</h2>
@@ -1019,6 +1151,12 @@
         <div class="checkbox-row">
           <input id="pause-on-enhance" type="checkbox" bind:checked={$pauseOnEnhance} />
           <label for="pause-on-enhance">Pause playback when the Anki enhance screen opens</label>
+        </div>
+      </div>
+      <div class="field">
+        <div class="checkbox-row">
+          <input id="always-reuse-assets" type="checkbox" bind:checked={$alwaysReuseMiningAssets} />
+          <label for="always-reuse-assets">Always re-use audio and images when mining the same subtitle line twice in a row</label>
         </div>
       </div>
     </section>
@@ -1315,12 +1453,13 @@
     background: var(--bg-hover);
   }
 
-  .tadoku-candidate input {
+  .tadoku-candidate > input {
     margin-top: 0.2rem;
   }
 
   .tadoku-candidate-copy {
     display: flex;
+    flex: 1;
     min-width: 0;
     flex-direction: column;
     gap: 0.1rem;
@@ -1330,6 +1469,31 @@
   .tadoku-candidate-copy > span,
   .tadoku-candidate-copy small {
     color: var(--text-secondary);
+  }
+
+  .tadoku-title-input {
+    width: 100%;
+  }
+
+  .tadoku-title-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.35rem;
+    margin-top: 0.25rem;
+  }
+
+  .tadoku-title-actions .btn-small,
+  .tadoku-title-edit {
+    padding: 0.25rem 0.5rem;
+    font-size: 0.7rem;
+  }
+
+  .tadoku-title-edit {
+    flex: 0 0 auto;
+  }
+
+  .tadoku-title-reset {
+    color: var(--danger, #e5534b);
   }
 
   .tadoku-candidate-copy em {

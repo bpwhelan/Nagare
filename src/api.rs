@@ -13,8 +13,8 @@ use crate::session::{
     scoped_history_id, split_scoped_id,
 };
 use crate::subtitle::{SubtitleTrack, find_all_matching_lines, find_matching_line};
-use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{get, post, put};
@@ -43,6 +43,7 @@ pub struct AppState {
     pub anki_event_tx: mpsc::Sender<AnkiBeaconEvent>,
     pub enhancement_queue: Arc<RwLock<Vec<EnhancementQueueItem>>>,
     pub enhancement_tx: mpsc::Sender<EnhancementJob>,
+    pub reusable_assets: Arc<RwLock<HashMap<i64, ReusableAssets>>>,
     pub session_rx: watch::Receiver<SessionState>,
     pub new_card_tx: broadcast::Sender<EnrichmentDialogState>,
     pub subtitles: Arc<RwLock<Option<SubtitleTrack>>>,
@@ -90,9 +91,16 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/config", get(get_config))
         .route("/api/config", put(update_config))
         .route("/api/tadoku/test", post(test_tadoku_connection))
-        .route("/api/tadoku/auth/refresh", post(refresh_tadoku_authentication))
+        .route(
+            "/api/tadoku/auth/refresh",
+            post(refresh_tadoku_authentication),
+        )
         .route("/api/tadoku/auth/clear", post(clear_tadoku_authentication))
         .route("/api/tadoku/candidates", get(get_tadoku_candidates))
+        .route(
+            "/api/tadoku/candidates/{history_id}",
+            put(update_tadoku_candidate),
+        )
         .route("/api/tadoku/sync", post(sync_tadoku_candidates))
         .route("/api/tadoku/decline", post(decline_tadoku_candidates))
         .route("/api/users", get(get_server_users))
@@ -167,6 +175,11 @@ async fn active_subtitle_data(state: &Arc<AppState>) -> SubtitleData {
         .as_ref()
         .map(|now_playing| now_playing.subtitle_selection_mode)
         .unwrap_or(SubtitleSelectionMode::Auto);
+    let loading = session_state
+        .now_playing
+        .as_ref()
+        .map(|now_playing| now_playing.subtitle_loading)
+        .unwrap_or(false);
     let subtitle_offset_ms = track.as_ref().map(|t| t.offset_ms).unwrap_or(0);
     let lines = track.map(|track| track.lines).unwrap_or_default();
     let count = lines.len();
@@ -188,6 +201,7 @@ async fn active_subtitle_data(state: &Arc<AppState>) -> SubtitleData {
         selected_candidate_id,
         selection_mode,
         subtitle_offset_ms,
+        loading,
     }
 }
 
@@ -206,6 +220,7 @@ fn history_subtitle_data(track: Option<SubtitleTrack>) -> SubtitleData {
         selected_candidate_id: None,
         selection_mode: SubtitleSelectionMode::Auto,
         subtitle_offset_ms,
+        loading: false,
     }
 }
 
@@ -408,6 +423,17 @@ pub(crate) struct EnrichRequest {
     /// Optional: enrich from a history item instead of the live session.
     /// Despite the legacy field name, this is a scoped history id.
     item_id: Option<String>,
+    /// Re-use the already-generated audio and picture from an earlier mine in
+    /// this process. The cache is deliberately session-only.
+    #[serde(default)]
+    reuse_assets_from_note_id: Option<i64>,
+}
+
+#[derive(Clone)]
+pub(crate) struct ReusableAssets {
+    audio_html: String,
+    picture_html: String,
+    clear_picture: bool,
 }
 
 #[derive(Serialize)]
@@ -612,8 +638,8 @@ async fn prepare_enrichment_candidate(
     if let Some(np) = now_playing.as_ref() {
         let subtitles = state.subtitles.read().await;
         if let Some(track) = subtitles.as_ref() {
-            let line = find_matching_line(track, &event.sentence, np.position_ms, 30_000).or_else(
-                || {
+            let line =
+                find_matching_line(track, &event.sentence, np.position_ms, 30_000).or_else(|| {
                     // Fall back to a global match across the whole track —
                     // accept whenever subs are loaded and a match exists,
                     // regardless of the reported playback position.
@@ -621,8 +647,7 @@ async fn prepare_enrichment_candidate(
                         .first()
                         .filter(|(_, score)| *score > 0.6)
                         .map(|&(idx, _)| idx)
-                },
-            );
+                });
             if let Some(idx) = line {
                 matched = Some((idx, Some(np.history_id.clone())));
             }
@@ -974,22 +999,28 @@ async fn save_mining_history_entry(
 async fn generate_and_store_screenshot(
     anki_client: &Arc<AnkiClient>,
     source: &str,
-    item_id: &str,
-    time_ms: i64,
+    media_name: &str,
+    episode_code: Option<&str>,
+    chapter_title: Option<&str>,
+    capture_time_ms: i64,
+    line_time_ms: i64,
     note_id: i64,
     static_format: crate::config::StaticScreenshotFormat,
 ) -> Option<String> {
     info!(
         "[enhance {}] Capturing screenshot fallback at {}ms...",
-        note_id, time_ms
+        note_id, capture_time_ms
     );
-    match media::generate_screenshot(source, time_ms, static_format).await {
+    match media::generate_screenshot(source, capture_time_ms, static_format).await {
         Ok(image) => {
-            let ss_filename = format!(
-                "nagare_{}_{}_ss.{}",
-                item_id,
-                time_ms,
-                image.format.extension()
+            let ss_filename = anki_media_filename(
+                media_name,
+                episode_code,
+                chapter_title,
+                line_time_ms,
+                note_id,
+                Some("ss"),
+                image.format.extension(),
             );
             let ss_b64 = media::to_base64(&image.data);
             let picture_html = match anki_client.store_media_file(&ss_filename, &ss_b64).await {
@@ -1018,6 +1049,35 @@ async fn generate_and_store_screenshot(
     }
 }
 
+async fn wait_for_reusable_assets(
+    state: &Arc<AppState>,
+    source_note_id: i64,
+) -> Option<ReusableAssets> {
+    loop {
+        if let Some(assets) = state
+            .reusable_assets
+            .read()
+            .await
+            .get(&source_note_id)
+            .cloned()
+        {
+            return Some(assets);
+        }
+
+        let source_still_processing = state
+            .enhancement_queue
+            .read()
+            .await
+            .iter()
+            .any(|item| item.note_id == source_note_id);
+        if !source_still_processing {
+            return None;
+        }
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 /// Sanitize a string into a single Anki tag component. Anki separates tags by
 /// whitespace and nests them with `::`, so collapse whitespace to underscores
 /// and neutralize stray colons that would otherwise create unintended nesting.
@@ -1027,6 +1087,170 @@ fn sanitize_tag_component(value: &str) -> String {
         .collect::<Vec<_>>()
         .join("_")
         .replace(':', "_")
+}
+
+fn media_filename_component(value: &str) -> String {
+    const MAX_CHARS: usize = 64;
+
+    let mut component = String::with_capacity(value.len().min(MAX_CHARS));
+    let mut kept = 0;
+    let mut separator_pending = false;
+    for character in value.trim().chars() {
+        let is_separator = character.is_whitespace()
+            || character.is_control()
+            || matches!(
+                character,
+                '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*'
+            );
+        if is_separator {
+            separator_pending = !component.is_empty();
+            continue;
+        }
+        if kept >= MAX_CHARS {
+            break;
+        }
+        if separator_pending && !component.ends_with('_') {
+            component.push('_');
+        }
+        separator_pending = false;
+        component.push(character);
+        kept += 1;
+    }
+
+    component
+        .trim_matches(|character| matches!(character, '.' | '_'))
+        .to_string()
+}
+
+fn media_timestamp(time_ms: i64) -> String {
+    let total_ms = time_ms.max(0);
+    let milliseconds = total_ms % 1000;
+    let total_seconds = total_ms / 1000;
+    let seconds = total_seconds % 60;
+    let total_minutes = total_seconds / 60;
+    let minutes = total_minutes % 60;
+    let hours = total_minutes / 60;
+    format!("{hours:02}-{minutes:02}-{seconds:02}-{milliseconds:03}")
+}
+
+fn episode_code_from_title(title: &str) -> Option<String> {
+    title.split_whitespace().find_map(|token| {
+        let token = token.trim_matches(|character: char| !character.is_ascii_alphanumeric());
+        let upper = token.to_ascii_uppercase();
+        let body = upper.strip_prefix('S')?;
+        let (season, episode) = body.split_once('E')?;
+        if season.is_empty()
+            || episode.is_empty()
+            || !season.chars().all(|character| character.is_ascii_digit())
+            || !episode.chars().all(|character| character.is_ascii_digit())
+        {
+            return None;
+        }
+        Some(format!(
+            "S{:02}E{:02}",
+            season.parse::<u32>().ok()?,
+            episode.parse::<u32>().ok()?
+        ))
+    })
+}
+
+/// Build a readable, Windows-safe Anki media filename from the series/title,
+/// episode or audiobook chapter, exact subtitle-line time, and unique note ID.
+fn anki_media_filename(
+    media_name: &str,
+    episode_code: Option<&str>,
+    chapter_title: Option<&str>,
+    time_ms: i64,
+    unique_id: i64,
+    suffix: Option<&str>,
+    extension: &str,
+) -> String {
+    let mut stem = media_filename_component(media_name);
+    if stem.is_empty() {
+        stem.push_str("media");
+    }
+    let episode_or_chapter = episode_code
+        .map(media_filename_component)
+        .filter(|component| !component.is_empty())
+        .or_else(|| {
+            chapter_title
+                .map(media_filename_component)
+                .filter(|component| !component.is_empty())
+        });
+    if let Some(component) = episode_or_chapter {
+        stem.push('_');
+        stem.push_str(&component);
+    }
+    stem.push('_');
+    stem.push_str(&media_timestamp(time_ms));
+    stem.push('_');
+    stem.push_str(&unique_id.to_string());
+
+    match suffix {
+        Some(suffix) => format!("{stem}_{suffix}.{extension}"),
+        None => format!("{stem}.{extension}"),
+    }
+}
+
+#[cfg(test)]
+mod media_filename_tests {
+    use super::{anki_media_filename, episode_code_from_title};
+
+    #[test]
+    fn uses_series_episode_line_time_and_unique_note_id_for_video() {
+        assert_eq!(
+            episode_code_from_title("The Apothecary Diaries S01E21 - How to Buy Out a Contract")
+                .as_deref(),
+            Some("S01E21")
+        );
+        assert_eq!(
+            anki_media_filename(
+                "The Apothecary Diaries",
+                Some("S01E21"),
+                None,
+                83_456,
+                1_786_507_682_038,
+                None,
+                "opus"
+            ),
+            "The_Apothecary_Diaries_S01E21_00-01-23-456_1786507682038.opus"
+        );
+    }
+
+    #[test]
+    fn uses_readable_series_chapter_and_line_time_for_audiobooks() {
+        assert_eq!(
+            anki_media_filename(
+                "陰の実力者になりたくて！",
+                None,
+                Some("チャプター 2"),
+                83_456,
+                1_786_507_682_038,
+                None,
+                "opus"
+            ),
+            "陰の実力者になりたくて！_チャプター_2_00-01-23-456_1786507682038.opus"
+        );
+    }
+
+    #[test]
+    fn replaces_windows_reserved_characters() {
+        let filename = anki_media_filename(
+            "Series:/\\*?\"<>| あ",
+            None,
+            None,
+            500,
+            123,
+            Some("ss"),
+            "webp",
+        );
+        assert_eq!(filename, "Series_あ_00-00-00-500_123_ss.webp");
+        assert!(
+            !filename
+                .chars()
+                .any(|character| "\\/:*?\"<>|".contains(character))
+        );
+    }
 }
 
 async fn perform_enrichment(
@@ -1058,139 +1282,201 @@ async fn perform_enrichment(
         info!("[enhance {}] Reading anki client...", note_id);
         let anki_client = state.anki_client.read().await.clone();
 
-        info!("[enhance {}] Resolving media source...", note_id);
-        let source = media::resolve_media_source(
-            &config,
-            server_opt.as_deref(),
-            &media_ctx.item_id,
-            &media_ctx.media_source_id,
-            media_ctx.file_path.as_deref(),
-        )
-        .map_err(|error| format!("Failed to resolve media source: {}", error))?;
-        info!("[enhance {}] Media source resolved", note_id);
-
-        info!(
-            "[enhance {}] Extracting audio ({}ms - {}ms)...",
-            note_id, req.start_ms, req.end_ms
-        );
-        let selected_audio_track = *state.selected_audio_track.read().await;
-        let (audio_track_index, audio_track_ordinal) =
-            resolve_audio_mapping(&state, selected_audio_track).await;
-        let audio_codec = config.mining.audio_codec;
-        let (audio_path, audio_data) = media::extract_audio(
-            &source,
-            req.start_ms,
-            req.end_ms,
-            audio_track_index,
-            audio_track_ordinal,
-            audio_codec,
-        )
-        .await
-        .map_err(|error| format!("Audio extraction failed: {}", error))?;
-        let audio_filename = format!(
-            "nagare_{}_{}.{}",
-            media_ctx.item_id,
-            req.start_ms,
-            audio_codec.extension()
-        );
-        let audio_b64 = media::to_base64(&audio_data);
-        info!(
-            "[enhance {}] Audio extracted ({} bytes), storing in Anki as {}...",
-            note_id,
-            audio_data.len(),
-            audio_filename
-        );
-
-        if let Err(error) = anki_client
-            .store_media_file(&audio_filename, &audio_b64)
-            .await
-        {
-            media::cleanup_temp_file(&audio_path).await;
-            return Err(format!("Failed to store audio: {}", error));
-        }
-        info!("[enhance {}] Audio stored in Anki", note_id);
-
-        let mut picture_html = String::new();
-        let mid_ms = (req.start_ms + req.end_ms) / 2;
-        if req.generate_avif {
-            let avif_encoder = config.mining.animated_screenshot_encoder;
+        let reused_assets = if let Some(source_note_id) = req.reuse_assets_from_note_id {
             info!(
-                "[enhance {}] Generating AVIF with {} ({}ms - {}ms)...",
-                note_id,
-                avif_encoder.as_str(),
-                req.start_ms,
-                req.end_ms
+                "[enhance {}] Waiting to re-use assets from note {}...",
+                note_id, source_note_id
             );
-            match media::generate_avif(
-                &source,
-                req.start_ms,
-                req.end_ms,
-                avif_encoder,
-                config.mining.avif_max_width,
-                config.mining.avif_max_fps,
-            )
-            .await
-            {
-                Ok((avif_path, avif_data)) => {
-                    let avif_filename =
-                        format!("nagare_{}_{}.avif", media_ctx.item_id, req.start_ms);
-                    let avif_b64 = media::to_base64(&avif_data);
-                    info!(
-                        "[enhance {}] AVIF generated ({} bytes), storing as {}...",
-                        note_id,
-                        avif_data.len(),
-                        avif_filename
-                    );
-                    if let Err(error) = anki_client
-                        .store_media_file(&avif_filename, &avif_b64)
-                        .await
-                    {
-                        warn!("Failed to store AVIF in Anki: {}", error);
-                    } else {
-                        picture_html = format!("<img src=\"{}\">", avif_filename);
-                        info!("[enhance {}] AVIF stored in Anki", note_id);
-                    }
-                    media::cleanup_temp_file(&avif_path).await;
-                }
-                Err(error) => {
-                    warn!(
-                        "[enhance {}] AVIF generation failed (continuing without): {}",
-                        note_id, error
-                    );
-                }
-            }
+            wait_for_reusable_assets(state, source_note_id).await
         } else {
-            info!("[enhance {}] AVIF generation skipped (disabled)", note_id);
-        }
+            None
+        };
 
-        if picture_html.is_empty() {
-            if req.generate_avif {
-                info!(
-                    "[enhance {}] No AVIF stored, falling back to screenshot...",
+        let mut audio_path = None;
+        let assets = if let Some(assets) = reused_assets {
+            info!("[enhance {}] Re-using cached mining assets", note_id);
+            assets
+        } else {
+            if req.reuse_assets_from_note_id.is_some() {
+                warn!(
+                    "[enhance {}] Requested assets were unavailable; generating new assets",
                     note_id
                 );
             }
-            if let Some(screenshot_html) = generate_and_store_screenshot(
-                &anki_client,
-                &source,
+
+            info!("[enhance {}] Resolving media source...", note_id);
+            let source = media::resolve_media_source(
+                &config,
+                server_opt.as_deref(),
                 &media_ctx.item_id,
-                mid_ms,
-                note_id,
-                config.mining.static_screenshot_format,
+                &media_ctx.media_source_id,
+                media_ctx.file_path.as_deref(),
+            )
+            .map_err(|error| format!("Failed to resolve media source: {}", error))?;
+            info!("[enhance {}] Media source resolved", note_id);
+
+            let media_probe = match media::probe_media(&source, req.start_ms).await {
+                Ok(probe) => Some(probe),
+                Err(error) => {
+                    warn!(
+                        "[enhance {}] Could not inspect media streams/chapters: {}",
+                        note_id, error
+                    );
+                    None
+                }
+            };
+            let fallback_audio_only = media_ctx
+                .file_path
+                .as_deref()
+                .is_some_and(media::is_likely_audio_only)
+                || media::is_likely_audio_only(&source);
+            let audio_only = media_probe
+                .as_ref()
+                .map(|probe| !probe.has_visual_video)
+                .unwrap_or(fallback_audio_only);
+            let chapter_title = media_probe
+                .as_ref()
+                .and_then(|probe| probe.chapter_title.as_deref());
+            let media_name = media_ctx.series_name.as_deref().unwrap_or(&media_ctx.title);
+            let episode_code = (!audio_only)
+                .then(|| episode_code_from_title(&media_ctx.title))
+                .flatten();
+
+            info!(
+                "[enhance {}] Extracting audio ({}ms - {}ms)...",
+                note_id, req.start_ms, req.end_ms
+            );
+            let selected_audio_track = *state.selected_audio_track.read().await;
+            let (audio_track_index, audio_track_ordinal) =
+                resolve_audio_mapping(&state, selected_audio_track).await;
+            let audio_codec = config.mining.audio_codec;
+            let (generated_audio_path, audio_data) = media::extract_audio(
+                &source,
+                req.start_ms,
+                req.end_ms,
+                audio_track_index,
+                audio_track_ordinal,
+                audio_codec,
             )
             .await
+            .map_err(|error| format!("Audio extraction failed: {}", error))?;
+            let audio_filename = anki_media_filename(
+                media_name,
+                episode_code.as_deref(),
+                chapter_title,
+                req.start_ms,
+                note_id,
+                None,
+                audio_codec.extension(),
+            );
+            let audio_b64 = media::to_base64(&audio_data);
+            info!(
+                "[enhance {}] Audio extracted ({} bytes), storing in Anki as {}...",
+                note_id,
+                audio_data.len(),
+                audio_filename
+            );
+
+            if let Err(error) = anki_client
+                .store_media_file(&audio_filename, &audio_b64)
+                .await
             {
-                picture_html = screenshot_html;
+                media::cleanup_temp_file(&generated_audio_path).await;
+                return Err(format!("Failed to store audio: {}", error));
             }
-        }
+            info!("[enhance {}] Audio stored in Anki", note_id);
+            audio_path = Some(generated_audio_path);
+
+            let mut picture_html = String::new();
+            let mid_ms = (req.start_ms + req.end_ms) / 2;
+            if req.generate_avif && !audio_only {
+                let avif_encoder = config.mining.animated_screenshot_encoder;
+                info!(
+                    "[enhance {}] Generating AVIF with {} ({}ms - {}ms)...",
+                    note_id,
+                    avif_encoder.as_str(),
+                    req.start_ms,
+                    req.end_ms
+                );
+                match media::generate_avif(
+                    &source,
+                    req.start_ms,
+                    req.end_ms,
+                    avif_encoder,
+                    config.mining.avif_max_width,
+                    config.mining.avif_max_fps,
+                )
+                .await
+                {
+                    Ok((avif_path, avif_data)) => {
+                        let avif_filename = anki_media_filename(
+                            media_name,
+                            episode_code.as_deref(),
+                            chapter_title,
+                            req.start_ms,
+                            note_id,
+                            None,
+                            "avif",
+                        );
+                        let avif_b64 = media::to_base64(&avif_data);
+                        if let Err(error) = anki_client
+                            .store_media_file(&avif_filename, &avif_b64)
+                            .await
+                        {
+                            warn!("Failed to store AVIF in Anki: {}", error);
+                        } else {
+                            picture_html = format!("<img src=\"{}\">", avif_filename);
+                        }
+                        media::cleanup_temp_file(&avif_path).await;
+                    }
+                    Err(error) => warn!(
+                        "[enhance {}] AVIF generation failed (continuing without): {}",
+                        note_id, error
+                    ),
+                }
+            } else if req.generate_avif {
+                info!("[enhance {}] Skipping AVIF for audio-only media", note_id);
+            }
+
+            if picture_html.is_empty() && !audio_only {
+                if let Some(screenshot_html) = generate_and_store_screenshot(
+                    &anki_client,
+                    &source,
+                    media_name,
+                    episode_code.as_deref(),
+                    chapter_title,
+                    mid_ms,
+                    req.start_ms,
+                    note_id,
+                    config.mining.static_screenshot_format,
+                )
+                .await
+                {
+                    picture_html = screenshot_html;
+                }
+            }
+
+            ReusableAssets {
+                audio_html: format!("[sound:{}]", audio_filename),
+                picture_html,
+                clear_picture: audio_only,
+            }
+        };
 
         let mut fields = HashMap::new();
         fields.insert(
             config.anki.fields.sentence_audio.clone(),
-            format!("[sound:{}]", audio_filename),
+            assets.audio_html.clone(),
         );
-        if !picture_html.is_empty() {
-            fields.insert(config.anki.fields.picture.clone(), picture_html);
+        if !assets.picture_html.is_empty() {
+            fields.insert(
+                config.anki.fields.picture.clone(),
+                assets.picture_html.clone(),
+            );
+        } else if assets.clear_picture {
+            // Retrying a note that was previously given an attached-cover AVIF
+            // should remove that broken image from the card.
+            fields.insert(config.anki.fields.picture.clone(), String::new());
         }
         if let Some(sentence) = req.sentence.clone() {
             fields.insert(config.anki.fields.sentence.clone(), sentence);
@@ -1219,10 +1505,13 @@ async fn perform_enrichment(
             .update_note_fields(req.note_id, fields, None, None)
             .await
         {
-            media::cleanup_temp_file(&audio_path).await;
+            if let Some(path) = audio_path.as_ref() {
+                media::cleanup_temp_file(path).await;
+            }
             return Err(format!("Failed to update note: {}", error));
         }
         info!("[enhance {}] Note fields updated", note_id);
+        state.reusable_assets.write().await.insert(note_id, assets);
 
         let mut tags_to_add: Vec<String> = config.anki.add_tags.clone();
         if config.anki.series_tag_enabled {
@@ -1252,7 +1541,9 @@ async fn perform_enrichment(
             }
         }
 
-        media::cleanup_temp_file(&audio_path).await;
+        if let Some(path) = audio_path.as_ref() {
+            media::cleanup_temp_file(path).await;
+        }
         info!("[enhance {}] Saving mining history entry...", note_id);
         save_mining_history_entry(state, req, &media_ctx, fallback_event, fallback_card_ids).await;
         info!("[enhance {}] Enhancement complete", note_id);
@@ -1299,7 +1590,10 @@ async fn backfill_pending_card_ids(state: &Arc<AppState>, note_id: i64) {
         Ok(ids) if !ids.is_empty() => ids,
         Ok(_) => return,
         Err(error) => {
-            warn!("Failed to backfill card ids for note {}: {}", note_id, error);
+            warn!(
+                "Failed to backfill card ids for note {}: {}",
+                note_id, error
+            );
             return;
         }
     };
@@ -1432,7 +1726,10 @@ async fn get_config(State(state): State<Arc<AppState>>) -> Json<serde_json::Valu
 fn public_config_json(config: &Config) -> serde_json::Value {
     let password_configured = config.tadoku.has_credentials();
     let mut value = serde_json::to_value(config).expect("Config is serializable");
-    if let Some(tadoku) = value.get_mut("tadoku").and_then(|value| value.as_object_mut()) {
+    if let Some(tadoku) = value
+        .get_mut("tadoku")
+        .and_then(|value| value.as_object_mut())
+    {
         tadoku.remove("password");
         tadoku.remove("session_cookie");
         tadoku.insert(
@@ -1443,9 +1740,7 @@ fn public_config_json(config: &Config) -> serde_json::Value {
     value
 }
 
-async fn test_tadoku_connection(
-    State(state): State<Arc<AppState>>,
-) -> Json<serde_json::Value> {
+async fn test_tadoku_connection(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     match crate::tadoku::test_connection(state.config.clone(), state.db.clone()).await {
         Ok(info) => Json(serde_json::json!({"ok": true, "connection": info})),
         Err(error) => Json(serde_json::json!({"ok": false, "error": error.to_string()})),
@@ -1488,13 +1783,12 @@ async fn clear_tadoku_authentication(
         config.tadoku = previous;
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"ok": false, "error": format!("Failed to clear Tadoku login: {error}")})),
+            Json(
+                serde_json::json!({"ok": false, "error": format!("Failed to clear Tadoku login: {error}")}),
+            ),
         );
     }
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({"ok": true})),
-    )
+    (StatusCode::OK, Json(serde_json::json!({"ok": true})))
 }
 
 async fn get_tadoku_candidates(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
@@ -1508,6 +1802,26 @@ async fn get_tadoku_candidates(State(state): State<Arc<AppState>>) -> Json<serde
         .to_ascii_lowercase();
     match state.db.list_tadoku_candidates(language_code).await {
         Ok(candidates) => Json(serde_json::json!({"ok": true, "candidates": candidates})),
+        Err(error) => Json(serde_json::json!({"ok": false, "error": error.to_string()})),
+    }
+}
+
+#[derive(Deserialize)]
+struct TadokuCandidateUpdateRequest {
+    title: Option<String>,
+}
+
+async fn update_tadoku_candidate(
+    State(state): State<Arc<AppState>>,
+    Path(history_id): Path<String>,
+    Json(request): Json<TadokuCandidateUpdateRequest>,
+) -> Json<serde_json::Value> {
+    match state
+        .db
+        .set_tadoku_candidate_title(history_id, request.title)
+        .await
+    {
+        Ok(()) => Json(serde_json::json!({"ok": true})),
         Err(error) => Json(serde_json::json!({"ok": false, "error": error.to_string()})),
     }
 }
@@ -2190,6 +2504,8 @@ struct SubtitleData {
     selection_mode: SubtitleSelectionMode,
     /// Accumulated user timing offset already baked into `lines` (ms).
     subtitle_offset_ms: i64,
+    /// Whether the active track is still being fetched and parsed.
+    loading: bool,
 }
 
 async fn audio_tracks_data(state: &Arc<AppState>) -> AudioTracksData {
@@ -2261,6 +2577,7 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
             Vec<SubtitleCandidate>,
             i64,
             usize,
+            bool,
         )> = None;
         let mut last_anki_status: Option<AnkiStatus> = None;
         let mut last_enhancement_queue: Vec<EnhancementQueueItem> = Vec::new();
@@ -2300,6 +2617,11 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
                         .map(|track| track.lines.clone())
                         .unwrap_or_default();
                     let native_count = native_lines.len();
+                    let subtitle_loading = session_state
+                        .now_playing
+                        .as_ref()
+                        .map(|now_playing| now_playing.subtitle_loading)
+                        .unwrap_or(false);
                     let subtitle_data = SubtitleData {
                         count: subtitle_lines.len(),
                         lines: subtitle_lines,
@@ -2309,6 +2631,7 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
                         selected_candidate_id,
                         selection_mode,
                         subtitle_offset_ms,
+                        loading: subtitle_loading,
                     };
                     let current_subtitle_signature = (
                         current_item_id.clone(),
@@ -2318,6 +2641,7 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
                         subtitle_data.candidates.clone(),
                         subtitle_data.subtitle_offset_ms,
                         subtitle_data.native_count,
+                        subtitle_data.loading,
                     );
 
                     let send_subs = current_item_id != last_item_id

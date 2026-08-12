@@ -1,6 +1,6 @@
 # Nagare
 
-Subtitle mining tool for Emby / Jellyfin / Plex. A Rust (axum + tokio) backend
+Subtitle mining tool for Emby / Jellyfin / Plex / AudioBookShelf. A Rust (axum + tokio) backend
 watches media-server playback sessions and AnkiConnect, then enriches Anki cards
 with audio, screenshots, and sentence/translation context. A Svelte frontend
 provides the player-side UI and configuration.
@@ -15,7 +15,7 @@ provides the player-side UI and configuration.
   - `session.rs` — media-server session tracking, history entries, subtitle loading
   - `media.rs` — ffmpeg audio/screenshot/AVIF generation
   - `subtitle.rs` — subtitle parsing + sentence-to-line matching
-  - `media_server/` — per-server adapters: `mediabrowser.rs` (Emby/Jellyfin), `plex.rs`, shared types in `mod.rs`
+  - `media_server/` — per-server adapters: `mediabrowser.rs` (Emby/Jellyfin), `plex.rs`, `audiobookshelf.rs`, shared types in `mod.rs`
 - `frontend/src/` — Svelte app
   - `lib/ConfigPage.svelte` — settings UI (tabbed: Server / Anki & Media / Frontend)
   - `lib/EnrichDialog.svelte` — the card enrichment dialog
@@ -31,6 +31,7 @@ guessing endpoint shapes or field names:
 - `api_reference/emby_openapi.json` — Emby
 - `api_reference/jellyfin-openapi-stable.json` — Jellyfin
 - `api_reference/plex_openapi.json` — Plex
+- `api_reference/abs_openapi.json` — AudioBookShelf
 
 These are large; search them for the specific endpoint/field instead of reading
 them whole.

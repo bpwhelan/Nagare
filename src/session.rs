@@ -13,6 +13,8 @@ use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock, watch};
 use tracing::{debug, info, warn};
 
+const POSITION_SAVE_INTERVAL: Duration = Duration::from_secs(5);
+
 /// Represents the current state of the monitored session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionState {
@@ -59,6 +61,10 @@ pub struct SubtitleCandidate {
     pub is_selected_in_session: bool,
     #[serde(skip_serializing, skip_deserializing, default)]
     local_path: Option<PathBuf>,
+    /// Whether a sidecar's basename exactly matches the media basename.
+    /// Kept internal because it is an auto-selection hint, not UI metadata.
+    #[serde(skip_serializing, skip_deserializing, default)]
+    is_exact_file_match: bool,
 }
 
 /// Describes an available audio track in the current media.
@@ -111,6 +117,9 @@ pub struct NowPlayingState {
     /// Mirrors `SubtitleTrack::offset_ms` for the active item.
     #[serde(default)]
     pub subtitle_offset_ms: i64,
+    /// True while Nagare is fetching and parsing the selected subtitle track.
+    #[serde(default)]
+    pub subtitle_loading: bool,
 }
 
 /// A snapshot of a previously-watched item, kept so the user can mine it later.
@@ -192,7 +201,7 @@ pub struct SessionManager {
     db: Arc<AppDatabase>,
     /// Prevent overlapping poll cycles when the API forces immediate refreshes.
     poll_lock: Mutex<()>,
-    /// Throttle: only persist to SQLite at most once per 30 s during position updates.
+    /// Throttle: only persist to SQLite at most once per position-save interval.
     last_save: Arc<Mutex<Instant>>,
     /// Whether the Plex websocket listener is connected and can provide live play-state updates.
     plex_ws_connected: AtomicBool,
@@ -481,12 +490,12 @@ impl SessionManager {
     }
 
     ///
-    /// `force = true`  → write immediately (used on new-item events).
-    /// `force = false` → write only if more than 30 s have elapsed since the
-    ///                   last save (used on high-frequency position updates).
+    /// `force = true`  → write immediately (used on new-item and trailing flushes).
+    /// `force = false` → write only if the position-save interval has elapsed
+    ///                   since the last save (used on high-frequency position updates).
     async fn save_history(&self, force: bool) {
         let mut last = self.last_save.lock().await;
-        if !force && last.elapsed() < Duration::from_secs(30) {
+        if !force && last.elapsed() < POSITION_SAVE_INTERVAL {
             return;
         }
 
@@ -507,6 +516,11 @@ impl SessionManager {
         }
 
         *last = Instant::now();
+    }
+
+    /// Persist all in-memory history immediately, bypassing the position throttle.
+    pub async fn flush_history(&self) {
+        self.save_history(true).await;
     }
 
     pub async fn select_session(&self, session_id: Option<String>) {
@@ -730,6 +744,7 @@ impl SessionManager {
             is_external: stream.is_external,
             is_selected_in_session,
             local_path: None,
+            is_exact_file_match: false,
         }
     }
 
@@ -873,6 +888,7 @@ impl SessionManager {
             return None;
         }
 
+        let is_exact_file_match = stem == video_stem;
         let language = Self::sidecar_language_hint(video_stem, &subtitle_path);
 
         Some(SubtitleCandidate {
@@ -886,6 +902,7 @@ impl SessionManager {
             is_external: true,
             is_selected_in_session: false,
             local_path: Some(subtitle_path),
+            is_exact_file_match,
         })
     }
 
@@ -960,10 +977,10 @@ impl SessionManager {
     }
 
     fn resolve_subtitle_candidate(
-        &self,
         candidates: &[SubtitleCandidate],
         target_lang: &str,
         override_candidate_id: Option<&str>,
+        server_kind: MediaServerKind,
     ) -> (Option<SubtitleCandidate>, SubtitleSelectionMode) {
         if let Some(candidate_id) = override_candidate_id {
             if let Some(candidate) = candidates
@@ -972,6 +989,18 @@ impl SessionManager {
             {
                 return (Some(candidate.clone()), SubtitleSelectionMode::Manual);
             }
+        }
+
+        // ABS has no subtitle stream selected by the player to use as a hint.
+        // Prefer an exact media-basename sidecar as soon as the open session
+        // exposes the item, even when playback has not started reporting yet.
+        if server_kind == MediaServerKind::Audiobookshelf
+            && let Some(candidate) = candidates.iter().find(|candidate| {
+                candidate.source == SubtitleCandidateSource::Sidecar
+                    && candidate.is_exact_file_match
+            })
+        {
+            return (Some(candidate.clone()), SubtitleSelectionMode::Auto);
         }
 
         if let Some(candidate) = candidates.iter().find(|candidate| {
@@ -1093,10 +1122,11 @@ impl SessionManager {
             )
             .await;
         let requested_override = candidate_id;
-        let (candidate, selection_mode) = self.resolve_subtitle_candidate(
+        let (candidate, selection_mode) = Self::resolve_subtitle_candidate(
             &candidates,
             &target_lang,
             requested_override.as_deref(),
+            active.kind,
         );
 
         if requested_override.is_some() && selection_mode != SubtitleSelectionMode::Manual {
@@ -1117,6 +1147,27 @@ impl SessionManager {
             *subtitle_candidates = candidates.clone();
         }
 
+        {
+            let mut state = self.state.write().await;
+            if let Some(now_playing_state) = state.now_playing.as_mut() {
+                if now_playing_state.history_id == history_id {
+                    now_playing_state.subtitle_stream_index =
+                        candidate.as_ref().and_then(|track| track.stream_index);
+                    now_playing_state.subtitle_candidate_id =
+                        candidate.as_ref().map(|track| track.id.clone());
+                    now_playing_state.subtitle_selection_mode = selection_mode;
+                    now_playing_state.subtitle_loading = true;
+                }
+            }
+        }
+
+        // Drop the previous track before announcing the load so clients never
+        // render subtitles from the old selection under the new track label.
+        *self.subtitles.write().await = None;
+        self.clear_native_subtitles().await;
+        let snapshot = self.state.read().await.clone();
+        let _ = self.state_tx.send(snapshot);
+
         self.load_subtitles_for_item(
             &now_playing.item_id,
             &media_source_id,
@@ -1134,20 +1185,15 @@ impl SessionManager {
             let mut state = self.state.write().await;
             if let Some(now_playing_state) = state.now_playing.as_mut() {
                 if now_playing_state.history_id == history_id {
-                    now_playing_state.subtitle_stream_index =
-                        candidate.as_ref().and_then(|track| track.stream_index);
-                    now_playing_state.subtitle_candidate_id =
-                        candidate.as_ref().map(|track| track.id.clone());
-                    now_playing_state.subtitle_selection_mode = selection_mode;
+                    now_playing_state.subtitle_loading = false;
                 }
             }
         }
 
         self.snapshot_active_track_into_history(&history_id).await;
-        self.save_history(true).await;
-
         let snapshot = self.state.read().await.clone();
         let _ = self.state_tx.send(snapshot);
+        self.save_history(true).await;
 
         Ok(())
     }
@@ -1259,6 +1305,7 @@ impl SessionManager {
 
         // Collect info we need while holding the lock, then release
         let previous_loaded_candidate_id = self.loaded_subtitle_candidate_id.read().await.clone();
+        let has_loaded_subtitle_track = self.subtitles.read().await.is_some();
         let previous_subtitle_override = self
             .selected_subtitle_candidate_override
             .read()
@@ -1274,6 +1321,7 @@ impl SessionManager {
         )> = None;
         let mut next_candidates = Vec::new();
         let mut next_override_candidate_id = None;
+        let mut active_item_ended = false;
 
         {
             let mut state = self.state.write().await;
@@ -1307,13 +1355,17 @@ impl SessionManager {
                         &active.server,
                     )
                     .await;
-                let (candidate, selection_mode) = self.resolve_subtitle_candidate(
+                let (candidate, selection_mode) = Self::resolve_subtitle_candidate(
                     &candidates,
                     &target_lang,
                     requested_override.as_deref(),
+                    active.kind,
                 );
                 let selected_stream_index = candidate.as_ref().and_then(|track| track.stream_index);
                 let selected_candidate_id = candidate.as_ref().map(|track| track.id.clone());
+                let subtitle_loading = item_changed
+                    || selected_candidate_id != previous_loaded_candidate_id
+                    || (selected_candidate_id.is_some() && !has_loaded_subtitle_track);
 
                 next_candidates = candidates;
                 next_override_candidate_id = if selection_mode == SubtitleSelectionMode::Manual {
@@ -1359,9 +1411,10 @@ impl SessionManager {
                     file_path: np.path.clone(),
                     audio_stream_index: resolved_audio_index,
                     subtitle_offset_ms: 0,
+                    subtitle_loading,
                 });
 
-                if item_changed || selected_candidate_id != previous_loaded_candidate_id {
+                if subtitle_loading {
                     needs_subtitle_load = Some((
                         item_changed,
                         history_id,
@@ -1372,6 +1425,7 @@ impl SessionManager {
                     ));
                 }
             } else {
+                active_item_ended = state.now_playing.is_some();
                 state.active_session_id = None;
                 state.now_playing = None;
             }
@@ -1397,6 +1451,10 @@ impl SessionManager {
             drop(loaded_candidate);
             let snapshot = self.state.read().await.clone();
             let _ = self.state_tx.send(snapshot);
+            if active_item_ended {
+                debug!("Active playback ended; flushing session history to SQLite");
+                self.flush_history().await;
+            }
             return;
         }
 
@@ -1404,6 +1462,14 @@ impl SessionManager {
         if let Some((item_changed, history_id, item_id, media_source_id, candidate, active)) =
             needs_subtitle_load
         {
+            // Publish the new item and its loading state before fetching/parsing
+            // the track. Large sidecars (especially audiobook ASS files) can
+            // otherwise leave the UI looking frozen for several seconds.
+            *self.subtitles.write().await = None;
+            self.clear_native_subtitles().await;
+            let snapshot = self.state.read().await.clone();
+            let _ = self.state_tx.send(snapshot);
+
             let display_title = active
                 .session
                 .now_playing
@@ -1435,6 +1501,17 @@ impl SessionManager {
             self.restore_subtitle_offset(&history_id).await;
 
             let sub_count = self.snapshot_active_track_into_history(&history_id).await;
+
+            {
+                let mut state = self.state.write().await;
+                if let Some(now_playing) = state.now_playing.as_mut()
+                    && now_playing.history_id == history_id
+                {
+                    now_playing.subtitle_loading = false;
+                }
+            }
+            let snapshot = self.state.read().await.clone();
+            let _ = self.state_tx.send(snapshot);
 
             if item_changed {
                 // Update file path and save to history
@@ -1511,7 +1588,7 @@ impl SessionManager {
             }
         }
 
-        // Throttled save for position updates (at most once every 30 s)
+        // Throttled save for position updates (at most once every 5 s)
         self.save_history(false).await;
 
         // Broadcast final state (covers position-only polls where no subtitle
@@ -1912,8 +1989,12 @@ pub async fn run_session_poller(manager: Arc<SessionManager>) {
 
 #[cfg(test)]
 mod tests {
-    use super::is_ignored_episode;
+    use super::{
+        SessionManager, SubtitleCandidateSource, SubtitleSelectionMode, is_ignored_episode,
+    };
+    use crate::config::MediaServerKind;
     use crate::media_server::NowPlaying;
+    use std::path::PathBuf;
 
     fn now_playing(name: &str, media_type: &str, series_name: Option<&str>) -> NowPlaying {
         NowPlaying {
@@ -1944,5 +2025,56 @@ mod tests {
 
         assert!(!is_ignored_episode(&other_episode));
         assert!(!is_ignored_episode(&theme_movie));
+    }
+
+    #[test]
+    fn abs_prefers_exact_sidecar_before_language_tagged_alternative() {
+        let media_stem = "Japanese Audiobook";
+        let language_candidate = SessionManager::sidecar_subtitle_candidate(
+            media_stem,
+            PathBuf::from("/audiobooks/Japanese Audiobook.ja.srt"),
+        )
+        .unwrap();
+        let exact_candidate = SessionManager::sidecar_subtitle_candidate(
+            media_stem,
+            PathBuf::from("/audiobooks/Japanese Audiobook.srt"),
+        )
+        .unwrap();
+
+        let (selected, mode) = SessionManager::resolve_subtitle_candidate(
+            &[language_candidate, exact_candidate.clone()],
+            "jpn",
+            None,
+            MediaServerKind::Audiobookshelf,
+        );
+
+        assert_eq!(mode, SubtitleSelectionMode::Auto);
+        assert_eq!(selected.unwrap().id, exact_candidate.id);
+        assert_eq!(exact_candidate.source, SubtitleCandidateSource::Sidecar);
+    }
+
+    #[test]
+    fn manual_abs_subtitle_choice_still_wins_over_exact_match() {
+        let media_stem = "Japanese Audiobook";
+        let manual_candidate = SessionManager::sidecar_subtitle_candidate(
+            media_stem,
+            PathBuf::from("/audiobooks/Japanese Audiobook.ja.srt"),
+        )
+        .unwrap();
+        let exact_candidate = SessionManager::sidecar_subtitle_candidate(
+            media_stem,
+            PathBuf::from("/audiobooks/Japanese Audiobook.srt"),
+        )
+        .unwrap();
+
+        let (selected, mode) = SessionManager::resolve_subtitle_candidate(
+            &[exact_candidate, manual_candidate.clone()],
+            "jpn",
+            Some(&manual_candidate.id),
+            MediaServerKind::Audiobookshelf,
+        );
+
+        assert_eq!(mode, SubtitleSelectionMode::Manual);
+        assert_eq!(selected.unwrap().id, manual_candidate.id);
     }
 }

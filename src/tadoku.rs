@@ -108,7 +108,7 @@ struct CreateLogRequest<'a> {
     activity_id: i32,
     amount: f64,
     unit_id: &'a str,
-    tags: [&'static str; 1],
+    tags: Vec<String>,
     description: &'a str,
 }
 
@@ -116,7 +116,7 @@ struct CreateLogRequest<'a> {
 struct UpdateLogRequest<'a> {
     amount: f64,
     unit_id: &'a str,
-    tags: [&'static str; 1],
+    tags: Vec<String>,
     description: &'a str,
 }
 
@@ -175,12 +175,7 @@ impl TadokuClient {
         persistence: Option<TadokuPersistence>,
         seed_saved_cookie: bool,
     ) -> anyhow::Result<Self> {
-        Self::new_with_auth_url(
-            config,
-            persistence,
-            seed_saved_cookie,
-            TADOKU_AUTH_BASE_URL,
-        )
+        Self::new_with_auth_url(config, persistence, seed_saved_cookie, TADOKU_AUTH_BASE_URL)
     }
 
     fn new_with_auth_url(
@@ -276,13 +271,20 @@ impl TadokuClient {
             .await
             .context("Could not start Tadoku login")?;
         if !flow_response.status().is_success() {
-            bail!("Could not start Tadoku login (HTTP {})", flow_response.status());
+            bail!(
+                "Could not start Tadoku login (HTTP {})",
+                flow_response.status()
+            );
         }
         let flow: LoginFlow = flow_response
             .json()
             .await
             .context("Tadoku returned an invalid login flow")?;
-        if !flow.ui.action.starts_with(&self.expected_login_action_prefix()) {
+        if !flow
+            .ui
+            .action
+            .starts_with(&self.expected_login_action_prefix())
+        {
             bail!("Tadoku returned an invalid login flow");
         }
         let csrf_token = flow
@@ -354,17 +356,22 @@ impl TadokuClient {
         self.login().await
     }
 
-    async fn connection_info(&mut self, language_code: &str) -> anyhow::Result<TadokuConnectionInfo> {
+    async fn connection_info(
+        &mut self,
+        language_code: &str,
+    ) -> anyhow::Result<TadokuConnectionInfo> {
         let session_url = self.config.session_url.clone();
         let session: SessionResponse = response_json(
-            self.send_authenticated(|http| http.get(&session_url)).await?,
+            self.send_authenticated(|http| http.get(&session_url))
+                .await?,
             "Tadoku authentication",
         )
         .await?;
 
         let options_url = self.api_url("logs/configuration-options");
         let options: ConfigurationOptions = response_json(
-            self.send_authenticated(|http| http.get(&options_url)).await?,
+            self.send_authenticated(|http| http.get(&options_url))
+                .await?,
             "Tadoku log configuration",
         )
         .await?;
@@ -462,18 +469,15 @@ impl TadokuClient {
         listening_minutes_unit_id: &str,
         registrations: &[Registration],
     ) -> anyhow::Result<String> {
-        let registration_ids = eligible_registration_ids(
-            registrations,
-            &batch.language_code,
-            listening_activity_id,
-        );
+        let registration_ids =
+            eligible_registration_ids(registrations, &batch.language_code, listening_activity_id);
         let payload = CreateLogRequest {
             registration_ids,
             language_code: &batch.language_code,
             activity_id: listening_activity_id,
             amount: tadoku_minutes(batch.duration_seconds),
             unit_id: listening_minutes_unit_id,
-            tags: ["nagare"],
+            tags: tadoku_tags(&self.config, batch),
             description: &batch.description,
         };
         let url = self.api_url("logs");
@@ -494,22 +498,37 @@ impl TadokuClient {
         listening_minutes_unit_id: &str,
     ) -> anyhow::Result<String> {
         let minutes = tadoku_minutes(batch.duration_seconds);
+        let desired_tags = tadoku_tags(&self.config, batch);
         let amount_matches = log
             .amount
             .is_some_and(|amount| (amount - minutes).abs() < 0.001);
         let unit_matches = log.unit_id.as_deref() == Some(listening_minutes_unit_id);
-        if amount_matches && unit_matches {
+        let tags_match = desired_tags.iter().all(|desired| {
+            log.tags
+                .iter()
+                .any(|existing| existing.eq_ignore_ascii_case(desired))
+        });
+        if amount_matches && unit_matches && tags_match {
             return Ok(log.id);
         }
 
         warn!(
-            "Tadoku log {} returned amount {:?} and unit {:?}; updating it to {:.1} minutes",
-            log.id, log.amount, log.unit_id, minutes
+            "Tadoku log {} is missing expected minutes, unit, or tags; updating it",
+            log.id
         );
+        let mut tags = log.tags.clone();
+        for desired in desired_tags {
+            if !tags
+                .iter()
+                .any(|existing| existing.eq_ignore_ascii_case(&desired))
+            {
+                tags.push(desired);
+            }
+        }
         let payload = UpdateLogRequest {
             amount: minutes,
             unit_id: listening_minutes_unit_id,
-            tags: ["nagare"],
+            tags,
             description: &batch.description,
         };
         let url = self.api_url(&format!("logs/{}", log.id));
@@ -522,19 +541,41 @@ impl TadokuClient {
         let updated_amount_matches = updated
             .amount
             .is_some_and(|amount| (amount - minutes).abs() < 0.001);
+        let updated_tags_match = tadoku_tags(&self.config, batch).iter().all(|desired| {
+            updated
+                .tags
+                .iter()
+                .any(|existing| existing.eq_ignore_ascii_case(desired))
+        });
         if !updated_amount_matches
             || updated.unit_id.as_deref() != Some(listening_minutes_unit_id)
+            || !updated_tags_match
         {
             bail!(
-                "Tadoku returned amount {:?} and unit {:?} after updating log {} to {:.1} minutes",
-                updated.amount,
-                updated.unit_id,
-                updated.id,
-                minutes
+                "Tadoku returned unexpected amount, unit, or tags after updating log {}",
+                updated.id
             );
         }
         Ok(updated.id)
     }
+}
+
+fn tadoku_tags(config: &TadokuConfig, batch: &TadokuExportBatch) -> Vec<String> {
+    let mut tags = vec!["nagare".to_string()];
+    for rule in &config.path_tag_rules {
+        let needle = rule.contains.to_lowercase();
+        if batch
+            .file_paths
+            .iter()
+            .any(|path| path.to_lowercase().contains(&needle))
+            && !tags
+                .iter()
+                .any(|existing| existing.eq_ignore_ascii_case(&rule.tag))
+        {
+            tags.push(rule.tag.clone());
+        }
+    }
+    tags
 }
 
 fn tadoku_minutes(duration_seconds: i32) -> f64 {
@@ -628,11 +669,7 @@ pub async fn test_connection(
 ) -> anyhow::Result<TadokuConnectionInfo> {
     let tadoku_config = config.read().await.tadoku.clone();
     let language_code = tadoku_config.language_code.trim().to_ascii_lowercase();
-    let mut client = TadokuClient::new(
-        tadoku_config,
-        Some(persistence(config, db)),
-        true,
-    )?;
+    let mut client = TadokuClient::new(tadoku_config, Some(persistence(config, db)), true)?;
     client.connection_info(&language_code).await
 }
 
@@ -641,11 +678,7 @@ pub async fn refresh_authentication(
     db: Arc<AppDatabase>,
 ) -> anyhow::Result<()> {
     let tadoku_config = config.read().await.tadoku.clone();
-    let mut client = TadokuClient::new(
-        tadoku_config,
-        Some(persistence(config, db)),
-        false,
-    )?;
+    let mut client = TadokuClient::new(tadoku_config, Some(persistence(config, db)), false)?;
     client.refresh_session().await
 }
 
@@ -674,11 +707,7 @@ async fn export(
 ) -> anyhow::Result<usize> {
     let tadoku_config = config.read().await.tadoku.clone();
     let language_code = tadoku_config.language_code.trim().to_ascii_lowercase();
-    let mut client = TadokuClient::new(
-        tadoku_config,
-        Some(persistence(config, db.clone())),
-        true,
-    )?;
+    let mut client = TadokuClient::new(tadoku_config, Some(persistence(config, db.clone())), true)?;
     let connection = client.connection_info(&language_code).await?;
     let registrations = client.registrations().await?;
     let eastern_date = eastern_time(Utc::now()).date_naive().to_string();
@@ -707,11 +736,7 @@ async fn export(
                 batch.batch_id, log.id
             );
             client
-                .ensure_log_minutes(
-                    log.clone(),
-                    &batch,
-                    &connection.listening_minutes_unit_id,
-                )
+                .ensure_log_minutes(log.clone(), &batch, &connection.listening_minutes_unit_id)
                 .await
         } else {
             client
@@ -827,9 +852,10 @@ fn nth_weekday(year: i32, month: u32, weekday: Weekday, nth: u32) -> NaiveDate {
 mod tests {
     use super::{
         Activity, CreateLogRequest, Language, Registration, RegistrationContest, TadokuClient,
-        eastern_time, eligible_registration_ids, extract_cookie_value, tadoku_minutes,
+        eastern_time, eligible_registration_ids, extract_cookie_value, tadoku_minutes, tadoku_tags,
     };
     use crate::config::TadokuConfig;
+    use crate::mining::TadokuExportBatch;
     use axum::body::Body;
     use axum::extract::State;
     use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
@@ -879,8 +905,15 @@ mod tests {
     ) -> Response {
         state.login_count.fetch_add(1, Ordering::SeqCst);
         state.login_forms.lock().unwrap().push(body);
-        if let Some(cookie) = headers.get(header::COOKIE).and_then(|value| value.to_str().ok()) {
-            state.request_cookies.lock().unwrap().push(cookie.to_string());
+        if let Some(cookie) = headers
+            .get(header::COOKIE)
+            .and_then(|value| value.to_str().ok())
+        {
+            state
+                .request_cookies
+                .lock()
+                .unwrap()
+                .push(cookie.to_string());
         }
         let mut response = Response::new(Body::from("{}"));
         if state.set_session_cookie {
@@ -893,8 +926,15 @@ mod tests {
     }
 
     async fn whoami(State(state): State<Arc<MockTadoku>>, headers: HeaderMap) -> Response {
-        if let Some(cookie) = headers.get(header::COOKIE).and_then(|value| value.to_str().ok()) {
-            state.request_cookies.lock().unwrap().push(cookie.to_string());
+        if let Some(cookie) = headers
+            .get(header::COOKIE)
+            .and_then(|value| value.to_str().ok())
+        {
+            state
+                .request_cookies
+                .lock()
+                .unwrap()
+                .push(cookie.to_string());
         }
         Json(json!({
             "identity": {"id": "user-id", "traits": {"display_name": "Reader"}}
@@ -906,8 +946,15 @@ mod tests {
         State(state): State<Arc<MockTadoku>>,
         headers: HeaderMap,
     ) -> Response {
-        if let Some(cookie) = headers.get(header::COOKIE).and_then(|value| value.to_str().ok()) {
-            state.request_cookies.lock().unwrap().push(cookie.to_string());
+        if let Some(cookie) = headers
+            .get(header::COOKIE)
+            .and_then(|value| value.to_str().ok())
+        {
+            state
+                .request_cookies
+                .lock()
+                .unwrap()
+                .push(cookie.to_string());
         }
         let call = state.options_count.fetch_add(1, Ordering::SeqCst);
         if state.reject_first_options_request && call == 0 {
@@ -976,6 +1023,20 @@ mod tests {
     }
 
     #[test]
+    fn adds_configured_tags_for_case_insensitive_path_matches() {
+        let config = TadokuConfig::default();
+        let batch = TadokuExportBatch {
+            batch_id: "batch".to_string(),
+            series_name: "Frieren".to_string(),
+            description: "Frieren S01E01".to_string(),
+            duration_seconds: 1_400,
+            language_code: "jpn".to_string(),
+            file_paths: vec!["/media/Anime/Frieren/episode01.mkv".to_string()],
+        };
+        assert_eq!(tadoku_tags(&config, &batch), vec!["nagare", "anime"]);
+    }
+
+    #[test]
     fn missing_credentials_are_rejected_before_client_creation() {
         let config = TadokuConfig::default();
         let error = TadokuClient::new(config, None, true).err().unwrap();
@@ -988,9 +1049,9 @@ mod tests {
     #[tokio::test]
     async fn browser_login_submits_credentials_and_csrf_as_form_data() {
         let (state, server) = spawn_mock_tadoku(true, true, true, false).await;
-        let mut client = TadokuClient::new_with_auth_url(
-            mock_config(&state), None, false, &state.base_url,
-        ).unwrap();
+        let mut client =
+            TadokuClient::new_with_auth_url(mock_config(&state), None, false, &state.base_url)
+                .unwrap();
         let connection = client.connection_info("jpn").await.unwrap();
         assert_eq!(connection.user_id, "user-id");
         assert_eq!(state.login_count.load(Ordering::SeqCst), 1);
@@ -1000,7 +1061,10 @@ mod tests {
         assert!(form.contains("password=super-secret"));
         assert!(form.contains("method=password"));
         assert!(form.contains("csrf_token=csrf-value"));
-        assert_eq!(client.session_cookie().unwrap().as_deref(), Some("fresh-session"));
+        assert_eq!(
+            client.session_cookie().unwrap().as_deref(),
+            Some("fresh-session")
+        );
         drop(forms);
         server.abort();
     }
@@ -1008,9 +1072,9 @@ mod tests {
     #[tokio::test]
     async fn rejects_untrusted_login_action_before_submitting_credentials() {
         let (state, server) = spawn_mock_tadoku(false, true, true, false).await;
-        let mut client = TadokuClient::new_with_auth_url(
-            mock_config(&state), None, false, &state.base_url,
-        ).unwrap();
+        let mut client =
+            TadokuClient::new_with_auth_url(mock_config(&state), None, false, &state.base_url)
+                .unwrap();
         let error = client.connection_info("jpn").await.unwrap_err();
         assert_eq!(error.to_string(), "Tadoku returned an invalid login flow");
         assert_eq!(state.login_count.load(Ordering::SeqCst), 0);
@@ -1020,9 +1084,9 @@ mod tests {
     #[tokio::test]
     async fn rejects_login_flow_without_csrf_token() {
         let (state, server) = spawn_mock_tadoku(true, false, true, false).await;
-        let mut client = TadokuClient::new_with_auth_url(
-            mock_config(&state), None, false, &state.base_url,
-        ).unwrap();
+        let mut client =
+            TadokuClient::new_with_auth_url(mock_config(&state), None, false, &state.base_url)
+                .unwrap();
         let error = client.connection_info("jpn").await.unwrap_err();
         assert_eq!(error.to_string(), "Tadoku did not return a CSRF token");
         assert_eq!(state.login_count.load(Ordering::SeqCst), 0);
@@ -1032,9 +1096,9 @@ mod tests {
     #[tokio::test]
     async fn successful_login_requires_browser_session_cookie() {
         let (state, server) = spawn_mock_tadoku(true, true, false, false).await;
-        let mut client = TadokuClient::new_with_auth_url(
-            mock_config(&state), None, false, &state.base_url,
-        ).unwrap();
+        let mut client =
+            TadokuClient::new_with_auth_url(mock_config(&state), None, false, &state.base_url)
+                .unwrap();
         let error = client.connection_info("jpn").await.unwrap_err();
         assert_eq!(
             error.to_string(),
@@ -1048,9 +1112,8 @@ mod tests {
         let (state, server) = spawn_mock_tadoku(true, true, true, false).await;
         let mut config = mock_config(&state);
         config.session_cookie = "saved-session".to_string();
-        let mut client = TadokuClient::new_with_auth_url(
-            config, None, true, &state.base_url,
-        ).unwrap();
+        let mut client =
+            TadokuClient::new_with_auth_url(config, None, true, &state.base_url).unwrap();
         client.connection_info("jpn").await.unwrap();
         assert_eq!(state.login_count.load(Ordering::SeqCst), 0);
         assert!(
@@ -1069,13 +1132,15 @@ mod tests {
         let (state, server) = spawn_mock_tadoku(true, true, true, true).await;
         let mut config = mock_config(&state);
         config.session_cookie = "expired-session".to_string();
-        let mut client = TadokuClient::new_with_auth_url(
-            config, None, true, &state.base_url,
-        ).unwrap();
+        let mut client =
+            TadokuClient::new_with_auth_url(config, None, true, &state.base_url).unwrap();
         client.connection_info("jpn").await.unwrap();
         assert_eq!(state.options_count.load(Ordering::SeqCst), 2);
         assert_eq!(state.login_count.load(Ordering::SeqCst), 1);
-        assert_eq!(client.session_cookie().unwrap().as_deref(), Some("fresh-session"));
+        assert_eq!(
+            client.session_cookie().unwrap().as_deref(),
+            Some("fresh-session")
+        );
         server.abort();
     }
 
@@ -1089,7 +1154,7 @@ mod tests {
             activity_id: 2,
             amount: tadoku_minutes(1_415),
             unit_id: "minute-unit",
-            tags: ["nagare"],
+            tags: vec!["nagare".to_string()],
             description: "NARUTO 疾風伝 S10E10-13",
         };
         let json = serde_json::to_value(payload).unwrap();
@@ -1111,10 +1176,7 @@ mod tests {
                 ..TadokuConfig::default()
             };
             config.normalize();
-            assert_eq!(
-                config.api_url,
-                "https://tadoku.app/api/internal/immersion"
-            );
+            assert_eq!(config.api_url, "https://tadoku.app/api/internal/immersion");
         }
     }
 

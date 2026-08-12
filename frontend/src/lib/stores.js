@@ -14,12 +14,12 @@ function localStorageStore(key, defaultValue) {
   return store;
 }
 
-/** @typedef {{ id: string, server_kind: 'emby'|'jellyfin'|'plex', client: string, device_name: string, user_name: string|null, title: string|null, is_target_language: boolean }} SessionSummary */
-/** @typedef {{ history_id: string, server_kind: 'emby'|'jellyfin'|'plex', item_id: string, title: string, position_ms: number, duration_ms: number|null, is_paused: boolean, supports_remote_control: boolean, subtitle_stream_index: number|null, subtitle_candidate_id: string|null, subtitle_selection_mode: 'auto'|'manual', media_source_id: string, file_path: string|null }} NowPlayingState */
+/** @typedef {{ id: string, server_kind: 'emby'|'jellyfin'|'plex'|'audiobookshelf', client: string, device_name: string, user_name: string|null, title: string|null, is_target_language: boolean }} SessionSummary */
+/** @typedef {{ history_id: string, server_kind: 'emby'|'jellyfin'|'plex'|'audiobookshelf', item_id: string, title: string, position_ms: number, duration_ms: number|null, is_paused: boolean, supports_remote_control: boolean, subtitle_stream_index: number|null, subtitle_candidate_id: string|null, subtitle_selection_mode: 'auto'|'manual', media_source_id: string, file_path: string|null, subtitle_loading?: boolean }} NowPlayingState */
 /** @typedef {{ sessions: SessionSummary[], active_session_id: string|null, now_playing: NowPlayingState|null }} SessionState */
 /** @typedef {{ index: number, start_ms: number, end_ms: number, text: string }} SubtitleLine */
 /** @typedef {{ id: string, source: 'server'|'sidecar', stream_index: number|null, language: string|null, label: string, codec: string|null, is_default: boolean, is_external: boolean, is_selected_in_session: boolean }} SubtitleCandidate */
-/** @typedef {{ lines: SubtitleLine[], count: number, candidates: SubtitleCandidate[], selected_candidate_id: string|null, selection_mode: 'auto'|'manual' }} SubtitlePayload */
+/** @typedef {{ lines: SubtitleLine[], count: number, candidates: SubtitleCandidate[], selected_candidate_id: string|null, selection_mode: 'auto'|'manual', loading?: boolean }} SubtitlePayload */
 /** @typedef {{ note_id: number, sentence: string, fields: Object, model_name: string, tags: string[] }} NewCardEvent */
 /** @typedef {{ event: NewCardEvent, matched_line_index: number|null, history_id?: string|null, start_ms?: number|null, end_ms?: number|null, generate_avif?: boolean|null, included_line_first?: number|null, included_line_last?: number|null, card_ids?: number[], source?: 'pending'|'mining_history', updated_at?: string|null }} NewCardWithMatch */
 /** @typedef {{ state: 'unknown'|'connected'|'disconnected', message: string|null }} AnkiStatus */
@@ -37,6 +37,7 @@ export const subtitleCandidates = writable(/** @type {SubtitleCandidate[]} */ ([
 export const selectedSubtitleCandidateId = writable(/** @type {string|null} */ (null));
 export const subtitleSelectionMode = writable(/** @type {'auto'|'manual'} */ ('auto'));
 export const subtitleOffsetMs = writable(0);
+export const subtitleLoading = writable(false);
 export const activeLineIndex = writable(/** @type {number|null} */ (null));
 export const timelineRecenterRequest = writable(0);
 export const pendingCards = writable(/** @type {NewCardWithMatch[]} */ ([]));
@@ -61,6 +62,7 @@ export const audioStartOffset = writable(100);
 export const audioEndOffset = writable(500);
 export const defaultGenerateAvif = writable(true);
 export const autoApprove = localStorageStore('opt_autoApprove', false);
+export const alwaysReuseMiningAssets = localStorageStore('opt_alwaysReuseMiningAssets', false);
 
 // History
 export const historyItems = writable(/** @type {any[]} */ ([]));
@@ -137,6 +139,7 @@ export function applySubtitlePayload(payload) {
   selectedSubtitleCandidateId.set(payload?.selected_candidate_id ?? null);
   subtitleSelectionMode.set(payload?.selection_mode || 'auto');
   subtitleOffsetMs.set(payload?.subtitle_offset_ms ?? 0);
+  subtitleLoading.set(payload?.loading ?? false);
 }
 
 // Brief "✓" flash shown next to the connection status after a successful
@@ -267,7 +270,10 @@ function syncActiveLineWithPosition(posMs = get(positionMs)) {
 
 function projectedPosition(anchor = _playbackAnchor) {
   if (!anchor) return null;
-  if (anchor.paused) return anchor.positionMs;
+  // AudioBookShelf only publishes an authoritative playback position on its
+  // periodic progress reports. Advancing a local clock between those reports
+  // makes the subtitle cursor keep moving after playback has been paused.
+  if (anchor.paused || anchor.serverKind === 'audiobookshelf') return anchor.positionMs;
 
   const elapsed = Date.now() - anchor.wallTimeMs;
   const projected = anchor.positionMs + elapsed;
@@ -286,6 +292,7 @@ export function syncPositionFromSessionState(state) {
 
   const nextAnchor = {
     itemId: np.history_id,
+    serverKind: np.server_kind,
     positionMs: np.position_ms,
     durationMs: np.duration_ms ?? Infinity,
     paused: np.is_paused,
@@ -299,6 +306,8 @@ export function syncPositionFromSessionState(state) {
     || _lastServerObservation.itemId !== nextAnchor.itemId
     || _lastServerObservation.paused !== nextAnchor.paused
     || Math.abs(_lastServerObservation.positionMs - nextAnchor.positionMs) > 250;
+  const authoritativeAbsPositionChanged = nextAnchor.serverKind === 'audiobookshelf'
+    && (!_playbackAnchor || _playbackAnchor.positionMs !== nextAnchor.positionMs);
   const serverJumpedBackward = serverObservationChanged
     && _lastServerObservation
     && _lastServerObservation.itemId === nextAnchor.itemId
@@ -312,6 +321,7 @@ export function syncPositionFromSessionState(state) {
   if (
     itemChanged
     || pauseChanged
+    || authoritativeAbsPositionChanged
     || serverJumpedBackward
     || serverAhead
     || (serverObservationChanged && serverCloseToProjection)
@@ -349,6 +359,7 @@ export function requestTimelineRecenter() {
 
 setInterval(() => {
   if (isSeekLocked()) return;
+  if (_playbackAnchor?.serverKind === 'audiobookshelf') return;
 
   const projected = projectedPosition();
   if (projected != null) {
@@ -381,6 +392,7 @@ export function setOptimisticPosition(ms) {
   if (np) {
     _playbackAnchor = {
       itemId: np.history_id,
+      serverKind: np.server_kind,
       positionMs: pos,
       durationMs: np.duration_ms ?? Infinity,
       paused: np.is_paused,
@@ -411,6 +423,7 @@ export function setOptimisticPlayState(paused) {
   if (np) {
     _playbackAnchor = {
       itemId: np.history_id,
+      serverKind: np.server_kind,
       positionMs: get(positionMs),
       durationMs: np.duration_ms ?? Infinity,
       paused,

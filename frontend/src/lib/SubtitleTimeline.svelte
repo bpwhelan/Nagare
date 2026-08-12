@@ -1,6 +1,6 @@
 <script>
-  import { onDestroy } from 'svelte';
-  import { subtitles, nativeSubtitles, subtitleCandidates, selectedSubtitleCandidateId, subtitleSelectionMode, subtitleOffsetMs, activeHistoryItemId, activeLineIndex, timelineRecenterRequest, positionMs, pauseOnHover, pauseOnSeek, disableSubtitleSeeking, isPlaying, sessionState, showErrorToast, setOptimisticPosition, setOptimisticPlayState, applySubtitlePayload, yomitanPopupVisible, nowPlayingTitle, showNativeSubtitles, showDownloadButton } from './stores.js';
+  import { afterUpdate, onDestroy, tick } from 'svelte';
+  import { subtitles, nativeSubtitles, subtitleCandidates, selectedSubtitleCandidateId, subtitleSelectionMode, subtitleOffsetMs, subtitleLoading, activeHistoryItemId, activeLineIndex, timelineRecenterRequest, positionMs, pauseOnHover, pauseOnSeek, disableSubtitleSeeking, isPlaying, sessionState, showErrorToast, setOptimisticPosition, setOptimisticPlayState, applySubtitlePayload, yomitanPopupVisible, nowPlayingTitle, showNativeSubtitles, showDownloadButton } from './stores.js';
   import { fireSeek, firePlayPause, playPause, selectSubtitleTrack, setSubtitleOffset } from './api.js';
   import { formatTime, nativeLinesForRange } from './utils.js';
   import AudioTrackSelector from './AudioTrackSelector.svelte';
@@ -16,6 +16,7 @@
   let controlsExpanded = false;
   let dismissingPopupPointerId = null;
   let consumeNextLineClick = false;
+  let wasSubtitleLoading = false;
 
   // Track whether we paused due to hover so we can resume on leave
   let pausedByHover = false;
@@ -29,6 +30,14 @@
     ? `Auto-select (${selectedSubtitleCandidate.label})`
     : 'Auto-select';
   $: showSubtitleSelector = !$activeHistoryItemId && $subtitleCandidates.length > 0;
+  $: isSubtitleLoading = $subtitleLoading;
+
+  afterUpdate(() => {
+    if (wasSubtitleLoading && !isSubtitleLoading) {
+      recenterAfterSubtitleLoad();
+    }
+    wasSubtitleLoading = isSubtitleLoading;
+  });
 
   $: if ($activeLineIndex != null && autoScroll && container) {
     scrollToLine($activeLineIndex);
@@ -57,6 +66,18 @@
     }
   }
 
+  async function recenterAfterSubtitleLoad() {
+    // `tick` waits for the large subtitle list to be inserted. The animation
+    // frame then guarantees layout is available before querying the active row.
+    await tick();
+    await new Promise(resolve => requestAnimationFrame(resolve));
+    if ($activeLineIndex == null || !container) return;
+
+    clearTimeout(scrollTimeout);
+    userScrolling = false;
+    scrollToLine($activeLineIndex, { force: true, behavior: 'auto' });
+  }
+
   function handleScroll() {
     if (Date.now() < programmaticScrollUntil) return;
     userScrolling = true;
@@ -71,6 +92,7 @@
     const previousValue = subtitlePickerValue;
     const rawValue = select.value;
     const candidateId = rawValue === 'auto' ? null : rawValue;
+    subtitleLoading.set(true);
 
     try {
       const result = await selectSubtitleTrack(candidateId);
@@ -80,13 +102,14 @@
       applySubtitlePayload(result?.subtitles);
     } catch (error) {
       select.value = previousValue;
+      subtitleLoading.set(false);
       showErrorToast(error?.message || 'Could not switch subtitle track');
     }
   }
 
   let offsetBusy = false;
 
-  $: offsetSupported = !$activeHistoryItemId && $subtitles.length > 0;
+  $: offsetSupported = !$activeHistoryItemId && !isSubtitleLoading && $subtitles.length > 0;
   $: offsetLabel = formatOffset($subtitleOffsetMs);
 
   function formatOffset(ms) {
@@ -326,8 +349,8 @@
   }
 </script>
 
-<div class="timeline-container" class:navigation-disabled={$yomitanPopupVisible} bind:this={container} on:scroll={handleScroll}>
-  {#if showSubtitleSelector || $subtitles.length > 0}
+<div class="timeline-container" class:navigation-disabled={$yomitanPopupVisible} bind:this={container} on:scroll={handleScroll} aria-busy={isSubtitleLoading}>
+  {#if showSubtitleSelector || $subtitles.length > 0 || isSubtitleLoading}
     <div class="controls" class:controls-collapsed={!controlsExpanded}>
       <div class="controls-summary">
         <button class="controls-toggle" on:click={() => controlsExpanded = !controlsExpanded} title={controlsExpanded ? 'Collapse track options' : 'Expand track options'}>
@@ -337,8 +360,14 @@
           <input type="checkbox" bind:checked={autoScroll} />
           Auto-scroll
         </label>
-        <span class="line-count">{$subtitles.length} lines</span>
-        {#if $subtitles.length > 0 && $showDownloadButton}
+        <span class="line-count">
+          {#if isSubtitleLoading}
+            Loading…
+          {:else}
+            {$subtitles.length} lines
+          {/if}
+        </span>
+        {#if !isSubtitleLoading && $subtitles.length > 0 && $showDownloadButton}
           <button class="download-btn" on:click={downloadSubtitles} title="Download current subtitle as .srt">
             <svg viewBox="0 0 20 20" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 3v9" /><path d="M6 9l4 4 4-4" /><path d="M4 16h12" /></svg>
             Download
@@ -349,7 +378,7 @@
         {#if showSubtitleSelector}
           <label class="track-picker">
             <span class="track-picker-label">Track</span>
-            <select value={subtitlePickerValue} on:change={handleSubtitleTrackChange}>
+            <select value={subtitlePickerValue} on:change={handleSubtitleTrackChange} disabled={isSubtitleLoading}>
               <option value="auto">{autoOptionLabel}</option>
               {#each $subtitleCandidates as track}
                 <option value={track.id}>{track.label}</option>
@@ -378,7 +407,13 @@
     </div>
   {/if}
 
-  {#if $subtitles.length === 0}
+  {#if isSubtitleLoading}
+    <div class="subtitle-loading" role="status" aria-live="polite">
+      <span class="subtitle-spinner" aria-hidden="true"></span>
+      <p>Loading subtitle…</p>
+      <p class="hint">Large subtitle files may take a moment.</p>
+    </div>
+  {:else if $subtitles.length === 0}
     <div class="empty">
       <p>No subtitles loaded</p>
       {#if showSubtitleSelector}
@@ -454,6 +489,40 @@
     color: var(--text-dim);
     gap: 0.5rem;
     padding: 1rem;
+  }
+
+  .subtitle-loading {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    min-height: 14rem;
+    height: calc(100% - 4rem);
+    color: var(--text-secondary);
+    gap: 0.55rem;
+    padding: 1rem;
+  }
+
+  .subtitle-loading p {
+    margin: 0;
+  }
+
+  .subtitle-loading .hint {
+    color: var(--text-dim);
+    font-size: 0.85rem;
+  }
+
+  .subtitle-spinner {
+    width: 1.35rem;
+    height: 1.35rem;
+    border-radius: 999px;
+    border: 2px solid color-mix(in srgb, var(--accent) 25%, transparent);
+    border-top-color: var(--accent);
+    animation: subtitle-spin 0.75s linear infinite;
+  }
+
+  @keyframes subtitle-spin {
+    to { transform: rotate(360deg); }
   }
 
   .empty .hint {

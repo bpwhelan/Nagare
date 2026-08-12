@@ -1,0 +1,16 @@
+.git
+.github
+.history
+.asbplayer
+.GameSentenceMiner
+target
+frontend/node_modules
+frontend/dist
+data
+config.toml
+.env
+.env.*
+*.log
+*.sqlite*
+*.zip
+

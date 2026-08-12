@@ -66,6 +66,7 @@ export async function enrichCard({
   matchedLineIndex = null,
   includedLineFirst = null,
   includedLineLast = null,
+  reuseAssetsFromNoteId = null,
 }) {
   const body = {
     note_id: noteId,
@@ -79,6 +80,7 @@ export async function enrichCard({
   if (includedLineFirst != null) body.included_line_first = includedLineFirst;
   if (includedLineLast != null) body.included_line_last = includedLineLast;
   if (itemId) body.item_id = itemId;
+  if (reuseAssetsFromNoteId != null) body.reuse_assets_from_note_id = reuseAssetsFromNoteId;
   return api('/api/enrich', {
     method: 'POST',
     body: JSON.stringify(body),
@@ -226,6 +228,13 @@ export async function clearTadokuLogin() {
 
 export async function getTadokuCandidates() {
   return api('/api/tadoku/candidates');
+}
+
+export async function updateTadokuCandidateTitle(historyId, title) {
+  return api(`/api/tadoku/candidates/${encodeURIComponent(historyId)}`, {
+    method: 'PUT',
+    body: JSON.stringify({ title }),
+  });
 }
 
 export async function syncTadokuCandidates(historyIds) {

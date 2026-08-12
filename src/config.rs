@@ -13,6 +13,8 @@ pub struct Config {
     pub jellyfin: Option<JellyfinConfig>,
     #[serde(default)]
     pub plex: Option<PlexConfig>,
+    #[serde(default)]
+    pub audiobookshelf: Option<AudiobookshelfConfig>,
 
     #[serde(default = "default_target_language")]
     pub target_language: String,
@@ -44,6 +46,7 @@ pub enum MediaServerKind {
     Emby,
     Jellyfin,
     Plex,
+    Audiobookshelf,
 }
 
 impl MediaServerKind {
@@ -52,6 +55,7 @@ impl MediaServerKind {
             Self::Emby => "emby",
             Self::Jellyfin => "jellyfin",
             Self::Plex => "plex",
+            Self::Audiobookshelf => "audiobookshelf",
         }
     }
 
@@ -60,6 +64,7 @@ impl MediaServerKind {
             Self::Emby => "Emby",
             Self::Jellyfin => "Jellyfin",
             Self::Plex => "Plex",
+            Self::Audiobookshelf => "AudioBookShelf",
         }
     }
 
@@ -68,6 +73,7 @@ impl MediaServerKind {
             "emby" => Some(Self::Emby),
             "jellyfin" => Some(Self::Jellyfin),
             "plex" => Some(Self::Plex),
+            "audiobookshelf" => Some(Self::Audiobookshelf),
             _ => None,
         }
     }
@@ -108,6 +114,18 @@ pub struct PlexConfig {
     pub url: String,
     pub token: String,
     /// User IDs (account IDs) to monitor. Empty means all users on the server.
+    #[serde(default)]
+    pub users: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AudiobookshelfConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    pub url: String,
+    /// An admin API token is required to enumerate open playback sessions.
+    pub token: String,
+    /// User IDs to monitor. Empty means all users on the server.
     #[serde(default)]
     pub users: Vec<String>,
 }
@@ -256,6 +274,16 @@ pub struct TadokuConfig {
 
     #[serde(default = "default_tadoku_session_url")]
     pub session_url: String,
+
+    /// Case-insensitive file-path substring matches used to add Tadoku tags.
+    #[serde(default = "default_tadoku_path_tag_rules")]
+    pub path_tag_rules: Vec<TadokuPathTagRule>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TadokuPathTagRule {
+    pub contains: String,
+    pub tag: String,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -378,6 +406,7 @@ impl Default for Config {
             emby: None,
             jellyfin: None,
             plex: None,
+            audiobookshelf: None,
             target_language: default_target_language(),
             native_language: default_native_language(),
             anki: AnkiConfig::default(),
@@ -480,6 +509,14 @@ impl Config {
         if self.plex.as_ref().map(|cfg| cfg.enabled).unwrap_or(false) {
             kinds.push(MediaServerKind::Plex);
         }
+        if self
+            .audiobookshelf
+            .as_ref()
+            .map(|cfg| cfg.enabled)
+            .unwrap_or(false)
+        {
+            kinds.push(MediaServerKind::Audiobookshelf);
+        }
         kinds
     }
 
@@ -494,6 +531,9 @@ impl Config {
             MediaServerKind::Emby => self.emby.as_ref().map(|c| c.users.as_slice()),
             MediaServerKind::Jellyfin => self.jellyfin.as_ref().map(|c| c.users.as_slice()),
             MediaServerKind::Plex => self.plex.as_ref().map(|c| c.users.as_slice()),
+            MediaServerKind::Audiobookshelf => {
+                self.audiobookshelf.as_ref().map(|c| c.users.as_slice())
+            }
         }
         .unwrap_or(&[])
     }
@@ -540,7 +580,12 @@ impl Config {
             (None, None) => false,
             _ => true,
         };
-        emby || jellyfin || plex
+        let audiobookshelf = match (&self.audiobookshelf, &other.audiobookshelf) {
+            (Some(a), Some(b)) => a.url != b.url || a.token != b.token || a.enabled != b.enabled,
+            (None, None) => false,
+            _ => true,
+        };
+        emby || jellyfin || plex || audiobookshelf
     }
 }
 
@@ -601,6 +646,7 @@ impl Default for TadokuConfig {
             export_hour_eastern: default_tadoku_export_hour(),
             api_url: default_tadoku_api_url(),
             session_url: default_tadoku_session_url(),
+            path_tag_rules: default_tadoku_path_tag_rules(),
         }
     }
 }
@@ -629,6 +675,12 @@ impl TadokuConfig {
         }
         self.language_code = self.language_code.trim().to_ascii_lowercase();
         self.export_hour_eastern = self.export_hour_eastern.min(23);
+        for rule in &mut self.path_tag_rules {
+            rule.contains = rule.contains.trim().to_string();
+            rule.tag = rule.tag.trim().to_string();
+        }
+        self.path_tag_rules
+            .retain(|rule| !rule.contains.is_empty() && !rule.tag.is_empty());
     }
 }
 
@@ -691,4 +743,11 @@ fn default_tadoku_api_url() -> String {
 }
 fn default_tadoku_session_url() -> String {
     "https://account.tadoku.app/kratos/sessions/whoami".to_string()
+}
+
+fn default_tadoku_path_tag_rules() -> Vec<TadokuPathTagRule> {
+    vec![TadokuPathTagRule {
+        contains: "anime".to_string(),
+        tag: "anime".to_string(),
+    }]
 }

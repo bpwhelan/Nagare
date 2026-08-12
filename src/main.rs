@@ -12,12 +12,15 @@ mod tadoku;
 use crate::anki::{AnkiBeaconEvent, AnkiClient, AnkiStatus, NewCardNotification};
 use crate::api::AppState;
 use crate::config::Config;
-use crate::media_server::{EmbyClient, JellyfinClient, PlexClient, ServerMap};
+use crate::media_server::{
+    AudiobookshelfClient, EmbyClient, JellyfinClient, PlexClient, ServerMap,
+};
 use crate::mining::{AppDatabase, EnrichmentDialogState};
 use crate::session::{SessionManager, SessionState};
 use axum::body::Body;
 use axum::http::{HeaderValue, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -29,6 +32,40 @@ use tracing::{error, info, warn};
 #[derive(rust_embed::RustEmbed)]
 #[folder = "frontend/dist"]
 struct EmbeddedFrontend;
+
+async fn shutdown_signal(session_manager: Arc<SessionManager>) {
+    let ctrl_c = async {
+        if let Err(error) = tokio::signal::ctrl_c().await {
+            warn!("Failed to install Ctrl+C handler: {}", error);
+            std::future::pending::<()>().await;
+        }
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(error) => {
+                warn!("Failed to install SIGTERM handler: {}", error);
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
+
+    info!("Shutdown signal received");
+    session_manager.flush_history().await;
+    info!("Session history flushed; beginning graceful shutdown");
+}
 
 /// Build media server clients for every enabled service in the current config.
 pub fn build_media_servers(config: &Config) -> ServerMap {
@@ -55,6 +92,14 @@ pub fn build_media_servers(config: &Config) -> ServerMap {
         servers.insert(
             crate::config::MediaServerKind::Plex,
             Arc::new(PlexClient::new(&plex.url, &plex.token)),
+        );
+    }
+
+    if let Some(abs) = config.audiobookshelf.as_ref().filter(|cfg| cfg.enabled) {
+        info!("Using AudioBookShelf server at {}", abs.url);
+        servers.insert(
+            crate::config::MediaServerKind::Audiobookshelf,
+            Arc::new(AudiobookshelfClient::new(&abs.url, &abs.token)),
         );
     }
 
@@ -193,6 +238,7 @@ async fn main() -> anyhow::Result<()> {
         anki_event_tx,
         enhancement_queue: Arc::new(RwLock::new(Vec::new())),
         enhancement_tx,
+        reusable_assets: Arc::new(RwLock::new(HashMap::new())),
         session_rx,
         new_card_tx: card_tx.clone(),
         subtitles,
@@ -281,7 +327,10 @@ async fn main() -> anyhow::Result<()> {
     info!("Listening on http://{}", listen_addr);
 
     let listener = tokio::net::TcpListener::bind(listen_addr).await?;
-    axum::serve(listener, app).await?;
+    let server_result = axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal(session_manager))
+        .await;
+    server_result?;
 
     Ok(())
 }

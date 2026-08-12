@@ -1,3 +1,5 @@
+# syntax=docker/dockerfile:1
+
 # ── Stage 1: Build Svelte frontend ───────────────────────────
 FROM node:22-alpine AS frontend-build
 WORKDIR /app/frontend
@@ -13,13 +15,15 @@ WORKDIR /app
 COPY Cargo.toml Cargo.lock build.rs ./
 COPY src/ src/
 COPY --from=frontend-build /app/frontend/dist ./frontend/dist
-RUN cargo build --release
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/app/target \
+    cargo build --release && cp target/release/nagare /app/nagare
 
 # ── Stage 3: Runtime ────────────────────────────────────────
 FROM alpine:3.21
 RUN apk add --no-cache ffmpeg ca-certificates
 WORKDIR /app
-COPY --from=backend-build /app/target/release/nagare /app/nagare
+COPY --from=backend-build /app/nagare /app/nagare
 COPY --from=frontend-build /app/frontend/dist /app/frontend/dist
 
 ENV FRONTEND_DIR=/app/frontend/dist

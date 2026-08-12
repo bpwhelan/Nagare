@@ -1,7 +1,7 @@
 {
   "name": "Nagare",
   "short_name": "Nagare",
-  "description": "Subtitle mining tool for Emby / Jellyfin / Plex",
+  "description": "Subtitle mining tool for Emby / Jellyfin / Plex / AudioBookShelf",
   "start_url": "/",
   "display": "standalone",
   "background_color": "#0f0f0f",

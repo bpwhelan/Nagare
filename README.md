@@ -5,7 +5,7 @@
 <h1 align="center">Nagare (流れ)</h1>
 
 <p align="center">
-    <em>Pronounced "Nah-gah-reh" — subtitle mining companion for Emby, Jellyfin, and Plex.</em>
+    <em>Pronounced "Nah-gah-reh" — subtitle mining companion for Emby, Jellyfin, Plex, and AudioBookShelf.</em>
 </p>
 
 <div align="center">
@@ -58,7 +58,7 @@ Nagare watches your active media server playback sessions, displays a live subti
 - Playback controls (seek, pause, resume) from the browser.
 - Yomitan-aware pause behavior. (Must turn off Secure Popup in Yomitan) 
 - Watch history for mining after playback ends
-- Multi-server support (Emby + Jellyfin + Plex simultaneously)
+- Multi-server support (Emby + Jellyfin + Plex + AudioBookShelf simultaneously)
 - Manual-review or automatic daily Tadoku listening-log sync, grouped by show with duplicate protection
 
 
@@ -67,6 +67,7 @@ Nagare watches your active media server playback sessions, displays a live subti
 - [x] Initial prototype with Emby support
 - [x] Add Jellyfin support
 - [x] Add Plex support
+- [x] Add AudioBookShelf support for local MP3/M4B sidecar subtitles
 - [x] AnkiConnect integration
 - [x] Support for subtitles even when player has none (listening practice while maintaining mineability).
 - [x] Mining History, allowing you to touch up cards after the fact, or add more context.
@@ -127,14 +128,36 @@ cd frontend && npm ci && npm run build && cd ..
 cargo build --release
 ```
 
+### Deploy the current checkout to the media server
+
+On Windows, `scripts/deploy.ps1` syncs the current checkout directly over SSH, builds the image on the server, and restarts the existing server-side Compose service. It includes tracked files and non-ignored untracked files, so you can test work before committing or pushing it.
+
+```powershell
+.\scripts\deploy.ps1
+```
+
+The defaults deploy to `root@192.168.1.44:/mnt/user/Dev/nagare`. The server's Compose files, `data`, `.env`, and `config.toml` are preserved and are never uploaded from the checkout. The image is built using the image name declared by the server's `nagare` service, then Compose restarts it without pulling from the registry. Subsequent Docker builds reuse the server's Rust build cache.
+
+Useful options:
+
+```powershell
+# Show what would be packaged without touching the server
+.\scripts\deploy.ps1 -DryRun
+
+# Select another SSH identity or force a clean image build
+.\scripts\deploy.ps1 -IdentityFile "$HOME\.ssh\id_ed25519" -NoCache
+```
+
+The server needs Docker Compose v2. The local machine needs `git`, `tar`, `scp`, and `ssh`; these are available in a standard Git/OpenSSH Windows setup.
+
 ## Configuration
 
 All configuration is managed through the web UI Config page and stored in `data/nagare.sqlite`. On first run, configure:
 
-1. **Media server** — URL and API key (Emby/Jellyfin) or token (Plex)
+1. **Media server** — URL and API key (Emby/Jellyfin), token (Plex), or admin token (AudioBookShelf)
 2. **AnkiConnect** — URL and field mappings (`Sentence`, `SentenceAudio`, `Picture`)
 3. **Media access** — `auto`, `disk`, or `api` mode; add path mappings if server and Nagare see different file paths
-4. **Tadoku (optional)** — save your Tadoku username and password, then choose manual review or automatic daily sync. Nagare signs in and refreshes the browser session automatically. Manual review lets you approve or permanently decline individual ready episodes; automatic sync defaults to 8 PM Eastern. When the review workflow is first enabled, episodes completed after the previous successful sync are queued.
+4. **Tadoku (optional)** — save your Tadoku username and password, then choose manual review or automatic daily sync. Nagare signs in and refreshes the browser session automatically. Manual review lets you approve or permanently decline individual ready episodes; automatic sync defaults to 8 PM Eastern. When the review workflow is first enabled, episodes completed after the previous successful sync are queued. Tadoku tags can also be assigned from case-insensitive file-path matches; by default, paths containing `anime` receive the `anime` tag.
 
 ## How it works
 

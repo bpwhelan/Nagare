@@ -619,7 +619,10 @@ Dialogue: 0,0:00:05.00,0:00:08.00,Default,,0,0,0,,これはテストです
         assert_eq!(track.lines.len(), 4);
         assert_eq!(track.lines[0].text, "ノルノアさんこそ");
         // 353 + 354 share timing: dup dropped, distinct line concatenated.
-        assert_eq!(track.lines[1].text, "ノルノアさんこそ 俺の思い違いだったのかも…");
+        assert_eq!(
+            track.lines[1].text,
+            "ノルノアさんこそ 俺の思い違いだったのかも…"
+        );
         assert_eq!(track.lines[2].text, "俺の思い違いだったのかも…");
         // 356 + 357 share timing (357 itself is a two-line cue joined on parse).
         assert_eq!(
@@ -691,7 +694,10 @@ Dialogue: 0,0:00:05.00,0:00:08.00,Default,,0,0,0,,これはテストです
         // Fully overlapping native track scores higher than a barely-overlapping one.
         let aligned = track_spanning(0, 600_000, 90);
         let misaligned = track_spanning(550_000, 1_200_000, 90);
-        assert!(score_native_candidate(&target, &aligned) > score_native_candidate(&target, &misaligned));
+        assert!(
+            score_native_candidate(&target, &aligned)
+                > score_native_candidate(&target, &misaligned)
+        );
     }
 
     #[test]
