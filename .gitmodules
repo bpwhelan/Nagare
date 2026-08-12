@@ -1,4 +1,4 @@
 [submodule "audiobookshelf"]
 	path = audiobookshelf
 	url = https://github.com/bpwhelan/audiobookshelf.git
-	branch = master
+	branch = nagare
