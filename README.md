@@ -128,28 +128,6 @@ cd frontend && npm ci && npm run build && cd ..
 cargo build --release
 ```
 
-### Deploy the current checkout to the media server
-
-On Windows, `scripts/deploy.ps1` syncs the current checkout directly over SSH, builds the image on the server, and restarts the existing server-side Compose service. It includes tracked files and non-ignored untracked files, so you can test work before committing or pushing it.
-
-```powershell
-.\scripts\deploy.ps1
-```
-
-The defaults deploy to `root@192.168.1.44:/mnt/user/Dev/nagare`. The server's Compose files, `data`, `.env`, and `config.toml` are preserved and are never uploaded from the checkout. The image is built using the image name declared by the server's `nagare` service, then Compose restarts it without pulling from the registry. Subsequent Docker builds reuse the server's Rust build cache.
-
-Useful options:
-
-```powershell
-# Show what would be packaged without touching the server
-.\scripts\deploy.ps1 -DryRun
-
-# Select another SSH identity or force a clean image build
-.\scripts\deploy.ps1 -IdentityFile "$HOME\.ssh\id_ed25519" -NoCache
-```
-
-The server needs Docker Compose v2. The local machine needs `git`, `tar`, `scp`, and `ssh`; these are available in a standard Git/OpenSSH Windows setup.
-
 ## Configuration
 
 All configuration is managed through the web UI Config page and stored in `data/nagare.sqlite`. On first run, configure:
