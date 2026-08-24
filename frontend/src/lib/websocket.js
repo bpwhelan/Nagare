@@ -142,7 +142,9 @@ function handleMessage(msg) {
         pendingCards.update(cards => {
           const noteId = msg.new_card.event.note_id;
           if (cards.some(c => c.event.note_id === noteId)) return cards;
-          return [...cards, msg.new_card];
+          // Mirror the server-side intake bound. If a burst arrives while this
+          // tab is open, do not let already-evicted cards accumulate locally.
+          return [...cards, msg.new_card].slice(-10);
         });
       }
       break;

@@ -246,6 +246,8 @@ async fn main() -> anyhow::Result<()> {
         subtitle_candidates,
         subtitle_history,
         history,
+        active_history_context: Arc::new(RwLock::new(None)),
+        card_lookup_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         pending_enrichments: Arc::new(RwLock::new(Vec::new())),
         enhancement_result_tx,
         remote_result_tx,

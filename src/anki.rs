@@ -449,6 +449,19 @@ pub fn note_info_to_event(note: NoteInfo, sentence_field: &str) -> NewCardEvent 
 /// 3. Require-tag whitelist
 /// 4. Media-field population (skip only when *all* configured fields already have values)
 fn should_skip_note(note: &NoteInfo, cfg: &AnkiConfig) -> bool {
+    let sentence = note
+        .fields
+        .get(&cfg.fields.sentence)
+        .map(|field| field.value.trim())
+        .unwrap_or_default();
+    if sentence.is_empty() {
+        debug!(
+            "Skipping note {} (configured sentence field '{}' is empty or missing)",
+            note.note_id, cfg.fields.sentence
+        );
+        return true;
+    }
+
     // Note type filter
     if !cfg.note_types.is_empty() && !cfg.note_types.contains(&note.model_name) {
         debug!(
@@ -1022,5 +1035,40 @@ pub async fn run_anki_poller(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod note_filter_tests {
+    use super::{NoteField, NoteInfo, should_skip_note};
+    use crate::config::AnkiConfig;
+    use std::collections::HashMap;
+
+    fn note_with_sentence(sentence: Option<&str>) -> NoteInfo {
+        let cfg = AnkiConfig::default();
+        let mut fields = HashMap::new();
+        if let Some(sentence) = sentence {
+            fields.insert(
+                cfg.fields.sentence,
+                NoteField {
+                    value: sentence.to_string(),
+                    order: 0,
+                },
+            );
+        }
+        NoteInfo {
+            note_id: 1,
+            model_name: "Mining".to_string(),
+            tags: Vec::new(),
+            fields,
+        }
+    }
+
+    #[test]
+    fn notes_with_blank_or_missing_sentence_fields_are_ignored() {
+        let cfg = AnkiConfig::default();
+
+        assert!(should_skip_note(&note_with_sentence(None), &cfg));
+        assert!(should_skip_note(&note_with_sentence(Some("   ")), &cfg));
     }
 }

@@ -26,7 +26,7 @@ use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{RwLock, broadcast, mpsc, watch};
+use tokio::sync::{RwLock, Semaphore, broadcast, mpsc, watch};
 use tracing::{error, info, warn};
 
 #[allow(unused_imports)]
@@ -51,6 +51,13 @@ pub struct AppState {
     pub subtitle_candidates: Arc<RwLock<Vec<SubtitleCandidate>>>,
     pub subtitle_history: Arc<RwLock<HashMap<String, SubtitleTrack>>>,
     pub history: Arc<RwLock<HashMap<String, HistoryEntry>>>,
+    /// A history item deliberately opened for mining. This is separate from
+    /// persisted subtitle history so unrelated Anki cards are never matched by
+    /// scanning every episode Nagare has previously seen.
+    pub active_history_context: Arc<RwLock<Option<ActiveHistoryContext>>>,
+    /// Card-id lookups are optional metadata. Keep a burst of new notes from
+    /// spawning an unbounded number of AnkiConnect requests.
+    pub card_lookup_semaphore: Arc<Semaphore>,
     /// Queue of pending enrichment requests from the frontend.
     pub pending_enrichments: Arc<RwLock<Vec<EnrichmentDialogState>>>,
     /// Broadcast channel for enhancement job results (success/failure).
@@ -129,6 +136,12 @@ async fn post_anki_event(
             if event.note_id.is_none() {
                 return StatusCode::BAD_REQUEST;
             }
+            if !mining_context_available(&state).await {
+                tracing::debug!(
+                    "Ignoring AnkiBeacon note_added event because no subtitle mining context is active"
+                );
+                return StatusCode::NO_CONTENT;
+            }
             StatusCode::ACCEPTED
         }
     };
@@ -158,6 +171,9 @@ async fn select_session(
     State(state): State<Arc<AppState>>,
     Json(body): Json<SelectSession>,
 ) -> Json<serde_json::Value> {
+    // Explicitly selecting live playback ends any history-mining context. A
+    // future card must match the selected session's currently loaded track.
+    *state.active_history_context.write().await = None;
     state.session_manager.select_session(body.session_id).await;
     Json(serde_json::json!({"ok": true}))
 }
@@ -323,7 +339,8 @@ async fn current_subtitle_offset(state: &Arc<AppState>, history_id: Option<&str>
 async fn get_pending_enrichments(
     State(state): State<Arc<AppState>>,
 ) -> Json<Vec<EnrichmentDialogState>> {
-    let pending = state.pending_enrichments.read().await;
+    let mut pending = state.pending_enrichments.write().await;
+    prune_expired_pending_enrichments(&mut pending);
     Json(pending.clone())
 }
 
@@ -358,11 +375,21 @@ async fn activate_history_item(
 
     // Load the history item's subtitles into the active subtitle track
     let sh = state.subtitle_history.read().await;
-    if let Some(track) = sh.get(&history_id) {
+    if let Some(track) = sh.get(&history_id).filter(|track| !track.lines.is_empty()) {
         let mut subs = state.subtitles.write().await;
         *subs = Some(track.clone());
+    } else {
+        return Json(serde_json::json!({
+            "ok": false,
+            "error": "No subtitles are available for this history item"
+        }));
     }
     drop(sh);
+
+    *state.active_history_context.write().await = Some(ActiveHistoryContext {
+        history_id: history_id.clone(),
+        activated_at: std::time::Instant::now(),
+    });
 
     info!("Activated history item: {} ({})", entry.title, history_id);
     Json(serde_json::json!({"ok": true, "title": entry.title}))
@@ -479,6 +506,64 @@ struct MediaContext {
     title: String,
     /// Series name from the media server (None for movies / one-offs).
     series_name: Option<String>,
+}
+
+pub(crate) struct ActiveHistoryContext {
+    history_id: String,
+    activated_at: std::time::Instant,
+}
+
+const HISTORY_MINING_CONTEXT_TTL: Duration = Duration::from_secs(30 * 60);
+const PENDING_ENRICHMENT_TTL: chrono::Duration = chrono::Duration::minutes(10);
+const MAX_PENDING_ENRICHMENTS: usize = 10;
+const MAX_ENHANCEMENT_JOBS: usize = 12;
+
+async fn active_history_track(state: &Arc<AppState>) -> Option<(String, SubtitleTrack)> {
+    let context = {
+        let context = state.active_history_context.read().await;
+        context.as_ref().and_then(|context| {
+            (context.activated_at.elapsed() < HISTORY_MINING_CONTEXT_TTL)
+                .then(|| context.history_id.clone())
+        })
+    };
+
+    let Some(history_id) = context else {
+        // Clear an expired context so it cannot become active again if a track
+        // with the same id is later reloaded.
+        let mut context = state.active_history_context.write().await;
+        if context
+            .as_ref()
+            .is_some_and(|context| context.activated_at.elapsed() >= HISTORY_MINING_CONTEXT_TTL)
+        {
+            *context = None;
+        }
+        return None;
+    };
+
+    let track = state
+        .subtitle_history
+        .read()
+        .await
+        .get(&history_id)
+        .cloned()?;
+    (!track.lines.is_empty()).then_some((history_id, track))
+}
+
+async fn mining_context_available(state: &Arc<AppState>) -> bool {
+    if active_history_track(state).await.is_some() {
+        return true;
+    }
+
+    if state.session_rx.borrow().now_playing.is_some() {
+        return state
+            .subtitles
+            .read()
+            .await
+            .as_ref()
+            .is_some_and(|track| !track.lines.is_empty());
+    }
+
+    false
 }
 
 fn history_entry_to_media_context(entry: &HistoryEntry) -> MediaContext {
@@ -625,59 +710,33 @@ async fn prepare_enrichment_candidate(
     let session_state = state.session_rx.borrow().clone();
     let now_playing = session_state.now_playing.clone();
 
-    // Resolve the matched subtitle line and the history item it belongs to.
-    // `(line_index, history_id)` — `history_id` is the item the audio/screenshot
-    // should be sourced from when the card is enriched.
-    let mut matched: Option<(usize, Option<String>)> = None;
-
-    // 1. Live mining: match against the active session's subtitle track, but only
-    //    while something is actually playing. The shared `state.subtitles` slot is
-    //    owned by the session poller and gets cleared whenever playback stops, so
-    //    trusting it without an active `now_playing` would attribute mined-from-
-    //    history cards to the wrong (or no) media item.
-    if let Some(np) = now_playing.as_ref() {
-        let subtitles = state.subtitles.read().await;
-        if let Some(track) = subtitles.as_ref() {
-            let line =
-                find_matching_line(track, &event.sentence, np.position_ms, 30_000).or_else(|| {
-                    // Fall back to a global match across the whole track —
-                    // accept whenever subs are loaded and a match exists,
-                    // regardless of the reported playback position.
-                    find_all_matching_lines(track, &event.sentence)
-                        .first()
-                        .filter(|(_, score)| *score > 0.6)
-                        .map(|&(idx, _)| idx)
-                });
-            if let Some(idx) = line {
-                matched = Some((idx, Some(np.history_id.clone())));
+    // An explicitly activated history item is the user's chosen mining target,
+    // even if a live session is still visible in the media server. Selecting a
+    // live session through Nagare clears this context.
+    let active_history = active_history_track(state).await;
+    let live_track = if active_history.is_none() && now_playing.is_some() {
+        state.subtitles.read().await.clone()
+    } else {
+        None
+    };
+    let (matched_line_index, history_id) = match_candidate_to_context(
+        &event,
+        now_playing.as_ref().and_then(|now_playing| {
+            if active_history.is_some() {
+                return None;
             }
-        }
-    }
-
-    // 2. Mining from history: the user activated a past watch item (or nothing is
-    //    playing at all). Scan the persisted watch-history subtitle tracks and pick
-    //    the best global match so the dialog still opens and the card is attributed
-    //    to the correct history item.
-    if matched.is_none() {
-        let history_tracks = state.subtitle_history.read().await;
-        let mut best: Option<(usize, f64, String)> = None;
-        for (hist_id, track) in history_tracks.iter() {
-            if let Some(&(idx, score)) = find_all_matching_lines(track, &event.sentence).first() {
-                if score > 0.6 && best.as_ref().map_or(true, |(_, b, _)| score > *b) {
-                    best = Some((idx, score, hist_id.clone()));
-                }
-            }
-        }
-        if let Some((idx, score, hist_id)) = best {
-            info!(
-                "Note {} matched history item {} (mining from history, score {:.2})",
-                event.note_id, hist_id, score
-            );
-            matched = Some((idx, Some(hist_id)));
-        }
-    }
-
-    let (matched_line_index, history_id) = matched?;
+            live_track.as_ref().map(|track| {
+                (
+                    now_playing.position_ms,
+                    now_playing.history_id.as_str(),
+                    track,
+                )
+            })
+        }),
+        active_history
+            .as_ref()
+            .map(|(id, track)| (id.as_str(), track)),
+    )?;
 
     let config = state.config.read().await.clone();
     // Don't block the dialog on an AnkiConnect `findCards` round-trip. The card
@@ -699,20 +758,197 @@ async fn prepare_enrichment_candidate(
         included_line_last: None,
         card_ids,
         source: EnrichmentSource::Pending,
-        updated_at: None,
+        updated_at: Some(Utc::now()),
     })
 }
 
-async fn queue_pending_enrichment(state: &Arc<AppState>, candidate: EnrichmentDialogState) {
+fn match_candidate_to_context(
+    event: &NewCardEvent,
+    live_context: Option<(i64, &str, &SubtitleTrack)>,
+    active_history: Option<(&str, &SubtitleTrack)>,
+) -> Option<(usize, Option<String>)> {
+    if event.sentence.trim().is_empty() {
+        return None;
+    }
+
+    if let Some((position_ms, history_id, track)) = live_context {
+        if track.lines.is_empty() {
+            return None;
+        }
+        // Live cards must match near the reported playback position. A global
+        // episode-wide fallback turns common short sentences from unrelated
+        // cards into false positives.
+        return find_matching_line(track, &event.sentence, position_ms, 30_000)
+            .map(|line_index| (line_index, Some(history_id.to_string())));
+    }
+
+    // History mining is opt-in and searches only the item the user explicitly
+    // activated, never the entire persisted subtitle archive.
+    let (history_id, track) = active_history?;
+    find_all_matching_lines(track, &event.sentence)
+        .first()
+        .filter(|(_, score)| *score > 0.6)
+        .map(|&(line_index, _)| (line_index, Some(history_id.to_string())))
+}
+
+fn prune_expired_pending_enrichments(pending: &mut Vec<EnrichmentDialogState>) {
+    let cutoff = Utc::now() - PENDING_ENRICHMENT_TTL;
+    pending.retain(|entry| {
+        entry
+            .updated_at
+            .is_none_or(|updated_at| updated_at >= cutoff)
+    });
+}
+
+fn upsert_pending_enrichment(
+    pending: &mut Vec<EnrichmentDialogState>,
+    candidate: EnrichmentDialogState,
+) -> Option<i64> {
+    prune_expired_pending_enrichments(pending);
+    if let Some(existing) = pending
+        .iter_mut()
+        .find(|entry| entry.event.note_id == candidate.event.note_id)
+    {
+        *existing = candidate;
+        return None;
+    }
+
+    let evicted_note_id = if pending.len() >= MAX_PENDING_ENRICHMENTS {
+        Some(pending.remove(0).event.note_id)
+    } else {
+        None
+    };
+    pending.push(candidate);
+    evicted_note_id
+}
+
+#[cfg(test)]
+mod anki_intake_tests {
+    use super::{
+        MAX_PENDING_ENRICHMENTS, match_candidate_to_context, prune_expired_pending_enrichments,
+        upsert_pending_enrichment,
+    };
+    use crate::anki::NewCardEvent;
+    use crate::mining::EnrichmentDialogState;
+    use crate::subtitle::{SubtitleLine, SubtitleTrack};
+    use chrono::{Duration as ChronoDuration, Utc};
+    use std::collections::HashMap;
+
+    fn event(note_id: i64, sentence: &str) -> NewCardEvent {
+        NewCardEvent {
+            note_id,
+            sentence: sentence.to_string(),
+            fields: HashMap::new(),
+            model_name: "Mining".to_string(),
+            tags: Vec::new(),
+        }
+    }
+
+    fn track(lines: &[(i64, i64, &str)]) -> SubtitleTrack {
+        SubtitleTrack {
+            lines: lines
+                .iter()
+                .enumerate()
+                .map(|(index, (start_ms, end_ms, text))| SubtitleLine {
+                    index,
+                    start_ms: *start_ms,
+                    end_ms: *end_ms,
+                    text: (*text).to_string(),
+                })
+                .collect(),
+            offset_ms: 0,
+        }
+    }
+
+    fn pending(note_id: i64, updated_at: chrono::DateTime<Utc>) -> EnrichmentDialogState {
+        EnrichmentDialogState {
+            event: event(note_id, "対象の文"),
+            matched_line_index: Some(0),
+            history_id: Some("history".to_string()),
+            start_ms: None,
+            end_ms: None,
+            generate_avif: None,
+            included_line_first: None,
+            included_line_last: None,
+            card_ids: Vec::new(),
+            source: Default::default(),
+            updated_at: Some(updated_at),
+        }
+    }
+
+    #[test]
+    fn card_without_active_subtitle_context_is_ignored() {
+        assert!(match_candidate_to_context(&event(1, "対象の文"), None, None).is_none());
+        assert!(match_candidate_to_context(&event(2, "   "), None, None).is_none());
+    }
+
+    #[test]
+    fn live_card_does_not_fall_back_to_a_distant_episode_match() {
+        let subtitles = track(&[(120_000, 122_000, "対象の文")]);
+
+        assert!(
+            match_candidate_to_context(
+                &event(1, "対象の文"),
+                Some((1_000, "live-history", &subtitles)),
+                None,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn explicitly_activated_history_track_can_match_without_live_playback() {
+        let subtitles = track(&[(120_000, 122_000, "対象の文")]);
+
+        assert_eq!(
+            match_candidate_to_context(
+                &event(1, "対象の文"),
+                None,
+                Some(("selected-history", &subtitles)),
+            ),
+            Some((0, Some("selected-history".to_string())))
+        );
+    }
+
+    #[test]
+    fn expired_pending_cards_are_pruned() {
+        let now = Utc::now();
+        let mut cards = vec![
+            pending(1, now - ChronoDuration::minutes(11)),
+            pending(2, now - ChronoDuration::minutes(1)),
+        ];
+
+        prune_expired_pending_enrichments(&mut cards);
+
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0].event.note_id, 2);
+    }
+
+    #[test]
+    fn pending_card_queue_evicts_oldest_entries_at_its_limit() {
+        let mut cards = Vec::new();
+        for note_id in 1..=(MAX_PENDING_ENRICHMENTS as i64 + 1) {
+            upsert_pending_enrichment(&mut cards, pending(note_id, Utc::now()));
+        }
+
+        assert_eq!(cards.len(), MAX_PENDING_ENRICHMENTS);
+        assert_eq!(cards.first().unwrap().event.note_id, 2);
+        assert_eq!(
+            cards.last().unwrap().event.note_id,
+            MAX_PENDING_ENRICHMENTS as i64 + 1
+        );
+    }
+}
+
+async fn queue_pending_enrichment(state: &Arc<AppState>, mut candidate: EnrichmentDialogState) {
+    candidate.updated_at = Some(Utc::now());
     {
         let mut pending = state.pending_enrichments.write().await;
-        if let Some(existing) = pending
-            .iter_mut()
-            .find(|entry| entry.event.note_id == candidate.event.note_id)
-        {
-            *existing = candidate.clone();
-        } else {
-            pending.push(candidate.clone());
+        if let Some(evicted_note_id) = upsert_pending_enrichment(&mut pending, candidate.clone()) {
+            warn!(
+                "Dropping stale pending note {} to keep the Anki intake queue bounded at {} cards",
+                evicted_note_id, MAX_PENDING_ENRICHMENTS
+            );
         }
     }
     let _ = state.new_card_tx.send(candidate);
@@ -751,6 +987,16 @@ async fn remove_enhancement_queue_item(state: &Arc<AppState>, note_id: i64) {
     queue.retain(|item| item.note_id != note_id);
 }
 
+async fn requeue_failed_enrichment(
+    state: &Arc<AppState>,
+    candidate: Option<EnrichmentDialogState>,
+) {
+    if let Some(mut candidate) = candidate {
+        candidate.source = EnrichmentSource::Retry;
+        queue_pending_enrichment(state, candidate).await;
+    }
+}
+
 async fn enqueue_enhancement_job(
     state: &Arc<AppState>,
     req: EnrichRequest,
@@ -772,6 +1018,17 @@ async fn enqueue_enhancement_job(
             ));
         }
 
+        if queue.len() >= MAX_ENHANCEMENT_JOBS {
+            warn!(
+                "[enqueue] note {} — REJECTED, enhancement queue is full ({})",
+                note_id, MAX_ENHANCEMENT_JOBS
+            );
+            return Err(format!(
+                "Enhancement queue is full (maximum {} cards)",
+                MAX_ENHANCEMENT_JOBS
+            ));
+        }
+
         queue.push(EnhancementQueueItem {
             note_id,
             state: EnhancementQueueState::Queued,
@@ -784,11 +1041,15 @@ async fn enqueue_enhancement_job(
         );
     }
 
-    state
+    if state
         .enhancement_tx
         .send(EnhancementJob { req, fallback })
         .await
-        .map_err(|_| "Enhancement worker is not running".to_string())?;
+        .is_err()
+    {
+        remove_enhancement_queue_item(state, note_id).await;
+        return Err("Enhancement worker is not running".to_string());
+    }
 
     Ok(())
 }
@@ -875,9 +1136,7 @@ async fn enhancement_worker_loop(
             }
             Ok(Ok(Err(error))) => {
                 error!("Enrichment failed for note {}: {}", note_id, error);
-                if let Some(candidate) = job.fallback {
-                    queue_pending_enrichment(&state, candidate).await;
-                }
+                requeue_failed_enrichment(&state, job.fallback).await;
                 EnhancementResult {
                     note_id,
                     success: false,
@@ -890,9 +1149,7 @@ async fn enhancement_worker_loop(
                     note_id,
                     ENHANCEMENT_TIMEOUT.as_secs()
                 );
-                if let Some(candidate) = job.fallback {
-                    queue_pending_enrichment(&state, candidate).await;
-                }
+                requeue_failed_enrichment(&state, job.fallback).await;
                 EnhancementResult {
                     note_id,
                     success: false,
@@ -901,9 +1158,7 @@ async fn enhancement_worker_loop(
             }
             Err(_) => {
                 error!("Enhancement task panicked for note {}", note_id);
-                if let Some(candidate) = job.fallback {
-                    queue_pending_enrichment(&state, candidate).await;
-                }
+                requeue_failed_enrichment(&state, job.fallback).await;
                 EnhancementResult {
                     note_id,
                     success: false,
@@ -1571,10 +1826,19 @@ pub async fn run_new_card_processor(
         queue_pending_enrichment(&state, candidate).await;
 
         if needs_card_ids {
-            let state = state.clone();
-            tokio::spawn(async move {
-                backfill_pending_card_ids(&state, note_id).await;
-            });
+            match state.card_lookup_semaphore.clone().try_acquire_owned() {
+                Ok(permit) => {
+                    let state = state.clone();
+                    tokio::spawn(async move {
+                        let _permit = permit;
+                        backfill_pending_card_ids(&state, note_id).await;
+                    });
+                }
+                Err(_) => tracing::debug!(
+                    "Skipping optional card-id backfill for note {} because lookup capacity is full",
+                    note_id
+                ),
+            }
         }
     }
 }
@@ -1981,7 +2245,7 @@ fn merge_tadoku_secrets(old: &TadokuConfig, new: &mut TadokuConfig) {
 #[cfg(test)]
 mod tadoku_settings_tests {
     use super::{merge_tadoku_secrets, public_config_json};
-    use crate::config::{Config, TadokuConfig};
+    use crate::config::{Config, TadokuConfig, TadokuSyncMode};
 
     fn saved_tadoku() -> TadokuConfig {
         TadokuConfig {
@@ -2001,6 +2265,28 @@ mod tadoku_settings_tests {
         assert_eq!(value["tadoku"]["password_configured"], true);
         assert!(value["tadoku"].get("password").is_none());
         assert!(value["tadoku"].get("session_cookie").is_none());
+    }
+
+    #[test]
+    fn legacy_tadoku_settings_default_to_daily_sync() {
+        let config: TadokuConfig =
+            serde_json::from_value(serde_json::json!({"enabled": true})).unwrap();
+
+        assert_eq!(config.sync_mode, TadokuSyncMode::Daily);
+        assert!(!config.automatic_sync_enabled());
+    }
+
+    #[test]
+    fn automatic_tadoku_mode_requires_automatic_exports_to_be_enabled() {
+        let mut config: TadokuConfig = serde_json::from_value(serde_json::json!({
+            "enabled": true,
+            "sync_mode": "automatic"
+        }))
+        .unwrap();
+
+        assert!(config.automatic_sync_enabled());
+        config.enabled = false;
+        assert!(!config.automatic_sync_enabled());
     }
 
     #[test]
