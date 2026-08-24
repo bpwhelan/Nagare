@@ -5,6 +5,7 @@ use crate::media_server::{
 use crate::mining::AppDatabase;
 use crate::subtitle::{SubtitleTrack, parse_subtitle};
 use serde::{Deserialize, Serialize};
+use std::cmp::Ordering as CmpOrdering;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -14,6 +15,13 @@ use tokio::sync::{Mutex, RwLock, watch};
 use tracing::{debug, info, warn};
 
 const POSITION_SAVE_INTERVAL: Duration = Duration::from_secs(5);
+/// Paused sessions remain available briefly for manual selection/mining, but
+/// media servers can otherwise retain them for hours or even indefinitely.
+const PAUSED_SESSION_VISIBLE_AFTER: Duration = Duration::from_secs(5 * 60);
+/// A server that continues to claim a session is playing without checking in
+/// is treated as abandoned. Servers without a reliable activity clock are
+/// still trusted to return only live sessions.
+const PLAYING_SESSION_STALE_AFTER: Duration = Duration::from_secs(2 * 60);
 
 /// Represents the current state of the monitored session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,6 +67,10 @@ pub struct SubtitleCandidate {
     pub is_default: bool,
     pub is_external: bool,
     pub is_selected_in_session: bool,
+    /// Filename similarity to the active media file for fuzzy sidecar fallbacks.
+    /// Exact sidecars and server tracks do not need a confidence value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub match_confidence: Option<u8>,
     #[serde(skip_serializing, skip_deserializing, default)]
     local_path: Option<PathBuf>,
     /// Whether a sidecar's basename exactly matches the media basename.
@@ -167,6 +179,43 @@ fn is_ignored_episode(now_playing: &NowPlaying) -> bool {
         || now_playing.episode_index.is_some();
 
     is_episode && now_playing.name.trim().eq_ignore_ascii_case("theme")
+}
+
+fn session_is_visible(session: &Session, now_ms: i64) -> bool {
+    let Some(last_activity_at_ms) = session.last_activity_at_ms else {
+        return true;
+    };
+    let age_ms = now_ms.saturating_sub(last_activity_at_ms).max(0) as u64;
+    let lifetime = if session.play_state.is_paused {
+        PAUSED_SESSION_VISIBLE_AFTER
+    } else {
+        PLAYING_SESSION_STALE_AFTER
+    };
+
+    age_ms <= lifetime.as_millis() as u64
+}
+
+fn compare_auto_session_priority(
+    left: &Session,
+    right: &Session,
+    target_language: &str,
+) -> CmpOrdering {
+    let left_is_playing = !left.play_state.is_paused;
+    let right_is_playing = !right.play_state.is_paused;
+    let left_is_target = left
+        .now_playing
+        .as_ref()
+        .is_some_and(|item| item.has_audio_language(target_language));
+    let right_is_target = right
+        .now_playing
+        .as_ref()
+        .is_some_and(|item| item.has_audio_language(target_language));
+
+    right_is_playing
+        .cmp(&left_is_playing)
+        .then_with(|| right_is_target.cmp(&left_is_target))
+        .then_with(|| right.last_activity_at_ms.cmp(&left.last_activity_at_ms))
+        .then_with(|| left.id.cmp(&right.id))
 }
 
 pub struct SessionManager {
@@ -523,6 +572,26 @@ impl SessionManager {
         self.save_history(true).await;
     }
 
+    /// Queue a Tadoku export after the media server unloads the current item.
+    /// Eligibility is evaluated from the just-persisted final play position,
+    /// so completed episodes and final long-form progress sync immediately.
+    fn queue_automatic_tadoku_export(&self, finished_history_id: Option<String>) {
+        let config = self.config.clone();
+        let db = self.db.clone();
+        tokio::spawn(async move {
+            match crate::tadoku::export_if_automatic(config, db, finished_history_id).await {
+                Ok(Some(count)) => {
+                    info!(
+                        "Playback-ended Tadoku check completed ({} show logs)",
+                        count
+                    )
+                }
+                Ok(None) => {}
+                Err(error) => warn!("Playback-ended Tadoku check failed: {}", error),
+            }
+        });
+    }
+
     pub async fn select_session(&self, session_id: Option<String>) {
         let mut sel = self.selected_session_id.write().await;
         *sel = session_id;
@@ -570,6 +639,7 @@ impl SessionManager {
 
     async fn collect_server_sessions(&self, servers: ServerMap) -> Vec<ServerSession> {
         let config = self.config.read().await.clone();
+        let now_ms = chrono::Utc::now().timestamp_millis();
         let mut sessions = Vec::<ServerSession>::new();
         for (kind, server) in servers {
             match server.get_sessions().await {
@@ -587,6 +657,7 @@ impl SessionManager {
                             .filter(|session| {
                                 !session.now_playing.as_ref().is_some_and(is_ignored_episode)
                             })
+                            .filter(|session| session_is_visible(session, now_ms))
                             .map(|session| ServerSession {
                                 kind,
                                 server: server.clone(),
@@ -743,6 +814,7 @@ impl SessionManager {
             is_default: stream.is_default,
             is_external: stream.is_external,
             is_selected_in_session,
+            match_confidence: None,
             local_path: None,
             is_exact_file_match: false,
         }
@@ -901,8 +973,114 @@ impl SessionManager {
             is_default: false,
             is_external: true,
             is_selected_in_session: false,
+            match_confidence: None,
             local_path: Some(subtitle_path),
             is_exact_file_match,
+        })
+    }
+
+    fn normalize_filename_for_match(value: &str) -> Vec<char> {
+        value
+            .chars()
+            .flat_map(char::to_lowercase)
+            .filter(|character| character.is_alphanumeric())
+            .collect()
+    }
+
+    fn filename_number_tokens(value: &str) -> Vec<String> {
+        let mut tokens = Vec::new();
+        let mut current = String::new();
+
+        for character in value.chars().chain(std::iter::once(' ')) {
+            if character.is_ascii_digit() {
+                current.push(character);
+            } else if !current.is_empty() {
+                let normalized = current.trim_start_matches('0');
+                tokens.push(if normalized.is_empty() {
+                    "0".to_string()
+                } else {
+                    normalized.to_string()
+                });
+                current.clear();
+            }
+        }
+
+        tokens
+    }
+
+    /// Return a normalized Levenshtein similarity in the inclusive range 0..=100.
+    /// Punctuation, spacing, and case are ignored so common release-name differences
+    /// do not overwhelm the meaningful parts of the filename.
+    fn subtitle_filename_confidence(media_stem: &str, subtitle_stem: &str) -> u8 {
+        let media = Self::normalize_filename_for_match(media_stem);
+        let subtitle = Self::normalize_filename_for_match(subtitle_stem);
+        let max_len = media.len().max(subtitle.len());
+
+        if max_len == 0 {
+            return 0;
+        }
+
+        let mut previous: Vec<usize> = (0..=subtitle.len()).collect();
+        let mut current = vec![0; subtitle.len() + 1];
+
+        for (media_index, media_character) in media.iter().enumerate() {
+            current[0] = media_index + 1;
+            for (subtitle_index, subtitle_character) in subtitle.iter().enumerate() {
+                let substitution_cost = usize::from(media_character != subtitle_character);
+                current[subtitle_index + 1] = (previous[subtitle_index + 1] + 1)
+                    .min(current[subtitle_index] + 1)
+                    .min(previous[subtitle_index] + substitution_cost);
+            }
+            std::mem::swap(&mut previous, &mut current);
+        }
+
+        let distance = previous[subtitle.len()];
+        let mut confidence = ((max_len - distance) * 100 + max_len / 2) / max_len;
+
+        // Track/episode numbers carry more identity than the surrounding release
+        // text. Penalize a conflicting final number so "Episode 02 (JP)" ranks
+        // above an otherwise-nearer "Episode 03".
+        let media_numbers = Self::filename_number_tokens(media_stem);
+        let subtitle_numbers = Self::filename_number_tokens(subtitle_stem);
+        if media_numbers.last().is_some()
+            && subtitle_numbers.last().is_some()
+            && media_numbers.last() != subtitle_numbers.last()
+        {
+            confidence /= 2;
+        }
+
+        confidence as u8
+    }
+
+    fn fuzzy_sidecar_subtitle_candidate(
+        video_stem: &str,
+        subtitle_path: PathBuf,
+    ) -> Option<SubtitleCandidate> {
+        let extension = Self::is_supported_subtitle_extension(&subtitle_path)?;
+        if extension != "srt" {
+            return None;
+        }
+
+        let file_name = subtitle_path.file_name()?.to_str()?.to_string();
+        let stem = subtitle_path.file_stem()?.to_str()?;
+        let match_confidence = Self::subtitle_filename_confidence(video_stem, stem);
+
+        Some(SubtitleCandidate {
+            id: format!("sidecar:{file_name}"),
+            source: SubtitleCandidateSource::Sidecar,
+            stream_index: None,
+            language: None,
+            label: format!(
+                "{file_name} ({} Sidecar · {match_confidence}% match)",
+                extension.to_ascii_uppercase()
+            ),
+            codec: Some(extension),
+            is_default: false,
+            is_external: true,
+            is_selected_in_session: false,
+            match_confidence: Some(match_confidence),
+            local_path: Some(subtitle_path),
+            is_exact_file_match: false,
         })
     }
 
@@ -925,10 +1103,29 @@ impl SessionManager {
             .collect();
         paths.sort();
 
-        paths
+        let exact_candidates: Vec<SubtitleCandidate> = paths
+            .iter()
+            .filter_map(|path| Self::sidecar_subtitle_candidate(video_stem, path.clone()))
+            .collect();
+        if !exact_candidates.is_empty() {
+            return exact_candidates;
+        }
+
+        // If no same-basename sidecar exists, make every SRT in the media
+        // directory available for manual correction (and rank the best guess
+        // first for auto-selection). Other formats remain exact-only so a
+        // broad fallback cannot surface unrelated attachment/font-heavy ASS files.
+        let mut fuzzy_candidates: Vec<SubtitleCandidate> = paths
             .into_iter()
-            .filter_map(|path| Self::sidecar_subtitle_candidate(video_stem, path))
-            .collect()
+            .filter_map(|path| Self::fuzzy_sidecar_subtitle_candidate(video_stem, path))
+            .collect();
+        fuzzy_candidates.sort_by(|left, right| {
+            right
+                .match_confidence
+                .cmp(&left.match_confidence)
+                .then_with(|| left.label.to_lowercase().cmp(&right.label.to_lowercase()))
+        });
+        fuzzy_candidates
     }
 
     async fn mapped_media_path_for_session(
@@ -1232,7 +1429,11 @@ impl SessionManager {
         let native_lang = config.native_language.clone();
         drop(config);
 
-        let sessions = self.collect_server_sessions(servers).await;
+        let mut sessions = self.collect_server_sessions(servers).await;
+        sessions.sort_by(|left, right| {
+            compare_auto_session_priority(&left.session, &right.session, &target_lang)
+                .then_with(|| left.kind.cmp(&right.kind))
+        });
 
         // Build session summaries
         let summaries: Vec<SessionSummary> = sessions
@@ -1263,10 +1464,9 @@ impl SessionManager {
                     .cloned()
             })
         } else {
-            // Sticky auto-select: if a session is already active and still
-            // playing, keep tracking it. Re-picking every poll causes the
-            // active session to flicker between multiple concurrent sessions
-            // (server session ordering is not stable across requests).
+            // Sticky auto-select applies only to actual playback. A paused
+            // session must never block a newly playing session, while keeping
+            // the current live player avoids flicker between concurrent ones.
             let previous_active_id = self.state.read().await.active_session_id.clone();
             let sticky = previous_active_id.as_deref().and_then(|id| {
                 split_scoped_id(id).and_then(|(kind, raw_id)| {
@@ -1276,30 +1476,19 @@ impl SessionManager {
                             s.kind == kind
                                 && s.session.id == raw_id
                                 && s.session.now_playing.is_some()
+                                && !s.session.play_state.is_paused
                         })
                         .cloned()
                 })
             });
 
             sticky.or_else(|| {
-                // No valid current session — pick a fresh one, preferring a
-                // target-language session, falling back to any playing session.
+                // Sessions are pre-sorted with playing first, then target
+                // language and freshness. Paused sessions are a final fallback.
                 sessions
                     .iter()
-                    .find(|s| {
-                        s.session
-                            .now_playing
-                            .as_ref()
-                            .map(|np| np.has_audio_language(&target_lang))
-                            .unwrap_or(false)
-                    })
+                    .find(|s| s.session.now_playing.is_some())
                     .cloned()
-                    .or_else(|| {
-                        sessions
-                            .iter()
-                            .find(|s| s.session.now_playing.is_some())
-                            .cloned()
-                    })
             })
         };
 
@@ -1321,7 +1510,8 @@ impl SessionManager {
         )> = None;
         let mut next_candidates = Vec::new();
         let mut next_override_candidate_id = None;
-        let mut active_item_ended = false;
+        let active_item_ended;
+        let finished_history_id;
 
         {
             let mut state = self.state.write().await;
@@ -1342,6 +1532,12 @@ impl SessionManager {
                     .clone()
                     .unwrap_or_else(|| format!("mediasource_{}", np.item_id));
                 let item_changed = prev_history_id.as_deref() != Some(&history_id);
+                active_item_ended = item_changed && prev_history_id.is_some();
+                finished_history_id = if active_item_ended {
+                    prev_history_id
+                } else {
+                    None
+                };
                 let requested_override = if item_changed {
                     None
                 } else {
@@ -1426,6 +1622,10 @@ impl SessionManager {
                 }
             } else {
                 active_item_ended = state.now_playing.is_some();
+                finished_history_id = state
+                    .now_playing
+                    .as_ref()
+                    .map(|now_playing| now_playing.history_id.clone());
                 state.active_session_id = None;
                 state.now_playing = None;
             }
@@ -1454,6 +1654,7 @@ impl SessionManager {
             if active_item_ended {
                 debug!("Active playback ended; flushing session history to SQLite");
                 self.flush_history().await;
+                self.queue_automatic_tadoku_export(finished_history_id);
             }
             return;
         }
@@ -1590,6 +1791,11 @@ impl SessionManager {
 
         // Throttled save for position updates (at most once every 5 s)
         self.save_history(false).await;
+
+        if active_item_ended {
+            debug!("Previous playback item unloaded; checking automatic Tadoku sync");
+            self.queue_automatic_tadoku_export(finished_history_id);
+        }
 
         // Broadcast final state (covers position-only polls where no subtitle
         // reload occurred; harmless double-send on new-item polls).
@@ -1990,11 +2196,15 @@ pub async fn run_session_poller(manager: Arc<SessionManager>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        SessionManager, SubtitleCandidateSource, SubtitleSelectionMode, is_ignored_episode,
+        PAUSED_SESSION_VISIBLE_AFTER, PLAYING_SESSION_STALE_AFTER, SessionManager,
+        SubtitleCandidateSource, SubtitleSelectionMode, compare_auto_session_priority,
+        is_ignored_episode, session_is_visible,
     };
     use crate::config::MediaServerKind;
-    use crate::media_server::NowPlaying;
+    use crate::media_server::{MediaStream, NowPlaying, PlayState, Session, StreamType};
+    use std::fs;
     use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn now_playing(name: &str, media_type: &str, series_name: Option<&str>) -> NowPlaying {
         NowPlaying {
@@ -2009,6 +2219,110 @@ mod tests {
             media_source_id: None,
             path: None,
         }
+    }
+
+    fn playback_session(
+        id: &str,
+        is_paused: bool,
+        language: &str,
+        last_activity_at_ms: Option<i64>,
+    ) -> Session {
+        let mut item = now_playing(id, "Episode", Some("Series"));
+        item.media_streams.push(MediaStream {
+            index: 0,
+            stream_type: StreamType::Audio,
+            codec: None,
+            language: Some(language.to_string()),
+            display_title: None,
+            is_default: true,
+            is_external: false,
+            is_text_subtitle_stream: false,
+            title: None,
+        });
+
+        Session {
+            id: id.to_string(),
+            client: "Test".to_string(),
+            device_name: id.to_string(),
+            user_name: None,
+            user_id: None,
+            last_activity_at_ms,
+            now_playing: Some(item),
+            play_state: PlayState {
+                can_seek: true,
+                is_paused,
+                position_ticks: Some(0),
+                audio_stream_index: Some(0),
+                subtitle_stream_index: None,
+            },
+            supports_remote_control: true,
+        }
+    }
+
+    #[test]
+    fn auto_selection_prioritizes_playing_over_paused_target_session() {
+        let mut sessions = [
+            playback_session("stale-abs", true, "jpn", Some(99_000)),
+            playback_session("active-jellyfin", false, "eng", Some(90_000)),
+        ];
+
+        sessions.sort_by(|left, right| compare_auto_session_priority(left, right, "jpn"));
+
+        assert_eq!(sessions[0].id, "active-jellyfin");
+    }
+
+    #[test]
+    fn auto_selection_uses_language_then_freshness_within_same_play_state() {
+        let mut sessions = [
+            playback_session("older-target", false, "jpn", Some(80_000)),
+            playback_session("newer-other", false, "eng", Some(99_000)),
+            playback_session("newer-target", false, "jpn", Some(90_000)),
+        ];
+
+        sessions.sort_by(|left, right| compare_auto_session_priority(left, right, "jpn"));
+
+        assert_eq!(sessions[0].id, "newer-target");
+        assert_eq!(sessions[1].id, "older-target");
+        assert_eq!(sessions[2].id, "newer-other");
+    }
+
+    #[test]
+    fn timestamped_sessions_expire_according_to_play_state() {
+        let now_ms = 1_000_000;
+        let paused_lifetime_ms = PAUSED_SESSION_VISIBLE_AFTER.as_millis() as i64;
+        let playing_lifetime_ms = PLAYING_SESSION_STALE_AFTER.as_millis() as i64;
+
+        assert!(session_is_visible(
+            &playback_session(
+                "recent-pause",
+                true,
+                "jpn",
+                Some(now_ms - paused_lifetime_ms)
+            ),
+            now_ms
+        ));
+        assert!(!session_is_visible(
+            &playback_session(
+                "old-pause",
+                true,
+                "jpn",
+                Some(now_ms - paused_lifetime_ms - 1),
+            ),
+            now_ms
+        ));
+        assert!(!session_is_visible(
+            &playback_session(
+                "stalled-player",
+                false,
+                "jpn",
+                Some(now_ms - playing_lifetime_ms - 1),
+            ),
+            now_ms
+        ));
+        assert!(session_is_visible(
+            &playback_session("no-clock", true, "jpn", None),
+            now_ms
+        ));
     }
 
     #[test]
@@ -2076,5 +2390,59 @@ mod tests {
 
         assert_eq!(mode, SubtitleSelectionMode::Manual);
         assert_eq!(selected.unwrap().id, manual_candidate.id);
+    }
+
+    #[test]
+    fn fuzzy_sidecars_are_ranked_by_filename_confidence() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "nagare-subtitle-fuzzy-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+
+        let media_path = directory.join("Book Chapter 02.mp3");
+        fs::write(&media_path, []).unwrap();
+        fs::write(directory.join("Book Chapter 19.srt"), []).unwrap();
+        fs::write(directory.join("Book Chapter 02 Japanese.srt"), []).unwrap();
+        fs::write(directory.join("Book Chapter 02 Japanese.ass"), []).unwrap();
+
+        let candidates = SessionManager::sidecar_subtitle_candidates(&media_path);
+
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].id, "sidecar:Book Chapter 02 Japanese.srt");
+        assert!(candidates[0].match_confidence > candidates[1].match_confidence);
+        assert!(candidates[0].label.contains("% match"));
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn exact_sidecars_suppress_directory_wide_fuzzy_fallback() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "nagare-subtitle-exact-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+
+        let media_path = directory.join("Book Chapter 02.mp3");
+        fs::write(&media_path, []).unwrap();
+        fs::write(directory.join("Book Chapter 02.ja.srt"), []).unwrap();
+        fs::write(directory.join("Another Book.srt"), []).unwrap();
+
+        let candidates = SessionManager::sidecar_subtitle_candidates(&media_path);
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].id, "sidecar:Book Chapter 02.ja.srt");
+        assert_eq!(candidates[0].match_confidence, None);
+
+        fs::remove_dir_all(directory).unwrap();
     }
 }

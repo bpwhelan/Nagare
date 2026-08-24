@@ -15,6 +15,9 @@ use tracing::warn;
 pub enum EnrichmentSource {
     #[default]
     Pending,
+    /// A previous enhancement attempt failed. Keep the card available for a
+    /// deliberate retry, but do not let frontend auto-approval resubmit it.
+    Retry,
     MiningHistory,
 }
 
@@ -77,6 +80,7 @@ pub struct MiningHistorySummary {
 #[derive(Debug, Clone)]
 pub struct TadokuExportBatch {
     pub batch_id: String,
+    pub tadoku_log_id: Option<String>,
     pub series_name: String,
     pub description: String,
     pub duration_seconds: i32,
@@ -102,6 +106,9 @@ struct TadokuCandidateRow {
     duration_ms: i64,
     file_path: Option<String>,
 }
+
+const LONGFORM_TADOKU_THRESHOLD_MS: i64 = 2 * 60 * 60 * 1_000;
+const LONGFORM_TADOKU_CHECKPOINT_MS: i64 = 30 * 60 * 1_000;
 
 impl MiningHistoryEntry {
     pub fn dialog_state(&self) -> EnrichmentDialogState {
@@ -234,6 +241,27 @@ impl AppDatabase {
         })
         .await
         .context("SQLite Tadoku batch preparation task failed")?
+    }
+
+    pub async fn prepare_automatic_tadoku_batches(
+        &self,
+        export_date: String,
+        language_code: String,
+        finished_history_id: Option<String>,
+    ) -> anyhow::Result<Vec<TadokuExportBatch>> {
+        let db_path = self.db_path.clone();
+        tokio::task::spawn_blocking(move || {
+            prepare_tadoku_batches_with_policy_sync(
+                &db_path,
+                &export_date,
+                &language_code,
+                None,
+                true,
+                finished_history_id.as_deref(),
+            )
+        })
+        .await
+        .context("SQLite automatic Tadoku batch preparation task failed")?
     }
 
     pub async fn list_tadoku_candidates(
@@ -790,12 +818,34 @@ fn prepare_tadoku_batches_sync(
     language_code: &str,
     selected_history_ids: Option<&HashSet<String>>,
 ) -> anyhow::Result<Vec<TadokuExportBatch>> {
+    prepare_tadoku_batches_with_policy_sync(
+        db_path,
+        export_date,
+        language_code,
+        selected_history_ids,
+        false,
+        None,
+    )
+}
+
+fn prepare_tadoku_batches_with_policy_sync(
+    db_path: &Path,
+    export_date: &str,
+    language_code: &str,
+    selected_history_ids: Option<&HashSet<String>>,
+    automatic: bool,
+    finished_history_id: Option<&str>,
+) -> anyhow::Result<Vec<TadokuExportBatch>> {
     let mut conn = open_connection(db_path)?;
     let tx = conn
         .transaction()
         .context("Failed to start Tadoku export transaction")?;
 
     refresh_pending_tadoku_batches(&tx, language_code)?;
+
+    if automatic {
+        prepare_longform_tadoku_checkpoints(&tx, export_date, language_code, finished_history_id)?;
+    }
 
     let mut retry_batches = if let Some(selected) = selected_history_ids {
         query_pending_tadoku_batches(&tx, language_code)?
@@ -807,7 +857,13 @@ fn prepare_tadoku_batches_sync(
         Vec::new()
     };
 
-    let candidates = query_tadoku_candidates(&tx, language_code)?;
+    let mut candidates = query_tadoku_candidates(&tx, language_code)?;
+    if automatic {
+        // Long-form titles use one cumulative Tadoku log that is updated at
+        // coarse checkpoints. Never also put them through the completed-item
+        // grouping path, which would claim the item a second way.
+        candidates.retain(|candidate| candidate.duration_ms <= LONGFORM_TADOKU_THRESHOLD_MS);
+    }
     let mut groups: BTreeMap<String, Vec<TadokuCandidateRow>> = BTreeMap::new();
     for candidate in candidates {
         if selected_history_ids
@@ -866,6 +922,7 @@ fn prepare_tadoku_batches_sync(
 
         created_batches.push(TadokuExportBatch {
             batch_id,
+            tadoku_log_id: None,
             series_name,
             description,
             duration_seconds,
@@ -885,7 +942,7 @@ fn prepare_tadoku_batches_sync(
     let conn = open_connection(db_path)?;
     let mut stmt = conn.prepare(
         "
-        SELECT batch_id, series_name, description, duration_seconds, language_code
+        SELECT batch_id, tadoku_log_id, series_name, description, duration_seconds, language_code
         FROM tadoku_export_batches
         WHERE status = 'pending' AND language_code = ?1
         ORDER BY created_at, series_name
@@ -894,10 +951,11 @@ fn prepare_tadoku_batches_sync(
     let rows = stmt.query_map([language_code], |row| {
         Ok(TadokuExportBatch {
             batch_id: row.get(0)?,
-            series_name: row.get(1)?,
-            description: row.get(2)?,
-            duration_seconds: row.get(3)?,
-            language_code: row.get(4)?,
+            tadoku_log_id: row.get(1)?,
+            series_name: row.get(2)?,
+            description: row.get(3)?,
+            duration_seconds: row.get(4)?,
+            language_code: row.get(5)?,
             file_paths: Vec::new(),
         })
     })?;
@@ -909,6 +967,186 @@ fn prepare_tadoku_batches_sync(
     Ok(batches)
 }
 
+/// Prepare cumulative checkpoints for media whose maximum runtime is over two
+/// hours. A history item owns one batch for its lifetime; completed batches are
+/// moved back to pending when another 30 minutes of progress accrue, or when
+/// the player unloads that item. The stable batch description lets Tadoku update
+/// one remote log instead of creating a log for every playback event.
+fn prepare_longform_tadoku_checkpoints(
+    conn: &Connection,
+    export_date: &str,
+    language_code: &str,
+    finished_history_id: Option<&str>,
+) -> anyhow::Result<()> {
+    let now = Utc::now().to_rfc3339();
+    let mut existing_stmt = conn.prepare(
+        "
+        SELECT
+            teb.batch_id,
+            teb.status,
+            teb.duration_seconds,
+            teb.description,
+            mh.history_id,
+            mh.last_position_ms,
+            mh.duration_ms,
+            mh.series_name,
+            mh.title,
+            mh.file_path
+        FROM tadoku_export_batches teb
+        JOIN tadoku_export_items tei ON tei.batch_id = teb.batch_id
+        JOIN media_history mh ON mh.history_id = tei.history_id
+        WHERE teb.language_code = ?1
+          AND teb.status IN ('pending', 'completed')
+          AND mh.duration_ms > ?2
+        ",
+    )?;
+    let existing_rows = existing_stmt.query_map(
+        params![language_code, LONGFORM_TADOKU_THRESHOLD_MS],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, String>(8)?,
+                row.get::<_, Option<String>>(9)?,
+            ))
+        },
+    )?;
+    let existing_rows = existing_rows.collect::<Result<Vec<_>, _>>()?;
+    drop(existing_stmt);
+
+    for (
+        batch_id,
+        status,
+        synced_seconds,
+        description,
+        history_id,
+        position_ms,
+        duration_ms,
+        series_name,
+        title,
+        file_path,
+    ) in existing_rows
+    {
+        if status != "completed" {
+            continue;
+        }
+        let checkpoint_ms = position_ms.clamp(0, duration_ms);
+        let synced_ms = synced_seconds.saturating_mul(1_000);
+        let forced = finished_history_id == Some(history_id.as_str());
+        let progress_due = checkpoint_ms > synced_ms
+            && (forced || checkpoint_ms.saturating_sub(synced_ms) >= LONGFORM_TADOKU_CHECKPOINT_MS);
+        let desired_description =
+            longform_tadoku_description(series_name.as_deref(), &title, file_path.as_deref());
+        let description_changed = description.trim() != desired_description;
+        if progress_due || description_changed {
+            let duration_seconds = if progress_due {
+                tadoku_duration_seconds(i128::from(checkpoint_ms))
+            } else {
+                synced_seconds.clamp(1, i64::from(i32::MAX)) as i32
+            };
+            conn.execute(
+                "UPDATE tadoku_export_batches
+                 SET duration_seconds = ?2, series_name = ?3, description = ?3,
+                     status = 'pending', last_error = NULL, updated_at = ?4
+                 WHERE batch_id = ?1",
+                params![batch_id, duration_seconds, desired_description, now],
+            )?;
+        }
+    }
+
+    let mut candidate_stmt = conn.prepare(
+        "
+        SELECT
+            mh.history_id,
+            COALESCE(NULLIF(mh.series_name, ''), teo.title) AS series_name,
+            mh.title,
+            mh.last_seen,
+            mh.last_position_ms,
+            mh.duration_ms,
+            mh.file_path
+        FROM media_history mh
+        LEFT JOIN tadoku_episode_overrides teo ON teo.history_id = mh.history_id
+        WHERE mh.duration_ms > ?1
+          AND mh.last_position_ms > 0
+          AND julianday(mh.last_seen) >= julianday((
+              SELECT value FROM app_metadata WHERE key = 'tadoku_candidate_cutoff'
+          ))
+          AND NOT EXISTS (
+              SELECT 1 FROM tadoku_episode_decisions ted WHERE ted.history_id = mh.history_id
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM tadoku_export_items tei WHERE tei.history_id = mh.history_id
+          )
+          AND NOT EXISTS (
+              SELECT 1
+              FROM tadoku_export_items tei
+              JOIN media_history exported ON exported.history_id = tei.history_id
+              WHERE LOWER(COALESCE(NULLIF(exported.series_name, ''), exported.title)) =
+                    LOWER(COALESCE(NULLIF(mh.series_name, ''), mh.title))
+                AND LOWER(exported.title) = LOWER(mh.title)
+          )
+        ORDER BY COALESCE(NULLIF(mh.series_name, ''), teo.title, mh.title), mh.last_seen
+        ",
+    )?;
+    let candidate_rows = candidate_stmt.query_map([LONGFORM_TADOKU_THRESHOLD_MS], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, Option<String>>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, i64>(4)?,
+            row.get::<_, i64>(5)?,
+            row.get::<_, Option<String>>(6)?,
+        ))
+    })?;
+    let candidate_rows = candidate_rows.collect::<Result<Vec<_>, _>>()?;
+    drop(candidate_stmt);
+
+    for (history_id, series_name, title, watched_at, position_ms, duration_ms, file_path) in
+        candidate_rows
+    {
+        let checkpoint_ms = position_ms.clamp(0, duration_ms);
+        let forced = finished_history_id == Some(history_id.as_str());
+        if !forced && checkpoint_ms < LONGFORM_TADOKU_CHECKPOINT_MS {
+            continue;
+        }
+
+        let batch_id = uuid::Uuid::new_v4().to_string();
+        let description =
+            longform_tadoku_description(series_name.as_deref(), &title, file_path.as_deref());
+        let series_name = description.clone();
+        conn.execute(
+            "
+            INSERT INTO tadoku_export_batches (
+                batch_id, export_date, series_name, description,
+                duration_seconds, language_code, status, created_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7, ?7)
+            ",
+            params![
+                batch_id,
+                export_date,
+                series_name,
+                description,
+                tadoku_duration_seconds(i128::from(checkpoint_ms)),
+                language_code,
+                now,
+            ],
+        )?;
+        conn.execute(
+            "INSERT INTO tadoku_export_items (history_id, batch_id, watched_at) VALUES (?1, ?2, ?3)",
+            params![history_id, batch_id, watched_at],
+        )?;
+    }
+
+    Ok(())
+}
+
 fn refresh_pending_tadoku_batches(conn: &Connection, language_code: &str) -> anyhow::Result<()> {
     let mut stmt = conn.prepare(
         "
@@ -916,7 +1154,8 @@ fn refresh_pending_tadoku_batches(conn: &Connection, language_code: &str) -> any
             tadoku_export_batches.batch_id,
             tadoku_export_batches.series_name,
             media_history.title,
-            media_history.duration_ms
+            media_history.duration_ms,
+            media_history.last_position_ms
         FROM tadoku_export_batches
         JOIN tadoku_export_items
           ON tadoku_export_items.batch_id = tadoku_export_batches.batch_id
@@ -935,15 +1174,25 @@ fn refresh_pending_tadoku_batches(conn: &Connection, language_code: &str) -> any
             row.get::<_, String>(1)?,
             row.get::<_, String>(2)?,
             row.get::<_, i64>(3)?,
+            row.get::<_, i64>(4)?,
         ))
     })?;
-    let mut batches: BTreeMap<String, (String, Vec<(String, i64)>)> = BTreeMap::new();
+    let mut batches: BTreeMap<String, (String, Vec<(String, i64, bool)>)> = BTreeMap::new();
     for row in rows {
-        let (batch_id, series_name, title, duration_ms) = row?;
+        let (batch_id, series_name, title, duration_ms, position_ms) = row?;
+        let credited_ms = if duration_ms > LONGFORM_TADOKU_THRESHOLD_MS {
+            position_ms.clamp(1, duration_ms)
+        } else {
+            duration_ms
+        };
         let batch = batches
             .entry(batch_id)
             .or_insert_with(|| (series_name, Vec::new()));
-        batch.1.push((title, duration_ms));
+        batch.1.push((
+            title,
+            credited_ms,
+            duration_ms > LONGFORM_TADOKU_THRESHOLD_MS,
+        ));
     }
     drop(stmt);
 
@@ -951,13 +1200,19 @@ fn refresh_pending_tadoku_batches(conn: &Connection, language_code: &str) -> any
     for (batch_id, (series_name, episodes)) in batches {
         let duration_seconds = episodes
             .iter()
-            .map(|(_, duration_ms)| i128::from(tadoku_duration_seconds(i128::from(*duration_ms))))
+            .map(|(_, duration_ms, _)| {
+                i128::from(tadoku_duration_seconds(i128::from(*duration_ms)))
+            })
             .sum::<i128>()
             .clamp(1, i32::MAX as i128) as i32;
-        let description = tadoku_batch_description(
-            &series_name,
-            episodes.iter().map(|(title, _)| title.as_str()),
-        );
+        let description = if episodes.len() == 1 && episodes[0].2 {
+            series_name.clone()
+        } else {
+            tadoku_batch_description(
+                &series_name,
+                episodes.iter().map(|(title, _, _)| title.as_str()),
+            )
+        };
         conn.execute(
             "UPDATE tadoku_export_batches SET description = ?2, duration_seconds = ?3, updated_at = ?4 WHERE batch_id = ?1",
             params![batch_id, description, duration_seconds, now],
@@ -1126,7 +1381,7 @@ fn query_pending_tadoku_batches(
 ) -> anyhow::Result<Vec<(TadokuExportBatch, HashSet<String>)>> {
     let mut stmt = conn.prepare(
         "
-        SELECT batch_id, series_name, description, duration_seconds, language_code
+        SELECT batch_id, tadoku_log_id, series_name, description, duration_seconds, language_code
         FROM tadoku_export_batches
         WHERE status = 'pending' AND language_code = ?1
         ORDER BY created_at, series_name
@@ -1135,10 +1390,11 @@ fn query_pending_tadoku_batches(
     let rows = stmt.query_map([language_code], |row| {
         Ok(TadokuExportBatch {
             batch_id: row.get(0)?,
-            series_name: row.get(1)?,
-            description: row.get(2)?,
-            duration_seconds: row.get(3)?,
-            language_code: row.get(4)?,
+            tadoku_log_id: row.get(1)?,
+            series_name: row.get(2)?,
+            description: row.get(3)?,
+            duration_seconds: row.get(4)?,
+            language_code: row.get(5)?,
             file_paths: Vec::new(),
         })
     })?;
@@ -1239,6 +1495,7 @@ fn query_tadoku_candidates(
           AND media_history.duration_ms > 0
           AND media_history.last_position_ms > 0
           AND media_history.last_position_ms * 100 >= media_history.duration_ms * 80
+          AND media_history.last_position_ms + 300000 >= media_history.duration_ms
           AND julianday(media_history.last_seen) >= julianday((
               SELECT value FROM app_metadata WHERE key = 'tadoku_candidate_cutoff'
           ))
@@ -1311,6 +1568,43 @@ fn query_tadoku_candidates(
 
 fn tadoku_duration_seconds(total_duration_ms: i128) -> i32 {
     (total_duration_ms / 1_000).clamp(1, i32::MAX as i128) as i32
+}
+
+fn longform_tadoku_description(
+    series_name: Option<&str>,
+    title: &str,
+    file_path: Option<&str>,
+) -> String {
+    if let Some(series_name) = series_name.map(str::trim).filter(|name| !name.is_empty()) {
+        return series_name.to_string();
+    }
+
+    if let Some((book_title, track_title)) = title.rsplit_once(" — ") {
+        let track_title = trim_html_space_suffix(track_title);
+        let matches_file = file_path
+            .and_then(|path| Path::new(path).file_name())
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.trim().eq_ignore_ascii_case(track_title));
+        let is_audio_filename = Path::new(track_title)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| {
+                matches!(extension.to_ascii_lowercase().as_str(), "mp3" | "m4b")
+            });
+        if matches_file || is_audio_filename {
+            return trim_html_space_suffix(book_title).to_string();
+        }
+    }
+
+    trim_html_space_suffix(title).to_string()
+}
+
+fn trim_html_space_suffix(mut value: &str) -> &str {
+    value = value.trim();
+    while let Some(trimmed) = value.strip_suffix("&#x20;") {
+        value = trimmed.trim_end();
+    }
+    value
 }
 
 fn tadoku_batch_description<'a>(
@@ -1722,7 +2016,8 @@ fn parse_timestamp(raw: &str) -> Result<DateTime<Utc>, std::io::Error> {
 mod tests {
     use super::{
         decline_tadoku_candidates_sync, list_tadoku_candidates_sync, open_connection,
-        prepare_tadoku_batches_sync, save_session_history_sync, set_tadoku_candidate_title_sync,
+        prepare_tadoku_batches_sync, prepare_tadoku_batches_with_policy_sync,
+        save_session_history_sync, set_tadoku_candidate_title_sync,
     };
     use crate::config::MediaServerKind;
     use crate::session::HistoryEntry;
@@ -1878,6 +2173,145 @@ mod tests {
         assert_eq!(retried.len(), 1);
         assert_eq!(retried[0].duration_seconds, 1_389);
 
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn tadoku_does_not_finish_long_media_with_too_much_remaining() {
+        let path = std::env::temp_dir().join(format!(
+            "nagare-tadoku-long-media-test-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        drop(open_connection(&path).unwrap());
+
+        let mut audiobook = history_entry("1", "Audiobook", 14_400_000); // 80% of five hours
+        audiobook.duration_ms = Some(18_000_000);
+        let history = HashMap::from([(audiobook.history_id.clone(), audiobook)]);
+        save_session_history_sync(&path, &history, None).unwrap();
+
+        assert!(
+            list_tadoku_candidates_sync(&path, "jpn")
+                .unwrap()
+                .is_empty()
+        );
+
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn automatic_tadoku_reuses_one_longform_batch_at_coarse_checkpoints() {
+        let path = std::env::temp_dir().join(format!(
+            "nagare-tadoku-longform-checkpoint-test-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        drop(open_connection(&path).unwrap());
+
+        let clean_title = "陰の実力者になりたくて！";
+        let mut audiobook = history_entry("book-1", clean_title, 29 * 60 * 1_000);
+        audiobook.title =
+            "陰の実力者になりたくて！ — 陰の実力者になりたくて！ 02.m4b &#x20;".to_string();
+        audiobook.series_name = None;
+        audiobook.file_path = Some("/audiobooks/陰の実力者になりたくて！ 02.m4b".to_string());
+        audiobook.duration_ms = Some(5 * 60 * 60 * 1_000);
+        let history_id = audiobook.history_id.clone();
+        let mut history = HashMap::from([(history_id.clone(), audiobook)]);
+        save_session_history_sync(&path, &history, None).unwrap();
+
+        let before_checkpoint =
+            prepare_tadoku_batches_with_policy_sync(&path, "2026-08-24", "jpn", None, true, None)
+                .unwrap();
+        assert!(before_checkpoint.is_empty());
+
+        history.get_mut(&history_id).unwrap().last_position_ms = 30 * 60 * 1_000;
+        save_session_history_sync(&path, &history, None).unwrap();
+        let first =
+            prepare_tadoku_batches_with_policy_sync(&path, "2026-08-24", "jpn", None, true, None)
+                .unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].duration_seconds, 30 * 60);
+        assert_eq!(first[0].description, clean_title);
+        let batch_id = first[0].batch_id.clone();
+
+        let conn = open_connection(&path).unwrap();
+        conn.execute(
+            "UPDATE tadoku_export_batches
+             SET status = 'completed', tadoku_log_id = 'remote-log-1', description = ?2
+             WHERE batch_id = ?1",
+            params![
+                &batch_id,
+                "陰の実力者になりたくて！ — 陰の実力者になりたくて！ 02.m4b &#x20;"
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        history.get_mut(&history_id).unwrap().last_position_ms = 44 * 60 * 1_000;
+        save_session_history_sync(&path, &history, None).unwrap();
+        let title_correction =
+            prepare_tadoku_batches_with_policy_sync(&path, "2026-08-24", "jpn", None, true, None)
+                .unwrap();
+        assert_eq!(title_correction.len(), 1);
+        assert_eq!(title_correction[0].batch_id, batch_id);
+        assert_eq!(title_correction[0].description, clean_title);
+        assert_eq!(
+            title_correction[0].tadoku_log_id.as_deref(),
+            Some("remote-log-1")
+        );
+
+        let conn = open_connection(&path).unwrap();
+        conn.execute(
+            "UPDATE tadoku_export_batches SET status = 'completed' WHERE batch_id = ?1",
+            [&batch_id],
+        )
+        .unwrap();
+        drop(conn);
+
+        let not_due =
+            prepare_tadoku_batches_with_policy_sync(&path, "2026-08-24", "jpn", None, true, None)
+                .unwrap();
+        assert!(not_due.is_empty());
+
+        history.get_mut(&history_id).unwrap().last_position_ms = 60 * 60 * 1_000;
+        save_session_history_sync(&path, &history, None).unwrap();
+        let second_checkpoint =
+            prepare_tadoku_batches_with_policy_sync(&path, "2026-08-24", "jpn", None, true, None)
+                .unwrap();
+        assert_eq!(second_checkpoint.len(), 1);
+        assert_eq!(second_checkpoint[0].batch_id, batch_id);
+        assert_eq!(second_checkpoint[0].duration_seconds, 60 * 60);
+
+        let conn = open_connection(&path).unwrap();
+        conn.execute(
+            "UPDATE tadoku_export_batches SET status = 'completed' WHERE batch_id = ?1",
+            [&batch_id],
+        )
+        .unwrap();
+        drop(conn);
+
+        history.get_mut(&history_id).unwrap().last_position_ms = 74 * 60 * 1_000;
+        save_session_history_sync(&path, &history, None).unwrap();
+
+        let final_flush = prepare_tadoku_batches_with_policy_sync(
+            &path,
+            "2026-08-24",
+            "jpn",
+            None,
+            true,
+            Some(&history_id),
+        )
+        .unwrap();
+        assert_eq!(final_flush.len(), 1);
+        assert_eq!(final_flush[0].batch_id, batch_id);
+        assert_eq!(final_flush[0].duration_seconds, 74 * 60);
+
+        let conn = open_connection(&path).unwrap();
+        let batch_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM tadoku_export_batches", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(batch_count, 1);
+        drop(conn);
         std::fs::remove_file(path).unwrap();
     }
 

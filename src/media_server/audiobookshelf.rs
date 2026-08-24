@@ -23,6 +23,39 @@ const LOCAL_SESSION_VISIBLE_AFTER_MS: i64 = 15 * 60 * 1_000;
 const LISTENING_SESSION_PAGE_SIZE: usize = 100;
 const LOCAL_PLAY_METHOD: u64 = 3;
 
+/// ABS can retain a title from an older downloaded-playback row even after
+/// the library item's metadata has been corrected. Some audiobook files use a
+/// leading volume marker such as `[1巻]`, which is useful in the filename but
+/// noisy in Nagare's now-playing title.
+fn strip_volume_prefix(title: &str) -> String {
+    let trimmed = title.trim();
+    let Some(bracketed) = trimmed.strip_prefix('[') else {
+        return trimmed.to_string();
+    };
+    let Some(close_bracket) = bracketed.find(']') else {
+        return trimmed.to_string();
+    };
+
+    let marker = bracketed[..close_bracket].trim();
+    let number = marker
+        .strip_prefix('第')
+        .unwrap_or(marker)
+        .strip_suffix('巻');
+    let Some(number) = number else {
+        return trimmed.to_string();
+    };
+    if number.is_empty() || !number.chars().all(char::is_numeric) {
+        return trimmed.to_string();
+    }
+
+    let without_prefix = bracketed[close_bracket + 1..].trim_start();
+    if without_prefix.is_empty() {
+        trimmed.to_string()
+    } else {
+        without_prefix.to_string()
+    }
+}
+
 #[derive(Debug, Clone)]
 struct AbsAudioTrack {
     index: u32,
@@ -392,11 +425,12 @@ impl AudiobookshelfClient {
 
         Ok(AbsSessionDetails {
             library_item_id,
-            display_title: value["displayTitle"]
-                .as_str()
-                .or_else(|| library_item["media"]["metadata"]["title"].as_str())
-                .unwrap_or("Audiobook")
-                .to_string(),
+            display_title: strip_volume_prefix(
+                value["displayTitle"]
+                    .as_str()
+                    .or_else(|| library_item["media"]["metadata"]["title"].as_str())
+                    .unwrap_or("Audiobook"),
+            ),
             series_name: library_item["media"]["metadata"]["seriesName"]
                 .as_str()
                 .or_else(|| value["seriesName"].as_str())
@@ -595,6 +629,7 @@ impl AudiobookshelfClient {
                 device_name: Self::device_name(value),
                 user_name: value["user"]["username"].as_str().map(String::from),
                 user_id: value["userId"].as_str().map(String::from),
+                last_activity_at_ms: value["updatedAt"].as_i64(),
                 now_playing: Some(now_playing),
                 play_state: PlayState {
                     can_seek: false,
@@ -857,6 +892,32 @@ mod tests {
     }
 
     #[test]
+    fn strips_leading_volume_marker_from_audiobook_title() {
+        assert_eq!(
+            strip_volume_prefix("[1巻] 陰の実力者になりたくて！ 01"),
+            "陰の実力者になりたくて！ 01"
+        );
+        assert_eq!(
+            strip_volume_prefix("[第２巻] Japanese Audiobook"),
+            "Japanese Audiobook"
+        );
+        assert_eq!(
+            strip_volume_prefix("[特典] Japanese Audiobook"),
+            "[特典] Japanese Audiobook"
+        );
+    }
+
+    #[test]
+    fn normalizes_stale_session_display_title() {
+        let mut session = expanded_session();
+        session["displayTitle"] = json!("[1巻] Japanese Audiobook");
+
+        let details = AudiobookshelfClient::parse_session_details(&session).unwrap();
+
+        assert_eq!(details.display_title, "Japanese Audiobook");
+    }
+
+    #[test]
     fn parses_supported_single_file_track_and_language() {
         let details = AudiobookshelfClient::parse_session_details(&expanded_session()).unwrap();
         assert_eq!(details.library_item_id, "book-1");
@@ -1026,6 +1087,7 @@ mod tests {
         let (parsed, _) = client.parse_session(&session, &details, 21_000).unwrap();
 
         assert!(parsed.play_state.is_paused);
+        assert_eq!(parsed.last_activity_at_ms, Some(20_000));
         assert_eq!(parsed.position_ms(), Some(75_000));
     }
 

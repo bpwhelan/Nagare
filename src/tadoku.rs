@@ -1,4 +1,4 @@
-use crate::config::{Config, TadokuConfig};
+use crate::config::{Config, TadokuConfig, TadokuSyncMode};
 use crate::mining::{AppDatabase, TadokuExportBatch};
 use anyhow::{Context, bail};
 use chrono::{DateTime, Datelike, FixedOffset, NaiveDate, Timelike, Utc, Weekday};
@@ -6,11 +6,13 @@ use reqwest::cookie::{CookieStore, Jar};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
-use tokio::sync::RwLock;
+use std::time::{Duration, Instant};
+use tokio::sync::{Mutex, RwLock};
 use tracing::{error, info, warn};
 
 const TADOKU_AUTH_BASE_URL: &str = "https://account.tadoku.app/kratos";
+const AUTOMATIC_EXPORT_INTERVAL: Duration = Duration::from_secs(5 * 60);
+static EXPORT_LOCK: Mutex<()> = Mutex::const_new(());
 
 #[derive(Debug, Serialize)]
 pub struct TadokuConnectionInfo {
@@ -503,17 +505,18 @@ impl TadokuClient {
             .amount
             .is_some_and(|amount| (amount - minutes).abs() < 0.001);
         let unit_matches = log.unit_id.as_deref() == Some(listening_minutes_unit_id);
+        let description_matches = log.description.as_deref() == Some(batch.description.as_str());
         let tags_match = desired_tags.iter().all(|desired| {
             log.tags
                 .iter()
                 .any(|existing| existing.eq_ignore_ascii_case(desired))
         });
-        if amount_matches && unit_matches && tags_match {
+        if amount_matches && unit_matches && description_matches && tags_match {
             return Ok(log.id);
         }
 
         warn!(
-            "Tadoku log {} is missing expected minutes, unit, or tags; updating it",
+            "Tadoku log {} is missing the expected title, minutes, unit, or tags; updating it",
             log.id
         );
         let mut tags = log.tags.clone();
@@ -549,10 +552,11 @@ impl TadokuClient {
         });
         if !updated_amount_matches
             || updated.unit_id.as_deref() != Some(listening_minutes_unit_id)
+            || updated.description.as_deref() != Some(batch.description.as_str())
             || !updated_tags_match
         {
             bail!(
-                "Tadoku returned unexpected amount, unit, or tags after updating log {}",
+                "Tadoku returned an unexpected title, amount, unit, or tags after updating log {}",
                 updated.id
             );
         }
@@ -686,7 +690,7 @@ pub async fn export_once(
     config: Arc<RwLock<Config>>,
     db: Arc<AppDatabase>,
 ) -> anyhow::Result<usize> {
-    export(config, db, None).await
+    export(config, db, None, false, None).await
 }
 
 pub async fn export_selected(
@@ -697,14 +701,20 @@ pub async fn export_selected(
     if history_ids.is_empty() {
         bail!("Select at least one episode to sync");
     }
-    export(config, db, Some(history_ids)).await
+    export(config, db, Some(history_ids), false, None).await
 }
 
 async fn export(
     config: Arc<RwLock<Config>>,
     db: Arc<AppDatabase>,
     selected_history_ids: Option<Vec<String>>,
+    automatic: bool,
+    finished_history_id: Option<String>,
 ) -> anyhow::Result<usize> {
+    // A five-minute check, an episode-finished event, and a manual request can
+    // arrive together. Serialize them so one completed episode is never
+    // prepared for two concurrent Tadoku requests.
+    let _export_guard = EXPORT_LOCK.lock().await;
     let tadoku_config = config.read().await.tadoku.clone();
     let language_code = tadoku_config.language_code.trim().to_ascii_lowercase();
     let mut client = TadokuClient::new(tadoku_config, Some(persistence(config, db.clone())), true)?;
@@ -714,6 +724,10 @@ async fn export(
     let batches = match selected_history_ids {
         Some(history_ids) => {
             db.prepare_selected_tadoku_batches(eastern_date, language_code, history_ids)
+                .await?
+        }
+        None if automatic => {
+            db.prepare_automatic_tadoku_batches(eastern_date, language_code, finished_history_id)
                 .await?
         }
         None => {
@@ -730,7 +744,12 @@ async fn export(
     let mut completed = 0usize;
     let mut failures = Vec::new();
     for batch in batches {
-        let result = if let Some(log) = existing.get(&batch.description) {
+        let existing_log = batch
+            .tadoku_log_id
+            .as_deref()
+            .and_then(|log_id| existing.values().find(|log| log.id == log_id))
+            .or_else(|| existing.get(&batch.description));
+        let result = if let Some(log) = existing_log {
             info!(
                 "Tadoku batch {} already exists remotely as {}; verifying it locally",
                 batch.batch_id, log.id
@@ -783,37 +802,74 @@ async fn export(
     }
 }
 
+/// Export all eligible episodes only when the near-real-time automatic mode is
+/// currently selected. The setting is checked at execution time so a queued
+/// episode-finished task cannot run after the user switches back to daily sync.
+pub async fn export_if_automatic(
+    config: Arc<RwLock<Config>>,
+    db: Arc<AppDatabase>,
+    finished_history_id: Option<String>,
+) -> anyhow::Result<Option<usize>> {
+    if !config.read().await.tadoku.automatic_sync_enabled() {
+        return Ok(None);
+    }
+
+    export(config, db, None, true, finished_history_id)
+        .await
+        .map(Some)
+}
+
 pub async fn run_exporter(config: Arc<RwLock<Config>>, db: Arc<AppDatabase>) {
+    let mut last_automatic_check: Option<Instant> = None;
+
     loop {
         let tadoku_config = config.read().await.tadoku.clone();
-        if tadoku_config.enabled {
-            let now_eastern = eastern_time(Utc::now());
-            let export_hour = tadoku_config.export_hour_eastern.min(23);
-            if now_eastern.hour() >= export_hour {
-                let export_date = now_eastern.date_naive().to_string();
-                match db.tadoku_export_due(export_date.clone()).await {
-                    Ok(true) => {
-                        if let Err(error) = db.mark_tadoku_run_started(export_date.clone()).await {
-                            error!("Could not record Tadoku export start: {}", error);
-                        } else {
-                            let result = export_once(config.clone(), db.clone()).await;
-                            let error_message = result.as_ref().err().map(ToString::to_string);
-                            if let Err(error) = db
-                                .mark_tadoku_run_finished(export_date, error_message)
-                                .await
+        if tadoku_config.automatic_sync_enabled() {
+            let automatic_check_due = last_automatic_check
+                .is_none_or(|last_check| last_check.elapsed() >= AUTOMATIC_EXPORT_INTERVAL);
+            if automatic_check_due {
+                last_automatic_check = Some(Instant::now());
+                match export_if_automatic(config.clone(), db.clone(), None).await {
+                    Ok(Some(count)) => {
+                        info!("Automatic Tadoku check completed ({} show logs)", count)
+                    }
+                    Ok(None) => {}
+                    Err(error) => error!("Automatic Tadoku check failed: {}", error),
+                }
+            }
+        } else {
+            last_automatic_check = None;
+            if tadoku_config.enabled && tadoku_config.sync_mode == TadokuSyncMode::Daily {
+                let now_eastern = eastern_time(Utc::now());
+                let export_hour = tadoku_config.export_hour_eastern.min(23);
+                if now_eastern.hour() >= export_hour {
+                    let export_date = now_eastern.date_naive().to_string();
+                    match db.tadoku_export_due(export_date.clone()).await {
+                        Ok(true) => {
+                            if let Err(error) =
+                                db.mark_tadoku_run_started(export_date.clone()).await
                             {
-                                error!("Could not record Tadoku export result: {}", error);
-                            }
-                            match result {
-                                Ok(count) => {
-                                    info!("Daily Tadoku export completed ({} show logs)", count)
+                                error!("Could not record Tadoku export start: {}", error);
+                            } else {
+                                let result = export_once(config.clone(), db.clone()).await;
+                                let error_message = result.as_ref().err().map(ToString::to_string);
+                                if let Err(error) = db
+                                    .mark_tadoku_run_finished(export_date, error_message)
+                                    .await
+                                {
+                                    error!("Could not record Tadoku export result: {}", error);
                                 }
-                                Err(error) => error!("Daily Tadoku export failed: {}", error),
+                                match result {
+                                    Ok(count) => {
+                                        info!("Daily Tadoku export completed ({} show logs)", count)
+                                    }
+                                    Err(error) => error!("Daily Tadoku export failed: {}", error),
+                                }
                             }
                         }
+                        Ok(false) => {}
+                        Err(error) => error!("Could not check Tadoku export schedule: {}", error),
                     }
-                    Ok(false) => {}
-                    Err(error) => error!("Could not check Tadoku export schedule: {}", error),
                 }
             }
         }
@@ -1027,6 +1083,7 @@ mod tests {
         let config = TadokuConfig::default();
         let batch = TadokuExportBatch {
             batch_id: "batch".to_string(),
+            tadoku_log_id: None,
             series_name: "Frieren".to_string(),
             description: "Frieren S01E01".to_string(),
             duration_seconds: 1_400,

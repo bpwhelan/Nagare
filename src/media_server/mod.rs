@@ -65,6 +65,9 @@ pub struct Session {
     pub device_name: String,
     pub user_name: Option<String>,
     pub user_id: Option<String>,
+    /// Best server-reported playback/activity timestamp, in Unix milliseconds.
+    /// Servers without a reliable activity clock leave this unset.
+    pub last_activity_at_ms: Option<i64>,
     pub now_playing: Option<NowPlaying>,
     pub play_state: PlayState,
     pub supports_remote_control: bool,

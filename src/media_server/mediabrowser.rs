@@ -73,12 +73,24 @@ impl MediaBrowserClient {
         }
     }
 
+    fn parse_activity_timestamp(value: &Value) -> Option<i64> {
+        value.as_str().and_then(|timestamp| {
+            chrono::DateTime::parse_from_rfc3339(timestamp)
+                .ok()
+                .map(|parsed| parsed.timestamp_millis())
+        })
+    }
+
     fn parse_session(v: &Value) -> Option<Session> {
         let id = v["Id"].as_str()?.to_string();
         let client = v["Client"].as_str().unwrap_or("Unknown").to_string();
         let device_name = v["DeviceName"].as_str().unwrap_or("Unknown").to_string();
         let user_name = v["UserName"].as_str().map(String::from);
         let user_id = v["UserId"].as_str().map(String::from);
+        let last_activity_at_ms = ["LastPlaybackCheckIn", "LastActivityDate"]
+            .into_iter()
+            .filter_map(|field| Self::parse_activity_timestamp(&v[field]))
+            .max();
         let supports_remote_control = v["SupportsRemoteControl"].as_bool().unwrap_or(false);
 
         let play_state_val = &v["PlayState"];
@@ -151,6 +163,7 @@ impl MediaBrowserClient {
             device_name,
             user_name,
             user_id,
+            last_activity_at_ms,
             now_playing,
             play_state,
             supports_remote_control,
@@ -341,5 +354,32 @@ impl MediaServer for MediaBrowserClient {
         })
         .await
         .map_err(|_| anyhow::anyhow!("Unpause timed out after 5s"))?
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MediaBrowserClient;
+    use serde_json::json;
+
+    #[test]
+    fn parses_latest_playback_activity_timestamp() {
+        let session = json!({
+            "Id": "session-1",
+            "Client": "Jellyfin Web",
+            "DeviceName": "Firefox",
+            "LastActivityDate": "2026-08-23T12:00:00Z",
+            "LastPlaybackCheckIn": "2026-08-23T12:00:05Z",
+            "PlayState": { "IsPaused": false },
+            "NowPlayingItem": {
+                "Id": "episode-1",
+                "Name": "Episode 1",
+                "MediaType": "Episode"
+            }
+        });
+
+        let parsed = MediaBrowserClient::parse_session(&session).unwrap();
+
+        assert_eq!(parsed.last_activity_at_ms, Some(1_787_486_405_000));
     }
 }

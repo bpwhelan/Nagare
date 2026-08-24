@@ -97,6 +97,7 @@
     if (!config.mining) config.mining = {};
     if (!config.tadoku) config.tadoku = {};
     if (config.tadoku.enabled == null) config.tadoku.enabled = false;
+    if (!['daily', 'automatic'].includes(config.tadoku.sync_mode)) config.tadoku.sync_mode = 'daily';
     if (config.tadoku.username == null) config.tadoku.username = '';
     if (config.tadoku.password == null) config.tadoku.password = '';
     if (config.tadoku.password_configured == null) config.tadoku.password_configured = false;
@@ -756,7 +757,7 @@
     {/if}
 
     {#if activeTab === 'tadoku'}
-    <p class="hint tab-hint">Review completed episodes yourself or let Nagare sync them on a daily schedule.</p>
+    <p class="hint tab-hint">Review completed episodes yourself, sync daily, or sync automatically as you finish watching.</p>
 
     <section class="section">
       <h2>Sync Mode</h2>
@@ -774,15 +775,31 @@
         <button
           type="button"
           class="tadoku-mode"
-          class:selected={config.tadoku.enabled}
-          aria-pressed={config.tadoku.enabled}
-          on:click={() => (config.tadoku.enabled = true)}
+          class:selected={config.tadoku.enabled && config.tadoku.sync_mode === 'daily'}
+          aria-pressed={config.tadoku.enabled && config.tadoku.sync_mode === 'daily'}
+          on:click={() => {
+            config.tadoku.enabled = true;
+            config.tadoku.sync_mode = 'daily';
+          }}
         >
-          <strong>Automatic sync</strong>
+          <strong>Daily sync</strong>
           <span>Send all ready episodes once per day.</span>
         </button>
+        <button
+          type="button"
+          class="tadoku-mode"
+          class:selected={config.tadoku.enabled && config.tadoku.sync_mode === 'automatic'}
+          aria-pressed={config.tadoku.enabled && config.tadoku.sync_mode === 'automatic'}
+          on:click={() => {
+            config.tadoku.enabled = true;
+            config.tadoku.sync_mode = 'automatic';
+          }}
+        >
+          <strong>Automatic sync</strong>
+          <span>Check every five minutes; long media also syncs when playback ends.</span>
+        </button>
       </div>
-      <p class="hint">Episodes are ready at 80% watched and can only be synced once. Durations round up to the next tenth of a minute.</p>
+      <p class="hint">Episodes are ready at 80% watched with no more than 5 minutes remaining. In automatic mode, media over 2 hours updates one cumulative Tadoku log every 30 minutes and when playback ends. Durations round up to the next tenth of a minute.</p>
     </section>
 
     <section class="section">
@@ -914,7 +931,7 @@
         <input id="tadoku-language" type="text" placeholder="jpn"
           bind:value={config.tadoku.language_code} />
       </div>
-      {#if config.tadoku.enabled}
+      {#if config.tadoku.enabled && config.tadoku.sync_mode === 'daily'}
       <div class="field">
         <label for="tadoku-hour">Daily Export Hour <span class="hint">(Eastern time, 0–23)</span></label>
         <input id="tadoku-hour" type="number" min="0" max="23" step="1"
@@ -1364,7 +1381,7 @@
 
   .tadoku-mode-grid {
     display: grid;
-    grid-template-columns: 1fr 1fr;
+    grid-template-columns: repeat(3, 1fr);
     gap: 0.6rem;
     margin-bottom: 0.65rem;
   }

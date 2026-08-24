@@ -247,6 +247,11 @@ pub struct TadokuConfig {
     #[serde(default)]
     pub enabled: bool,
 
+    /// Automatic export cadence. This only applies when `enabled` is true;
+    /// disabling Tadoku automatic exports keeps the manual review workflow.
+    #[serde(default)]
+    pub sync_mode: TadokuSyncMode,
+
     /// Tadoku username or email used by the browser login flow.
     #[serde(default)]
     pub username: String,
@@ -284,6 +289,14 @@ pub struct TadokuConfig {
 pub struct TadokuPathTagRule {
     pub contains: String,
     pub tag: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum TadokuSyncMode {
+    #[default]
+    Daily,
+    Automatic,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -639,6 +652,7 @@ impl Default for TadokuConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            sync_mode: TadokuSyncMode::Daily,
             username: String::new(),
             password: String::new(),
             session_cookie: String::new(),
@@ -654,6 +668,10 @@ impl Default for TadokuConfig {
 impl TadokuConfig {
     pub fn has_credentials(&self) -> bool {
         !self.username.trim().is_empty() && !self.password.is_empty()
+    }
+
+    pub fn automatic_sync_enabled(&self) -> bool {
+        self.enabled && self.sync_mode == TadokuSyncMode::Automatic
     }
 
     /// Normalize known Tadoku production URLs. The OpenAPI document still
