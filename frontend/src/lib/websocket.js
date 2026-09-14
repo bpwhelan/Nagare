@@ -1,4 +1,5 @@
 import { get } from 'svelte/store';
+import { confirmCardReceived, reviewRevision } from './stores.js';
 import { activeHistoryItemId, sessionState, pendingCards, connected, ankiStatus, enhancementQueue, syncPositionFromSessionState, isSeekLocked, isPlayLocked, applySubtitlePayload, applyAudioTracksPayload, showErrorToast, flashEnhancementSuccess, forceResync } from './stores.js';
 
 let ws = null;
@@ -105,7 +106,9 @@ function handleMessage(msg) {
 
   switch (msg.type) {
     case 'init':
+      reviewRevision.update(n => n + 1);
     case 'full_update':
+      if (Array.isArray(msg.pending_cards)) pendingCards.set(msg.pending_cards);
       if (msg.state) {
         sessionState.set(msg.state);
         syncPositionFromSessionState(msg.state);
@@ -146,9 +149,14 @@ function handleMessage(msg) {
 
     case 'new_card':
       if (msg.new_card) {
+        confirmCardReceived(msg.new_card.event.note_id);
+        reviewRevision.update(n => n + 1);
         pendingCards.update(cards => {
+          if (msg.new_card.source === 'mining_history') return cards;
           const noteId = msg.new_card.event.note_id;
-          if (cards.some(c => c.event.note_id === noteId)) return cards;
+          if (cards.some(c => c.event.note_id === noteId)) {
+            return cards.map(c => c.event.note_id === noteId ? msg.new_card : c);
+          }
           // Mirror the server-side intake bound. If a burst arrives while this
           // tab is open, do not let already-evicted cards accumulate locally.
           return [...cards, msg.new_card].slice(-10);
@@ -159,6 +167,8 @@ function handleMessage(msg) {
     case 'enhancement_result':
       if (msg.enhancement_result) {
         const r = msg.enhancement_result;
+        reviewRevision.update(n => n + 1);
+        if (r.success) pendingCards.update(cards => cards.filter(c => c.event.note_id !== r.note_id));
         console.log('[WS] enhancement_result:', r);
         if (r.success) {
           // No toast — just a brief checkmark next to the connection status.

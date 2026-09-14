@@ -90,6 +90,9 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             post(activate_history_item),
         )
         .route("/api/mined", get(get_mined_history))
+        .route("/api/review", get(get_review_sessions))
+        .route("/api/review/{session_id}", get(get_review_session))
+        .route("/api/review/notes/{note_id}", put(set_reviewed))
         .route("/api/dialog/note/{note_id}", get(get_dialog_by_note_id))
         .route("/api/dialog/card/{card_id}", get(get_dialog_by_card_id))
         .route("/api/enrich", post(enrich_card))
@@ -405,6 +408,70 @@ async fn get_mined_history(State(state): State<Arc<AppState>>) -> Json<Vec<Minin
     }
 }
 
+async fn get_review_sessions(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    match state.db.list_review_sessions().await {
+        Ok(sessions) => Json(serde_json::json!({"ok": true, "sessions": sessions})),
+        Err(error) => Json(serde_json::json!({"ok": false, "error": error.to_string()})),
+    }
+}
+
+async fn get_review_session(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+) -> Json<serde_json::Value> {
+    match state.db.review_detail(session_id).await {
+        Ok(Some(mut detail)) => {
+            let queue = state.enhancement_queue.read().await;
+            for card in &mut detail.cards {
+                if let Some(job) = queue
+                    .iter()
+                    .find(|j| j.note_id == card.dialog.event.note_id)
+                {
+                    card.status = match job.state {
+                        EnhancementQueueState::Queued => "queued",
+                        EnhancementQueueState::Running => "running",
+                    }
+                    .into();
+                }
+            }
+            Json(serde_json::json!({"ok": true, "review": detail}))
+        }
+        Ok(None) => Json(serde_json::json!({"ok": false, "error": "Review session not found"})),
+        Err(error) => Json(serde_json::json!({"ok": false, "error": error.to_string()})),
+    }
+}
+
+#[derive(Deserialize)]
+struct ReviewRequest {
+    reviewed: bool,
+}
+
+async fn set_reviewed(
+    State(state): State<Arc<AppState>>,
+    Path(note_id): Path<i64>,
+    Json(req): Json<ReviewRequest>,
+) -> Json<serde_json::Value> {
+    // Don't mark the old contents reviewed while a replacement is in flight.
+    let queued = state
+        .enhancement_queue
+        .read()
+        .await
+        .iter()
+        .any(|j| j.note_id == note_id);
+    if queued {
+        return Json(
+            serde_json::json!({"ok": false, "error": "Wait for enhancement to finish before reviewing."}),
+        );
+    }
+    match state.db.mark_reviewed(note_id, req.reviewed).await {
+        Ok(true) => Json(serde_json::json!({"ok": true})),
+        Ok(false) => {
+            Json(serde_json::json!({"ok": false, "error": "Card not found or still enhancing"}))
+        }
+        Err(error) => Json(serde_json::json!({"ok": false, "error": error.to_string()})),
+    }
+}
+
 async fn get_dialog_by_note_id(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(note_id): axum::extract::Path<i64>,
@@ -550,8 +617,23 @@ async fn active_history_track(state: &Arc<AppState>) -> Option<(String, Subtitle
 }
 
 async fn mining_context_available(state: &Arc<AppState>) -> bool {
-    if active_history_track(state).await.is_some() {
-        return true;
+    let history_id = state
+        .active_history_context
+        .read()
+        .await
+        .as_ref()
+        .filter(|ctx| ctx.activated_at.elapsed() < HISTORY_MINING_CONTEXT_TTL)
+        .map(|ctx| ctx.history_id.clone());
+    if let Some(history_id) = history_id {
+        if state
+            .subtitle_history
+            .read()
+            .await
+            .get(&history_id)
+            .is_some_and(|track| !track.lines.is_empty())
+        {
+            return true;
+        }
     }
 
     if state.session_rx.borrow().now_playing.is_some() {
@@ -676,7 +758,14 @@ async fn lookup_dialog_state(
     }
     .map_err(|error| error.to_string())?;
 
-    Ok(mining.map(|entry| entry.dialog_state()))
+    if let Some(entry) = mining {
+        return Ok(Some(entry.dialog_state()));
+    }
+    match lookup {
+        DialogLookup::NoteId(note_id) => state.db.review_dialog(note_id).await,
+        DialogLookup::CardId(card_id) => state.db.review_dialog_by_card_id(card_id).await,
+    }
+    .map_err(|error| error.to_string())
 }
 
 async fn remove_pending_enrichment(state: &Arc<AppState>, note_id: i64) {
@@ -701,10 +790,11 @@ async fn resolve_audio_mapping(
 async fn prepare_enrichment_candidate(
     state: &Arc<AppState>,
     notification: NewCardNotification,
-) -> Option<EnrichmentDialogState> {
+) -> Option<(EnrichmentDialogState, SubtitleTrack)> {
     let NewCardNotification {
         event,
         card_ids: provided_card_ids,
+        needs_enhancement,
     } = notification;
 
     let session_state = state.session_rx.borrow().clone();
@@ -739,27 +829,37 @@ async fn prepare_enrichment_candidate(
     )?;
 
     let config = state.config.read().await.clone();
+    let track = active_history.map(|(_, track)| track).or(live_track)?;
+    let line = track.lines.get(matched_line_index)?;
     // Don't block the dialog on an AnkiConnect `findCards` round-trip. The card
     // ids are only needed for open-by-card-id routing and as an enrich-time
-    // fallback (re-fetched in `save_mining_history_entry` regardless), so when
+    // fallback, so when
     // the beacon didn't include them we leave the list empty here and let
-    // `run_new_card_processor` backfill it in the background. This keeps the
-    // notification → dialog latency to the in-memory subtitle match only.
+    // `run_new_card_processor` backfill it in the background. Only the local
+    // subtitle snapshot must be saved before publishing the card.
     let card_ids = provided_card_ids.unwrap_or_default();
 
-    Some(EnrichmentDialogState {
-        event,
-        matched_line_index: Some(matched_line_index),
-        history_id,
-        start_ms: None,
-        end_ms: None,
-        generate_avif: Some(config.mining.generate_avif),
-        included_line_first: None,
-        included_line_last: None,
-        card_ids,
-        source: EnrichmentSource::Pending,
-        updated_at: Some(Utc::now()),
-    })
+    Some((
+        EnrichmentDialogState {
+            matched_text: Some(line.text.clone()),
+            event,
+            matched_line_index: Some(matched_line_index),
+            history_id,
+            start_ms: Some((line.start_ms - config.mining.audio_start_offset_ms).max(0)),
+            end_ms: Some(line.end_ms + config.mining.audio_end_offset_ms),
+            generate_avif: Some(config.mining.generate_avif),
+            included_line_first: Some(matched_line_index),
+            included_line_last: Some(matched_line_index),
+            card_ids,
+            source: if needs_enhancement {
+                EnrichmentSource::Pending
+            } else {
+                EnrichmentSource::MiningHistory
+            },
+            updated_at: Some(Utc::now()),
+        },
+        track,
+    ))
 }
 
 fn match_candidate_to_context(
@@ -863,6 +963,7 @@ mod anki_intake_tests {
     fn pending(note_id: i64, updated_at: chrono::DateTime<Utc>) -> EnrichmentDialogState {
         EnrichmentDialogState {
             event: event(note_id, "対象の文"),
+            matched_text: None,
             matched_line_index: Some(0),
             history_id: Some("history".to_string()),
             start_ms: None,
@@ -922,6 +1023,113 @@ mod anki_intake_tests {
 
         assert_eq!(cards.len(), 1);
         assert_eq!(cards[0].event.note_id, 2);
+    }
+
+    #[tokio::test]
+    async fn published_cards_already_have_their_review_snapshot() {
+        use super::*;
+        let directory =
+            std::env::temp_dir().join(format!("nagare-intake-{}", uuid::Uuid::new_v4()));
+        let db = Arc::new(
+            AppDatabase::new(directory.join("test.db"), None)
+                .await
+                .unwrap(),
+        );
+        let config = Arc::new(RwLock::new(Config::default()));
+        let (session_tx, session_rx) = watch::channel(SessionState {
+            sessions: vec![],
+            active_session_id: None,
+            now_playing: None,
+        });
+        let manager = Arc::new(
+            SessionManager::new(
+                Arc::new(RwLock::new(ServerMap::new())),
+                config.clone(),
+                session_tx,
+                directory.clone(),
+                db.clone(),
+            )
+            .await
+            .unwrap(),
+        );
+        manager
+            .subtitle_history()
+            .write()
+            .await
+            .insert("plex|one".into(), track(&[(1_000, 2_000, "対象の文")]));
+        let (new_card_tx, mut published) = broadcast::channel(4);
+        let state = Arc::new(AppState {
+            config,
+            db: db.clone(),
+            session_manager: manager.clone(),
+            servers: manager.servers(),
+            anki_client: Arc::new(RwLock::new(Arc::new(AnkiClient::new("http://127.0.0.1:1")))),
+            anki_status: Arc::new(RwLock::new(AnkiStatus::default())),
+            anki_event_tx: mpsc::channel(4).0,
+            enhancement_queue: Arc::new(RwLock::new(vec![])),
+            enhancement_tx: mpsc::channel(4).0,
+            reusable_assets: Arc::new(RwLock::new(HashMap::new())),
+            session_rx,
+            new_card_tx,
+            subtitles: manager.subtitles(),
+            native_subtitles: manager.native_subtitles(),
+            subtitle_candidates: manager.subtitle_candidates(),
+            subtitle_history: manager.subtitle_history(),
+            history: manager.history(),
+            active_history_context: Arc::new(RwLock::new(Some(ActiveHistoryContext {
+                history_id: "plex|one".into(),
+                activated_at: std::time::Instant::now(),
+            }))),
+            card_lookup_semaphore: Arc::new(Semaphore::new(1)),
+            pending_enrichments: Arc::new(RwLock::new(vec![])),
+            enhancement_result_tx: broadcast::channel(4).0,
+            remote_result_tx: broadcast::channel(4).0,
+            audio_tracks: manager.audio_tracks(),
+            selected_audio_track: manager.selected_audio_track(),
+            audio_track_resolution: manager.audio_track_resolution(),
+        });
+        // Hold a real SQLite writer to expose publication before persistence.
+        let conn = crate::mining::open_connection(&directory.join("test.db")).unwrap();
+        conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let (tx, rx) = mpsc::channel(4);
+        let processor = tokio::spawn(run_new_card_processor(state.clone(), rx));
+        tx.send(NewCardNotification {
+            event: event(1, "対象の文"),
+            card_ids: Some(vec![10]),
+            needs_enhancement: true,
+        })
+        .await
+        .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), published.recv())
+                .await
+                .is_err()
+        );
+        conn.execute_batch("COMMIT").unwrap();
+        drop(conn);
+        let card = tokio::time::timeout(Duration::from_secs(5), published.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let saved = db.review_dialog(card.event.note_id).await.unwrap().unwrap();
+        assert_eq!(saved.card_ids, vec![10]);
+        assert_eq!(saved.matched_text.as_deref(), Some("対象の文"));
+        db.update_review_card(1, "skipped", None, None)
+            .await
+            .unwrap();
+        let sessions = db.list_review_sessions().await.unwrap();
+        let detail = db
+            .review_detail(sessions[0].id.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(detail.cards[0].status, "skipped");
+        drop(tx);
+        processor.await.unwrap();
+        drop(state);
+        drop(manager);
+        drop(db);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -1002,6 +1210,9 @@ async fn enqueue_enhancement_job(
     req: EnrichRequest,
     fallback: Option<EnrichmentDialogState>,
 ) -> Result<(), String> {
+    if req.start_ms < 0 || req.end_ms <= req.start_ms {
+        return Err("Choose an audio end time after the start time".into());
+    }
     let note_id = req.note_id;
     info!(
         "[enqueue] note {} — item_id={:?}, start={}ms, end={}ms, avif={}",
@@ -1041,6 +1252,13 @@ async fn enqueue_enhancement_job(
         );
     }
 
+    if let Err(error) = state
+        .db
+        .update_review_card(note_id, "queued", None, None)
+        .await
+    {
+        warn!("Could not persist queued review status: {}", error);
+    }
     if state
         .enhancement_tx
         .send(EnhancementJob { req, fallback })
@@ -1048,6 +1266,15 @@ async fn enqueue_enhancement_job(
         .is_err()
     {
         remove_enhancement_queue_item(state, note_id).await;
+        let _ = state
+            .db
+            .update_review_card(
+                note_id,
+                "failed",
+                None,
+                Some("Enhancement worker is not running".into()),
+            )
+            .await;
         return Err("Enhancement worker is not running".to_string());
     }
 
@@ -1123,10 +1350,15 @@ async fn enhancement_worker_loop(
         .catch_unwind()
         .await;
 
+        let tags = match &result {
+            Ok(Ok(Ok(tags))) => tags.clone(),
+            _ => Vec::new(),
+        };
+
         remove_enhancement_queue_item(&state, note_id).await;
 
         let enhancement_result = match result {
-            Ok(Ok(Ok(()))) => {
+            Ok(Ok(Ok(_))) => {
                 info!("Successfully enriched note {}", note_id);
                 EnhancementResult {
                     note_id,
@@ -1167,7 +1399,26 @@ async fn enhancement_worker_loop(
             }
         };
 
+        if !enhancement_result.success {
+            let _ = state
+                .db
+                .update_review_card(
+                    note_id,
+                    "failed",
+                    None,
+                    Some(enhancement_result.message.clone()),
+                )
+                .await;
+        }
         let _ = state.enhancement_result_tx.send(enhancement_result);
+        // Optional tag bookkeeping follows the confirmed field update and its
+        // UI notification; it cannot hold up the success checkmark.
+        if !tags.is_empty() {
+            let client = state.anki_client.read().await.clone();
+            if let Err(error) = client.add_tags(&[note_id], &tags.join(" ")).await {
+                warn!("Failed to add tags to note {}: {}", note_id, error);
+            }
+        }
         info!(
             "[worker-{}] Finished note {}, ready for next job",
             worker_id, note_id
@@ -1183,31 +1434,36 @@ async fn save_mining_history_entry(
     fallback_card_ids: Vec<i64>,
 ) {
     let config = state.config.read().await.clone();
-    let anki_client = state.anki_client.read().await.clone();
-    let event = match fetch_note_event(anki_client.clone(), &config, req.note_id).await {
+    let event = match fallback_event {
         Some(event) => event,
-        None => match fallback_event {
-            Some(event) => event,
-            None => {
-                warn!(
-                    "Skipping mining history save for note {} because no note snapshot was available",
-                    req.note_id
-                );
-                return;
+        None => {
+            let anki_client = state.anki_client.read().await.clone();
+            match fetch_note_event(anki_client, &config, req.note_id).await {
+                Some(event) => event,
+                None => {
+                    warn!(
+                        "Skipping mining history save for note {} because no note snapshot was available",
+                        req.note_id
+                    );
+                    return;
+                }
             }
-        },
+        }
     };
 
-    let card_ids = match anki_client.find_cards_for_note(req.note_id).await {
-        Ok(ids) if !ids.is_empty() => ids,
-        Ok(_) => fallback_card_ids,
-        Err(error) => {
-            warn!(
-                "Failed to refresh card ids for note {}: {}",
-                req.note_id, error
-            );
-            fallback_card_ids
-        }
+    // The successful write already tells us the new contents. Neither notesInfo
+    // nor findCards belongs between Anki's confirmation and the success event.
+    let card_ids = if fallback_card_ids.is_empty() {
+        state
+            .db
+            .review_dialog(req.note_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|d| d.card_ids)
+            .unwrap_or_default()
+    } else {
+        fallback_card_ids
     };
 
     let now = Utc::now();
@@ -1243,9 +1499,20 @@ async fn save_mining_history_entry(
         updated_at: now,
     };
 
+    let dialog = entry.dialog_state();
     if let Err(error) = state.db.upsert_mined_note(entry).await {
         warn!(
             "Failed to persist mining history for note {}: {}",
+            req.note_id, error
+        );
+    }
+    if let Err(error) = state
+        .db
+        .update_review_card(req.note_id, "enhanced", Some(dialog), None)
+        .await
+    {
+        warn!(
+            "Failed to save enhanced review card {}: {}",
             req.note_id, error
         );
     }
@@ -1513,7 +1780,7 @@ async fn perform_enrichment(
     req: &EnrichRequest,
     fallback_event: Option<NewCardEvent>,
     fallback_card_ids: Vec<i64>,
-) -> Result<(), String> {
+) -> Result<Vec<String>, String> {
     let note_id = req.note_id;
     let result = async {
         info!(
@@ -1603,7 +1870,10 @@ async fn perform_enrichment(
             );
             let selected_audio_track = *state.selected_audio_track.read().await;
             let (audio_track_index, audio_track_ordinal) =
-                resolve_audio_mapping(&state, selected_audio_track).await;
+                match state.db.review_audio_mapping(note_id).await {
+                    Ok(Some(mapping)) => mapping,
+                    _ => resolve_audio_mapping(&state, selected_audio_track).await,
+                };
             let audio_codec = config.mining.audio_codec;
             let (generated_audio_path, audio_data) = media::extract_audio(
                 &source,
@@ -1739,9 +2009,7 @@ async fn perform_enrichment(
         if let Some(translation_field) = config.anki.fields.sentence_translation.as_ref() {
             if !translation_field.is_empty() {
                 if let Some(translation) = req.translation.as_ref() {
-                    if !translation.is_empty() {
-                        fields.insert(translation_field.clone(), translation.clone());
-                    }
+                    fields.insert(translation_field.clone(), translation.clone());
                 }
             }
         }
@@ -1757,7 +2025,7 @@ async fn perform_enrichment(
             fields.len()
         );
         if let Err(error) = anki_client
-            .update_note_fields(req.note_id, fields, None, None)
+            .update_note_fields(req.note_id, fields.clone(), None, None)
             .await
         {
             if let Some(path) = audio_path.as_ref() {
@@ -1766,6 +2034,22 @@ async fn perform_enrichment(
             return Err(format!("Failed to update note: {}", error));
         }
         info!("[enhance {}] Note fields updated", note_id);
+        let mut saved_event = fallback_event;
+        if let Some(event) = saved_event.as_mut() {
+            for (name, value) in &fields {
+                let order = event.fields.get(name).map(|f| f.order).unwrap_or(0);
+                event.fields.insert(
+                    name.clone(),
+                    crate::anki::NoteField {
+                        value: value.clone(),
+                        order,
+                    },
+                );
+            }
+            if let Some(sentence) = fields.get(&config.anki.fields.sentence) {
+                event.sentence = sentence.clone();
+            }
+        }
         state.reusable_assets.write().await.insert(note_id, assets);
 
         let mut tags_to_add: Vec<String> = config.anki.add_tags.clone();
@@ -1788,21 +2072,14 @@ async fn perform_enrichment(
                 }
             }
         }
-        if !tags_to_add.is_empty() {
-            let tags_str = tags_to_add.join(" ");
-            info!("[enhance {}] Adding tags: {}", note_id, tags_str);
-            if let Err(error) = anki_client.add_tags(&[req.note_id], &tags_str).await {
-                warn!("Failed to add tags to note {}: {}", req.note_id, error);
-            }
-        }
 
         if let Some(path) = audio_path.as_ref() {
             media::cleanup_temp_file(path).await;
         }
         info!("[enhance {}] Saving mining history entry...", note_id);
-        save_mining_history_entry(state, req, &media_ctx, fallback_event, fallback_card_ids).await;
+        save_mining_history_entry(state, req, &media_ctx, saved_event, fallback_card_ids).await;
         info!("[enhance {}] Enhancement complete", note_id);
-        Ok(())
+        Ok(tags_to_add)
     }
     .await;
 
@@ -1813,17 +2090,79 @@ pub async fn run_new_card_processor(
     state: Arc<AppState>,
     mut rx: mpsc::Receiver<NewCardNotification>,
 ) {
+    use std::hash::{Hash, Hasher};
+    let mut seen = std::collections::HashSet::new();
+    let mut last_session: Option<(String, String)> = None;
+    let mut last_note_at = std::time::Instant::now();
     while let Some(notification) = rx.recv().await {
-        let Some(candidate) = prepare_enrichment_candidate(&state, notification).await else {
+        let received_at = std::time::Instant::now();
+        let Some((candidate, track)) = prepare_enrichment_candidate(&state, notification).await
+        else {
             continue;
         };
 
-        // Surface the dialog immediately; resolve card ids out of band when the
-        // beacon didn't supply them so the AnkiConnect lookup stays off the
-        // notification → dialog path.
+        if !seen.insert(candidate.event.note_id) {
+            continue;
+        }
         let needs_card_ids = candidate.card_ids.is_empty();
         let note_id = candidate.event.note_id;
-        queue_pending_enrichment(&state, candidate).await;
+
+        // Preserve the exact SRT and grouping before enhancement. Changing the
+        // playback source/track or returning after a long break starts a session.
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        for line in &track.lines {
+            (line.start_ms, line.end_ms, &line.text).hash(&mut hash);
+        }
+        let audio_mapping =
+            resolve_audio_mapping(&state, *state.selected_audio_track.read().await).await;
+        audio_mapping.hash(&mut hash);
+        let scope = format!(
+            "{:?}:{:?}:{}",
+            candidate.history_id,
+            state.session_rx.borrow().active_session_id,
+            hash.finish()
+        );
+        if last_session.as_ref().is_none_or(|(key, _)| key != &scope)
+            || last_note_at.elapsed() > Duration::from_secs(30 * 60)
+        {
+            last_session = Some((scope, uuid::Uuid::new_v4().to_string()));
+        }
+        last_note_at = std::time::Instant::now();
+        let title = resolve_media_context(&state, candidate.history_id.as_deref())
+            .await
+            .map(|ctx| ctx.title)
+            .unwrap_or_else(|_| "Mining session".into());
+        if let Err(error) = state
+            .db
+            .record_review_card(
+                last_session.as_ref().unwrap().1.clone(),
+                title,
+                track,
+                candidate.clone(),
+                audio_mapping,
+            )
+            .await
+        {
+            error!(
+                "Could not save detected card {} for review: {}",
+                note_id, error
+            );
+        }
+
+        // The browser can immediately auto-enhance or skip a published card.
+        // Save its snapshot first so those updates cannot race a missing row
+        // or fall back to a different live audio track. Optional AnkiConnect
+        // card-ID lookups still happen after the notification.
+        if candidate.source == EnrichmentSource::Pending {
+            queue_pending_enrichment(&state, candidate).await;
+        } else {
+            let _ = state.new_card_tx.send(candidate);
+        }
+        info!(
+            note_id,
+            elapsed_ms = received_at.elapsed().as_millis(),
+            "Card matched and published to WebSocket"
+        );
 
         if needs_card_ids {
             match state.card_lookup_semaphore.clone().try_acquire_owned() {
@@ -1862,13 +2201,16 @@ async fn backfill_pending_card_ids(state: &Arc<AppState>, note_id: i64) {
         }
     };
 
-    let mut pending = state.pending_enrichments.write().await;
-    if let Some(entry) = pending
-        .iter_mut()
-        .find(|entry| entry.event.note_id == note_id)
     {
-        entry.card_ids = ids;
+        let mut pending = state.pending_enrichments.write().await;
+        if let Some(entry) = pending
+            .iter_mut()
+            .find(|entry| entry.event.note_id == note_id)
+        {
+            entry.card_ids = ids.clone();
+        }
     }
+    let _ = state.db.backfill_review_card_ids(note_id, ids).await;
 }
 
 async fn enrich_card(
@@ -1880,7 +2222,7 @@ async fn enrich_card(
         "[REST] enrich_card called: note={}, item_id={:?}, start={}ms, end={}ms",
         note_id, req.item_id, req.start_ms, req.end_ms
     );
-    let fallback = {
+    let mut fallback = {
         let pending = state.pending_enrichments.read().await;
         let found = pending
             .iter()
@@ -1893,6 +2235,12 @@ async fn enrich_card(
         );
         found
     };
+    if fallback.is_none() {
+        fallback = lookup_dialog_state(&state, DialogLookup::NoteId(note_id))
+            .await
+            .ok()
+            .flatten();
+    }
 
     match enqueue_enhancement_job(&state, req, fallback).await {
         Ok(()) => {
@@ -1978,6 +2326,10 @@ async fn skip_enrichment(
 ) -> Json<serde_json::Value> {
     if let Some(note_id) = body.get("note_id").and_then(|v| v.as_i64()) {
         remove_pending_enrichment(&state, note_id).await;
+        let _ = state
+            .db
+            .update_review_card(note_id, "skipped", None, None)
+            .await;
     }
     Json(serde_json::json!({"ok": true}))
 }
@@ -2534,6 +2886,8 @@ async fn play_pause(
 
 #[derive(Deserialize)]
 struct PreviewAudioRequest {
+    #[serde(default)]
+    note_id: Option<i64>,
     start_ms: i64,
     end_ms: i64,
     item_id: Option<String>,
@@ -2566,8 +2920,15 @@ async fn preview_audio_url(
     };
 
     let selected_audio_track = *state.selected_audio_track.read().await;
-    let (audio_track_index, audio_track_ordinal) =
-        resolve_audio_mapping(&state, selected_audio_track).await;
+    let saved_mapping = if let Some(note_id) = req.note_id {
+        state.db.review_audio_mapping(note_id).await.ok().flatten()
+    } else {
+        None
+    };
+    let (audio_track_index, audio_track_ordinal) = match saved_mapping {
+        Some(mapping) => mapping,
+        None => resolve_audio_mapping(&state, selected_audio_track).await,
+    };
     let audio_codec = config.mining.audio_codec;
     match media::extract_audio(
         &source,
@@ -2763,6 +3124,8 @@ struct WsMessage {
     #[serde(skip_serializing_if = "Option::is_none")]
     new_card: Option<EnrichmentDialogState>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pending_cards: Option<Vec<EnrichmentDialogState>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     anki_status: Option<AnkiStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
     enhancement_queue: Option<Vec<EnhancementQueueItem>>,
@@ -2823,11 +3186,11 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
 
     // Send initial state
     {
-        let subs = subtitles.read().await;
         let session_state = session_rx.borrow().clone();
         let current_anki_status = anki_status.read().await.clone();
         let current_enhancement_queue = enhancement_queue.read().await.clone();
         let subtitle_data = active_subtitle_data(&state).await;
+        let subs = subtitles.read().await;
         let active_line =
             if let (Some(track), Some(np)) = (subs.as_ref(), &session_state.now_playing) {
                 track
@@ -2837,12 +3200,14 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
                 None
             };
 
+        drop(subs);
         let init_msg = WsMessage {
             msg_type: "init".to_string(),
             state: Some(session_state),
             subtitles: Some(subtitle_data),
             active_line_index: active_line,
             new_card: None,
+            pending_cards: Some(state.pending_enrichments.read().await.clone()),
             anki_status: Some(current_anki_status),
             enhancement_queue: Some(current_enhancement_queue),
             enhancement_result: None,
@@ -2857,6 +3222,7 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
 
     let send_task = tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_millis(50));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut last_item_id: Option<String> = None;
         let mut last_subtitle_signature: Option<(
             Option<String>,
@@ -2877,6 +3243,97 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
 
         loop {
             tokio::select! {
+                biased;
+                card_result = card_rx.recv() => {
+                    let candidate = match card_result {
+                        Ok(e) => e,
+                        Err(broadcast::error::RecvError::Lagged(n)) => {
+                            warn!("WS new_card receiver lagged, {} message(s) lost", n);
+                            continue;
+                        }
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    };
+
+                    let msg = WsMessage {
+                        msg_type: "new_card".to_string(),
+                        state: None,
+                        subtitles: None,
+                        active_line_index: None,
+                        new_card: Some(candidate),
+                        pending_cards: None,
+                        anki_status: None,
+                        enhancement_queue: None,
+                        enhancement_result: None,
+                        remote_result: None,
+                        audio_tracks: None,
+                    };
+
+                    if let Ok(json) = serde_json::to_string(&msg) {
+                        if sender.send(Message::Text(json.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+                result = result_rx.recv() => {
+                    let enhancement_result = match result {
+                        Ok(r) => r,
+                        Err(broadcast::error::RecvError::Lagged(n)) => {
+                            warn!("WS enhancement_result receiver lagged, {} message(s) lost", n);
+                            continue;
+                        }
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    };
+
+                    let msg = WsMessage {
+                        msg_type: "enhancement_result".to_string(),
+                        state: None,
+                        subtitles: None,
+                        active_line_index: None,
+                        new_card: None,
+                        pending_cards: None,
+                        anki_status: None,
+                        enhancement_queue: None,
+                        enhancement_result: Some(enhancement_result),
+                        remote_result: None,
+                        audio_tracks: None,
+                    };
+
+                    if let Ok(json) = serde_json::to_string(&msg) {
+                        if sender.send(Message::Text(json.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+                remote = remote_rx.recv() => {
+                    let remote_result = match remote {
+                        Ok(r) => r,
+                        Err(broadcast::error::RecvError::Lagged(n)) => {
+                            warn!("WS remote_result receiver lagged, {} message(s) lost", n);
+                            continue;
+                        }
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    };
+
+                    let msg = WsMessage {
+                        msg_type: "remote_result".to_string(),
+                        state: None,
+                        subtitles: None,
+                        active_line_index: None,
+                        new_card: None,
+                        pending_cards: None,
+                        anki_status: None,
+                        enhancement_queue: None,
+                        enhancement_result: None,
+                        remote_result: Some(remote_result),
+                        audio_tracks: None,
+                    };
+
+                    if let Ok(json) = serde_json::to_string(&msg) {
+                        if sender.send(Message::Text(json.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                }
                 _ = interval.tick() => {
                     let session_state = session_rx.borrow_and_update().clone();
                     let subs = subtitles.read().await;
@@ -2897,40 +3354,19 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
                         .as_ref()
                         .map(|np| np.subtitle_selection_mode)
                         .unwrap_or(SubtitleSelectionMode::Auto);
-                    let subtitle_lines = subs.as_ref().map(|track| track.lines.clone()).unwrap_or_default();
+                    let subtitle_count = subs.as_ref().map(|track| track.lines.len()).unwrap_or(0);
                     let subtitle_offset_ms = subs.as_ref().map(|track| track.offset_ms).unwrap_or(0);
-                    let native_lines = native_subtitles
-                        .read()
-                        .await
-                        .as_ref()
-                        .map(|track| track.lines.clone())
-                        .unwrap_or_default();
-                    let native_count = native_lines.len();
+                    let native = native_subtitles.read().await;
+                    let native_count = native.as_ref().map(|track| track.lines.len()).unwrap_or(0);
                     let subtitle_loading = session_state
                         .now_playing
                         .as_ref()
                         .map(|now_playing| now_playing.subtitle_loading)
                         .unwrap_or(false);
-                    let subtitle_data = SubtitleData {
-                        count: subtitle_lines.len(),
-                        lines: subtitle_lines,
-                        native_count,
-                        native_lines,
-                        candidates: current_candidates.clone(),
-                        selected_candidate_id,
-                        selection_mode,
-                        subtitle_offset_ms,
-                        loading: subtitle_loading,
-                    };
                     let current_subtitle_signature = (
-                        current_item_id.clone(),
-                        subtitle_data.selected_candidate_id.clone(),
-                        subtitle_data.selection_mode,
-                        subtitle_data.count,
-                        subtitle_data.candidates.clone(),
-                        subtitle_data.subtitle_offset_ms,
-                        subtitle_data.native_count,
-                        subtitle_data.loading,
+                        current_item_id.clone(), selected_candidate_id.clone(), selection_mode,
+                        subtitle_count, current_candidates.clone(), subtitle_offset_ms,
+                        native_count, subtitle_loading,
                     );
 
                     let send_subs = current_item_id != last_item_id
@@ -2965,18 +3401,29 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
                         None
                     };
 
+                    let subtitle_data = if send_subs {
+                        Some(SubtitleData {
+                            count: subtitle_count,
+                            lines: subs.as_ref().map(|t| t.lines.clone()).unwrap_or_default(),
+                            native_count,
+                            native_lines: native.as_ref().map(|t| t.lines.clone()).unwrap_or_default(),
+                            candidates: current_candidates, selected_candidate_id, selection_mode,
+                            subtitle_offset_ms, loading: subtitle_loading,
+                        })
+                    } else { None };
+                    // No subtitle lock may be held across socket I/O (or a
+                    // nested read that can queue behind a waiting writer).
+                    drop(subs);
+                    drop(native);
                     let is_full_update = send_subs || send_audio;
 
                     let msg = WsMessage {
                         msg_type: if is_full_update { "full_update".to_string() } else { "position".to_string() },
                         state: Some(session_state),
-                        subtitles: if send_subs {
-                            Some(subtitle_data)
-                        } else {
-                            None
-                        },
+                        subtitles: subtitle_data,
                         active_line_index: active_line,
                         new_card: None,
+                        pending_cards: None,
                         anki_status: if send_anki_status {
                             Some(current_anki_status)
                         } else {
@@ -2994,93 +3441,6 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
                         } else {
                             None
                         },
-                    };
-
-                    if let Ok(json) = serde_json::to_string(&msg) {
-                        if sender.send(Message::Text(json.into())).await.is_err() {
-                            break;
-                        }
-                    }
-                }
-                card_result = card_rx.recv() => {
-                    let candidate = match card_result {
-                        Ok(e) => e,
-                        Err(broadcast::error::RecvError::Lagged(n)) => {
-                            warn!("WS new_card receiver lagged, {} message(s) lost", n);
-                            continue;
-                        }
-                        Err(broadcast::error::RecvError::Closed) => break,
-                    };
-
-                    let msg = WsMessage {
-                        msg_type: "new_card".to_string(),
-                        state: None,
-                        subtitles: None,
-                        active_line_index: None,
-                        new_card: Some(candidate),
-                        anki_status: None,
-                        enhancement_queue: None,
-                        enhancement_result: None,
-                        remote_result: None,
-                        audio_tracks: None,
-                    };
-
-                    if let Ok(json) = serde_json::to_string(&msg) {
-                        if sender.send(Message::Text(json.into())).await.is_err() {
-                            break;
-                        }
-                    }
-                }
-                result = result_rx.recv() => {
-                    let enhancement_result = match result {
-                        Ok(r) => r,
-                        Err(broadcast::error::RecvError::Lagged(n)) => {
-                            warn!("WS enhancement_result receiver lagged, {} message(s) lost", n);
-                            continue;
-                        }
-                        Err(broadcast::error::RecvError::Closed) => break,
-                    };
-
-                    let msg = WsMessage {
-                        msg_type: "enhancement_result".to_string(),
-                        state: None,
-                        subtitles: None,
-                        active_line_index: None,
-                        new_card: None,
-                        anki_status: None,
-                        enhancement_queue: None,
-                        enhancement_result: Some(enhancement_result),
-                        remote_result: None,
-                        audio_tracks: None,
-                    };
-
-                    if let Ok(json) = serde_json::to_string(&msg) {
-                        if sender.send(Message::Text(json.into())).await.is_err() {
-                            break;
-                        }
-                    }
-                }
-                remote = remote_rx.recv() => {
-                    let remote_result = match remote {
-                        Ok(r) => r,
-                        Err(broadcast::error::RecvError::Lagged(n)) => {
-                            warn!("WS remote_result receiver lagged, {} message(s) lost", n);
-                            continue;
-                        }
-                        Err(broadcast::error::RecvError::Closed) => break,
-                    };
-
-                    let msg = WsMessage {
-                        msg_type: "remote_result".to_string(),
-                        state: None,
-                        subtitles: None,
-                        active_line_index: None,
-                        new_card: None,
-                        anki_status: None,
-                        enhancement_queue: None,
-                        enhancement_result: None,
-                        remote_result: Some(remote_result),
-                        audio_tracks: None,
                     };
 
                     if let Ok(json) = serde_json::to_string(&msg) {

@@ -1,21 +1,28 @@
 <script>
   import { onMount } from 'svelte';
-  import { historyItems, minedHistoryItems, activeHistoryItemId, currentView, navigate, applySubtitlePayload } from './stores.js';
-  import { getHistory, getMinedHistory, activateHistoryItem, getHistorySubtitles } from './api.js';
+  import { historyItems, minedHistoryItems, activeHistoryItemId, currentView, navigate, applySubtitlePayload, autoApprove } from './stores.js';
+  import { getHistory, getMinedHistory, getReviewSessions, activateHistoryItem, getHistorySubtitles } from './api.js';
+  import { plainText } from './review.js';
   import { formatTime } from './utils.js';
 
   let loading = false;
-  let activeTab = 'mined'; // 'mined' | 'watch'
+  let activeTab = 'sessions';
+  let sessions = [], historyFilter = null, error = '';
+  $: visibleSessions = sessions.filter(s => !historyFilter || s.history_id === historyFilter);
 
   onMount(loadHistory);
 
   async function loadHistory() {
     loading = true;
     try {
-      const [items, mined] = await Promise.all([getHistory(), getMinedHistory()]);
+      const [items, mined, review] = await Promise.all([getHistory(), getMinedHistory(), getReviewSessions()]);
+      if (!review.ok) throw new Error(review.error);
+      sessions = review.sessions;
+      error = '';
       historyItems.set(items);
       minedHistoryItems.set(mined);
     } catch (e) {
+      error = e.message;
       console.error('Failed to load history:', e);
     } finally {
       loading = false;
@@ -23,6 +30,7 @@
   }
 
   async function handleActivate(item) {
+    try {
     const result = await activateHistoryItem(item.history_id);
     if (result.ok) {
       // The WS only pushes subtitles on now_playing item changes; after activating
@@ -31,7 +39,8 @@
       applySubtitlePayload(subData);
       activeHistoryItemId.set(item.history_id);
       currentView.set('timeline');
-    }
+    } else { error = result.error || 'Could not open subtitles'; }
+    } catch(e) { error = e.message; }
   }
 
   function handleOpenMined(item) {
@@ -60,7 +69,11 @@
     </button>
   </div>
 
+  <div class="review-intro"><div><h3>Mine now. Review when you're ready.</h3><p>Open a session to review its cards, add subtitle context, and adjust audio.</p></div><label><input type="checkbox" bind:checked={$autoApprove} /> Automatically enhance new cards<small>While this browser stays open</small></label></div>
+  {#if error}<p class="history-error" role="alert">{error}</p>{/if}
+
   <div class="history-tabs" role="tablist">
+    <button class="tab" class:active={activeTab === 'sessions'} role="tab" aria-selected={activeTab === 'sessions'} on:click={() => { activeTab = 'sessions'; historyFilter = null; }}>Card sessions <span class="tab-count">{sessions.length}</span></button>
     <button
       class="tab"
       class:active={activeTab === 'mined'}
@@ -87,7 +100,18 @@
     </button>
   </div>
 
-  {#if activeTab === 'mined'}
+  {#if activeTab === 'sessions'}
+    {#if historyFilter}<button class="clear-filter" on:click={() => historyFilter = null}>← All sessions</button>{/if}
+    <div class="history-list">
+      {#each visibleSessions as session (session.id)}
+        <button class="history-item review-session" on:click={() => navigate(`/review/${encodeURIComponent(session.id)}`)}>
+          <div class="item-header"><div class="item-title">{session.title}</div><span class="review-arrow">→</span></div>
+          <div class="item-meta"><span>{new Date(session.created_at).toLocaleString()}</span><span>{session.card_count} cards · {session.enhanced_count} enhanced</span></div>
+          <div class="session-progress"><progress max={session.card_count || 1} value={session.reviewed_count}></progress><span>{session.reviewed_count} / {session.card_count} reviewed</span></div>
+        </button>
+      {:else}<div class="empty compact"><p>{loading ? 'Loading sessions…' : 'No card sessions yet'}</p><p class="hint">Cards detected from your subtitles will appear here, including cards you skip or enhance automatically.</p></div>{/each}
+    </div>
+  {:else if activeTab === 'mined'}
     <section class="history-section">
       <p class="hint">Tap a mined note to reopen the enhancement dialog.</p>
       {#if $minedHistoryItems.length === 0}
@@ -102,7 +126,7 @@
                 <div class="item-title">{item.title}</div>
                 <span class="item-server">note #{item.note_id}</span>
               </div>
-              <div class="item-preview">{@html item.sentence.replace(/\n/g, '<br>')}</div>
+              <div class="item-preview">{plainText(item.sentence)}</div>
               <div class="item-meta">
                 <span class="meta-time">{timeAgo(item.updated_at)}</span>
               </div>
@@ -122,7 +146,7 @@
       {:else}
         <div class="history-list">
           {#each $historyItems as item}
-            <button class="history-item" on:click={() => handleActivate(item)}>
+            <div class="history-item">
               <div class="item-header">
                 <div class="item-title">{item.title}</div>
                 <span class="item-server">{item.server_kind}</span>
@@ -134,7 +158,8 @@
                 {/if}
                 <span class="meta-time">{timeAgo(item.last_seen)}</span>
               </div>
-            </button>
+              <div class="watch-actions"><button on:click={() => handleActivate(item)}>Open subtitles</button><button on:click={() => { historyFilter = item.history_id; activeTab = 'sessions'; }}>Review cards ({sessions.filter(s => s.history_id === item.history_id).reduce((n,s) => n + s.card_count, 0)})</button></div>
+            </div>
           {/each}
         </div>
       {/if}
@@ -143,6 +168,10 @@
 </div>
 
 <style>
+  .review-intro { border:1px solid var(--border); border-radius:10px; padding:20px; margin:16px 0 24px; background:var(--bg-secondary); display:grid; gap:16px; }
+  .review-intro h3 { font-size:17px; margin-bottom:6px; } .review-intro p { font-size:13px; color:var(--text-secondary); line-height:1.7; }
+  .review-intro label { font-size:13px; } .review-intro input { accent-color:#80d9c0; margin-right:6px; } .review-intro small { display:block; font-size:11px; color:var(--text-secondary); margin:5px 0 0 23px; }
+  .review-session { padding:20px; gap:10px; } .review-arrow { font-size:20px; color:#80d9c0; } .session-progress { display:flex; align-items:center; gap:15px; margin-top:6px; } .session-progress progress { height:5px; flex:1; accent-color:#80d9c0; } .session-progress span { font-size:11px; color:var(--text-secondary); } .watch-actions { display:flex; gap:8px; margin-top:8px; } .watch-actions button { font-size:12px; } .clear-filter { margin-bottom:14px; } .history-error { color:#ffabab; margin:16px 0; }
   .history-page {
     padding: 1rem;
     max-width: 800px;

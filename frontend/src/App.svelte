@@ -2,10 +2,11 @@
   import { onMount, onDestroy } from 'svelte';
   import { fade } from 'svelte/transition';
   import { connectWebSocket, disconnect, resyncFromBackground } from './lib/websocket.js';
-  import { getConfig, getDialogByCardId, getDialogByNoteId, getHistorySubtitles, getPendingEnrichments, getState } from './lib/api.js';
+  import { getConfig, getDialogByCardId, getDialogByNoteId, getHistorySubtitles, getState } from './lib/api.js';
   import {
     activeHistoryItemId,
     ankiStatus,
+    ankiNotice,
     applySubtitlePayload,
     applyMiningConfig,
     connected,
@@ -32,6 +33,8 @@
   import EnrichDialog from './lib/EnrichDialog.svelte';
   import ConfigPage from './lib/ConfigPage.svelte';
   import HistoryPage from './lib/HistoryPage.svelte';
+  import SessionReview from './lib/SessionReview.svelte';
+  import AutoEnhance from './lib/AutoEnhance.svelte';
   import ToastContainer from './lib/ToastContainer.svelte';
   import MediaRemote from './lib/MediaRemote.svelte';
   import AudioTrackModal from './lib/AudioTrackModal.svelte';
@@ -41,6 +44,14 @@
   let foregroundRecoveryId = 0;
   let lastForegroundRecoveryAt = 0;
   let foregroundRecoveryTimers = [];
+
+  function showView(view) {
+    if (location.pathname !== '/') {
+      history.pushState({}, '', '/');
+      syncRouteFromLocation();
+    }
+    currentView.set(view);
+  }
 
   const FOREGROUND_RECOVERY_DEBOUNCE_MS = 500;
   const FOREGROUND_RECOVERY_DELAYS_MS = [0, 700, 2000];
@@ -112,12 +123,8 @@
     window.addEventListener('focus', handlePageVisible);
 
     try {
-      const [config, pending] = await Promise.all([
-        getConfig(),
-        getPendingEnrichments(),
-      ]);
+      const config = await getConfig();
       applyMiningConfig(config.mining || {});
-      pendingCards.set(pending || []);
     } catch (e) {
       console.error('Failed to load initial app state:', e);
     }
@@ -179,12 +186,17 @@
     ? `note:${$route.noteId}`
     : $route.name === 'mine_card'
       ? `card:${$route.cardId}`
-      : 'home';
+      : $route.name === 'review' ? `review:${$route.sessionId}` : 'home';
 
   $: if (routeKey !== lastRouteKey) {
     lastRouteKey = routeKey;
-    if (routeKey === 'home') {
+    routeRequestId++;
+    if ($route.name === 'review') {
       dialogCard.set(null);
+      currentView.set('review');
+    } else if (routeKey === 'home') {
+      dialogCard.set(null);
+      if ($currentView === 'review') currentView.set('history');
     } else {
       hydrateDialogRoute($route);
     }
@@ -193,7 +205,7 @@
 
 <svelte:window on:popstate={syncRouteFromLocation} />
 
-<div class="app" class:mobile-playing={$isPlaying && !mobileChrome}>
+<div class="app" class:mobile-playing={$isPlaying && !mobileChrome} class:review-open={$currentView === 'review'}>
   <!-- Top bar -->
   <header class="topbar">
     <!-- Desktop: full topbar always. Mobile-playing: compact. Mobile-paused: compact. -->
@@ -202,6 +214,9 @@
       <div class="connection" class:online={$connected}>
         {$connected ? '●' : '○'}
       </div>
+      {#if $ankiNotice}
+        <span class="card-received" role="status">✓ Card received</span>
+      {/if}
       {#if $enhancementFlash}
         <span class="enhance-check" role="status" aria-label="Card enhanced" transition:fade={{ duration: 200 }}>✓</span>
       {/if}
@@ -214,19 +229,19 @@
       <nav class="desktop-nav">
         <button
           class:active={$currentView === 'timeline'}
-          on:click={() => currentView.set('timeline')}
+          on:click={() => showView('timeline')}
         >
           Subtitles
         </button>
         <button
           class:active={$currentView === 'history'}
-          on:click={() => currentView.set('history')}
+          on:click={() => showView('history')}
         >
           History
         </button>
         <button
           class:active={$currentView === 'config'}
-          on:click={() => currentView.set('config')}
+          on:click={() => showView('config')}
         >
           ⚙
         </button>
@@ -279,7 +294,7 @@
     <nav class="mobile-chrome-nav">
       <button
         class:active={$currentView === 'timeline'}
-        on:click={() => currentView.set('timeline')}
+        on:click={() => showView('timeline')}
       >
         Subtitles
         {#if $pendingCards.length > 0}
@@ -288,13 +303,13 @@
       </button>
       <button
         class:active={$currentView === 'history'}
-        on:click={() => currentView.set('history')}
+        on:click={() => showView('history')}
       >
         History
       </button>
       <button
         class:active={$currentView === 'config'}
-        on:click={() => currentView.set('config')}
+        on:click={() => showView('config')}
       >
         Settings
       </button>
@@ -310,6 +325,8 @@
       <SubtitleTimeline />
     {:else if $currentView === 'history'}
       <HistoryPage />
+    {:else if $currentView === 'review' && $route.name === 'review'}
+      {#key $route.sessionId}<SessionReview sessionId={$route.sessionId} />{/key}
     {:else if $currentView === 'config'}
       <ConfigPage />
     {/if}
@@ -327,6 +344,7 @@
 
   <!-- Enrichment dialog (modal overlay) -->
   <EnrichDialog />
+  <AutoEnhance />
 
   <!-- Audio track selection modal -->
   <AudioTrackModal />
@@ -336,6 +354,13 @@
 </div>
 
 <style>
+  :global(#app:has(.review-open)) { width:100%; }
+  .review-open .logo { margin:0; }
+  .review-open .topbar { padding:10px 20px; }
+  .review-open .now-playing, .review-open .mobile-chrome-overlay,
+  .review-open .mobile-bottom-bar, .review-open .topbar-np { display:none; }
+  .review-open .content { padding:0; overflow:auto; }
+  .card-received { font-size:11px; color:#80d9c0; white-space:nowrap; }
   /* ══════════════════════════════════════
      Desktop layout (unchanged)
      ══════════════════════════════════════ */

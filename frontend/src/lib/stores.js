@@ -67,6 +67,14 @@ export const alwaysReuseMiningAssets = localStorageStore('opt_alwaysReuseMiningA
 // History
 export const historyItems = writable(/** @type {any[]} */ ([]));
 export const minedHistoryItems = writable(/** @type {any[]} */ ([]));
+export const reviewRevision = writable(0);
+export const ankiNotice = writable(null);
+let noticeTimer;
+export function confirmCardReceived(noteId) {
+  ankiNotice.set(noteId);
+  clearTimeout(noticeTimer);
+  noticeTimer = setTimeout(() => ankiNotice.set(null), 4000);
+}
 /// When mining from history, the active history item_id
 export const activeHistoryItemId = writable(/** @type {string|null} */ (null));
 export const dialogCard = writable(/** @type {NewCardWithMatch|null} */ (null));
@@ -94,6 +102,11 @@ export function applyAudioTracksPayload(payload) {
 }
 
 function parseRoute(pathname = location.pathname) {
+  const reviewMatch = pathname.match(/^\/review\/([^/]+)$/);
+  if (reviewMatch) {
+    try { return { name: 'review', sessionId: decodeURIComponent(reviewMatch[1]) }; }
+    catch { return { name: 'home' }; }
+  }
   const noteMatch = pathname.match(/^\/mine\/note\/(\d+)$/);
   if (noteMatch) {
     return { name: 'mine_note', noteId: Number(noteMatch[1]) };

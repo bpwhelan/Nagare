@@ -291,7 +291,9 @@ fn parse_ass_timestamp(ts: &str) -> i64 {
 
 /// Strip HTML tags from subtitle text.
 fn strip_tags(text: &str) -> String {
-    let tag_re = Regex::new(r"<[^>]+>").unwrap();
+    static TAG_RE: std::sync::LazyLock<Regex> =
+        std::sync::LazyLock::new(|| Regex::new(r"<[^>]+>").unwrap());
+    let tag_re = &*TAG_RE;
     tag_re.replace_all(text, "").trim().to_string()
 }
 

@@ -58,6 +58,7 @@ Nagare watches your active media server playback sessions, displays a live subti
 - Playback controls (seek, pause, resume) from the browser.
 - Yomitan-aware pause behavior. (Must turn off Secure Popup in Yomitan) 
 - Watch history for mining after playback ends
+- Session card review with saved SRT snapshots, review progress, context expansion, and audio previews
 - Multi-server support (Emby + Jellyfin + Plex + AudioBookShelf simultaneously)
 - Manual-review, daily, or automatic Tadoku listening-log sync, grouped by show with duplicate protection
 
@@ -149,6 +150,15 @@ This discovery uses the administrator-only `/api/sessions` endpoint, so the conf
 2. Select a session or allow Nagare to auto-select the most recently active one
 3. Create a card in Anki — Nagare matches it to the exact subtitle context
 4. Confirm the match, preview audio/screenshot, and enrich the card
+
+### Review a mining session later
+
+Open **History → Card sessions**, or choose **Review cards** on a watch-history item. Each session keeps the subtitle snapshot and audio track used when its cards were detected. You can search or filter cards, inspect their saved Anki fields, add surrounding subtitle lines, edit the sentence/translation, preview audio and frames, and save a revised clip to Anki. **Reviewed & next** saves progress across reloads and restarts. Unsaved edits stay available when switching between cards in the workspace.
+
+**Automatically enhance new cards** uses the existing browser preference and keeps working while that browser is open, including on the review page. Cards are recorded before enhancement completes, so skipped cards, failed attempts, and cards that already had media remain available for review. Failures require a deliberate retry. Changing the media, subtitle/audio track, playback session, or returning after 30 minutes without mining starts another card session. Earlier enhanced notes are imported by title with the subtitle history available at upgrade time; their original session boundaries cannot be reconstructed.
+
+AnkiBeacon full payloads take the fastest notification path: they do not wait for fallback polling or optional card-ID lookups. ID-only payloads still need AnkiConnect metadata, but those lookups run separately. The UI distinguishes **Card received** from the confirmation that enhancement finished.
+
 
 ## Project structure
 

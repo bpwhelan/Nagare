@@ -5,6 +5,7 @@ mod media;
 mod media_server;
 mod mining;
 mod plex_websocket;
+mod review;
 mod session;
 mod subtitle;
 mod tadoku;

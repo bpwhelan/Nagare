@@ -25,6 +25,8 @@ pub enum EnrichmentSource {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EnrichmentDialogState {
     pub event: NewCardEvent,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matched_text: Option<String>,
     pub matched_line_index: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub history_id: Option<String>,
@@ -129,6 +131,7 @@ impl MiningHistoryEntry {
     pub fn dialog_state(&self) -> EnrichmentDialogState {
         EnrichmentDialogState {
             event: self.event.clone(),
+            matched_text: None,
             matched_line_index: self.matched_line_index,
             history_id: Some(self.history_id.clone()),
             start_ms: Some(self.start_ms),
@@ -144,7 +147,7 @@ impl MiningHistoryEntry {
 }
 
 pub struct AppDatabase {
-    db_path: PathBuf,
+    pub(crate) db_path: PathBuf,
 }
 
 impl AppDatabase {
@@ -460,10 +463,11 @@ fn init_database(path: &Path, legacy_db_path: Option<&Path>) -> anyhow::Result<(
         }
     }
 
-    open_connection(path).map(|_| ())
+    let conn = open_connection(path)?;
+    crate::review::initialize(&conn)
 }
 
-fn open_connection(path: &Path) -> anyhow::Result<Connection> {
+pub(crate) fn open_connection(path: &Path) -> anyhow::Result<Connection> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("Failed to create DB dir {}", parent.display()))?;

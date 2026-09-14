@@ -1,12 +1,13 @@
 const BASE = '';
 
-import { showErrorToast } from './stores.js';
+import { showErrorToast, pendingCards } from './stores.js';
 
 async function api(path, options = {}) {
   const resp = await fetch(`${BASE}${path}`, {
     headers: { 'Content-Type': 'application/json' },
     ...options,
   });
+  if (!resp.ok) throw new Error(`Request failed (${resp.status})`);
   return resp.json();
 }
 
@@ -75,7 +76,7 @@ export async function enrichCard({
     end_ms: endMs,
     generate_avif: generateAvif,
   };
-  if (translation) body.translation = translation;
+  if (translation != null) body.translation = translation;
   if (matchedLineIndex != null) body.matched_line_index = matchedLineIndex;
   if (includedLineFirst != null) body.included_line_first = includedLineFirst;
   if (includedLineLast != null) body.included_line_last = includedLineLast;
@@ -101,6 +102,12 @@ export async function getPendingEnrichments() {
 export async function getMinedHistory() {
   return api('/api/mined');
 }
+
+export const getReviewSessions = () => api('/api/review');
+export const getReviewSession = (id) => api(`/api/review/${encodeURIComponent(id)}`);
+export const markCardReviewed = (noteId, reviewed) => api(`/api/review/notes/${noteId}`, {
+  method: 'PUT', body: JSON.stringify({ reviewed }),
+});
 
 export async function getDialogByNoteId(noteId) {
   return api(`/api/dialog/note/${noteId}`);
@@ -166,8 +173,9 @@ export function firePlayPause(paused) {
   });
 }
 
-export async function previewAudio(startMs, endMs, itemId = null) {
+export async function previewAudio(startMs, endMs, itemId = null, noteId = null) {
   const body = { start_ms: startMs, end_ms: endMs };
+  if (noteId != null) body.note_id = noteId;
   if (itemId) body.item_id = itemId;
   return api('/api/preview-audio', {
     method: 'POST',
@@ -279,8 +287,8 @@ export async function previewAudioTrack(streamIndex, itemId = null) {
 const _enrichQueue = [];
 let _enrichDraining = false;
 
-export function queueEnrichCard(payload) {
-  _enrichQueue.push(payload);
+export function queueEnrichCard(payload, fallback = null) {
+  _enrichQueue.push({ payload, fallback });
   console.log('[enrich-queue] Queued note', payload.noteId, `(${_enrichQueue.length} pending)`);
   _drainEnrichQueue();
 }
@@ -289,15 +297,18 @@ async function _drainEnrichQueue() {
   if (_enrichDraining) return;
   _enrichDraining = true;
   while (_enrichQueue.length > 0) {
-    const payload = _enrichQueue.shift();
+    const { payload, fallback } = _enrichQueue.shift();
     try {
       console.log('[enrich-queue] Sending note', payload.noteId);
       const result = await enrichCard(payload);
       console.log('[enrich-queue] Response for note', payload.noteId, result);
       if (!result.success) {
-        showErrorToast(result.error || 'Could not queue enhancement');
+        throw new Error(result.error || 'Could not queue enhancement');
       }
     } catch (e) {
+      if (fallback && fallback.source !== 'mining_history') {
+        pendingCards.update(cards => [...cards.filter(c => c.event.note_id !== payload.noteId), { ...fallback, source: 'retry' }].slice(-10));
+      }
       console.error('[enrich-queue] Error for note', payload.noteId, e);
       showErrorToast(e.message || 'Could not queue enhancement');
     }

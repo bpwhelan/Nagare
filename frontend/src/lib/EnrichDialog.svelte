@@ -21,10 +21,9 @@
   import { enrichCard, skipEnrichment, previewAudio, previewScreenshot, getSubtitleMatches, firePlayPause, queueEnrichCard } from './api.js';
   import { audioMimeType, formatTime, imageMimeType, gatherTranslation } from './utils.js';
 
-  $: card = $dialogCard || $pendingCards[0] || null;
+  $: card = $dialogCard || ($currentView === 'timeline' && !$autoApprove ? $pendingCards[0] : null) || null;
   $: isRouteCard = $dialogCard != null;
   $: isHistoryCard = card?.source === 'mining_history';
-  $: shouldAutoApprovePending = Boolean(card && !isRouteCard && card.source === 'pending' && $autoApprove);
   $: mediaItemId = card?.history_id || $activeHistoryItemId || null;
   $: matchedIndex = card?.matched_line_index;
   $: matchedLine = matchedIndex != null ? $subtitles[matchedIndex] : null;
@@ -44,7 +43,6 @@
   let selectedHistoryMatch = null;
   let lastCardKey = null;
   let submitting = false;
-  let lastAutoApprovedCardKey = null;
   let lastMinedLine = null;
   let reusePrompt = false;
   let alwaysReuseFromPrompt = false;
@@ -184,7 +182,8 @@
 
   $: if (card && cardKey !== lastCardKey) {
     lastCardKey = cardKey;
-    editedSentence = card.event.sentence || '';
+    editedSentence = card.matched_text && card.source === 'pending'
+      ? mergeSentenceMarkup(card.matched_text, card.event.sentence) : card.event.sentence || '';
     editedTranslation = '';
     translationDirty = false;
     historyMatches = null;
@@ -201,7 +200,7 @@
     cleanupScreenshot();
     if ($activeHistoryItemId && matchedIndex == null && includedLineFirst == null) {
       fetchHistoryMatches(card.event.sentence);
-    } else if ($pauseOnEnhance && $isPlaying && !shouldAutoApprovePending) {
+    } else if ($pauseOnEnhance && $isPlaying) {
       firePlayPause(true);
       pausedByDialog = true;
     }
@@ -229,16 +228,6 @@
   // until the user edits it manually.
   $: if (!translationDirty) {
     editedTranslation = gatherTranslation($nativeSubtitles, startMs, endMs);
-  }
-
-  $: autoApproveReady = shouldAutoApprovePending
-    && includedLineFirst != null
-    && includedLineLast != null
-    && endMs > startMs;
-
-  $: if (autoApproveReady && cardKey !== lastAutoApprovedCardKey && !submitting) {
-    lastAutoApprovedCardKey = cardKey;
-    handleConfirm();
   }
 
   function rebuildSentence() {
@@ -353,11 +342,12 @@
       }
     }
 
+    const fallbackCard = card;
     const noteId = card.event.note_id;
     const payload = {
       noteId,
       sentence: editedSentence,
-      translation: editedTranslation,
+      translation: editedTranslation || null,
       startMs,
       endMs,
       generateAvif,
@@ -379,7 +369,7 @@
     closeDialogAfterDispatch(noteId, isHistoryCard);
 
     // Queue the enrichment — calls are serialized to avoid connection pool exhaustion
-    queueEnrichCard(payload);
+    queueEnrichCard(payload, fallbackCard);
   }
 
   async function handleSkip() {
@@ -392,7 +382,7 @@
     }
     cleanupAudio();
     cleanupScreenshot();
-    if (card.source === 'pending') {
+    if (!isHistoryCard) {
       await skipEnrichment(card.event.note_id);
       removeCardFromQueue(card.event.note_id);
     }
@@ -594,7 +584,7 @@
   </div>
 {/if}
 
-{#if card && !shouldAutoApprovePending && !reusePrompt}
+{#if card && !reusePrompt}
   <div class="overlay">
     <div class="dialog">
       <div class="dialog-header">

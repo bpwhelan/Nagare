@@ -65,6 +65,7 @@ pub struct NewCardEvent {
 pub struct NewCardNotification {
     pub event: NewCardEvent,
     pub card_ids: Option<Vec<i64>>,
+    pub needs_enhancement: bool,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -544,11 +545,6 @@ impl HeartbeatState {
     fn is_fresh(&self) -> bool {
         self.received_at.elapsed() < self.stale_after()
     }
-
-    fn duration_until_stale(&self) -> Duration {
-        self.stale_after()
-            .saturating_sub(self.received_at.elapsed())
-    }
 }
 
 fn heartbeat_is_fresh(heartbeat: Option<&HeartbeatState>) -> bool {
@@ -569,13 +565,21 @@ async fn emit_note_info(
     tx: &mpsc::Sender<NewCardNotification>,
     card_ids: Option<Vec<i64>>,
 ) -> bool {
-    if should_skip_note(&note, anki_config) {
+    let mut intake_config = anki_config.clone();
+    intake_config.skip_if_audio_exists = false;
+    intake_config.skip_if_picture_exists = false;
+    if should_skip_note(&note, &intake_config) {
         return true;
     }
+    let needs_enhancement = !should_skip_note(&note, anki_config);
 
     let event = note_info_to_event(note, &anki_config.fields.sentence);
     if tx
-        .send(NewCardNotification { event, card_ids })
+        .send(NewCardNotification {
+            event,
+            card_ids,
+            needs_enhancement,
+        })
         .await
         .is_err()
     {
@@ -682,6 +686,7 @@ async fn poll_ankiconnect_once(
                         }
                         Err(error) => {
                             warn!("Failed to fetch note info: {}", error);
+                            return PollStep::Continue(base_interval);
                         }
                     }
                 }
@@ -853,186 +858,97 @@ pub async fn run_anki_poller(
     status: Arc<RwLock<AnkiStatus>>,
     tx: mpsc::Sender<NewCardNotification>,
     mut event_rx: mpsc::Receiver<AnkiBeaconEvent>,
-    mut session_rx: watch::Receiver<SessionState>,
+    session_rx: watch::Receiver<SessionState>,
 ) {
-    let mut known_ids: HashSet<i64> = HashSet::new();
+    let mut known_ids = HashSet::new();
     let mut initialized = false;
-    let mut poller_idle = false;
-    let mut heartbeat: Option<HeartbeatState> = None;
-    let mut processed_push_notes: HashSet<i64> = HashSet::new();
-    let mut next_fallback_poll_at: Option<Instant> = None;
-    let mut last_live_session_at = if has_live_session(&session_rx.borrow()) {
-        Some(Instant::now())
-    } else {
-        None
-    };
-
-    let mut consecutive_errors: u32 = 0;
+    let mut heartbeat = None;
+    let mut processed_push_notes = HashSet::new();
+    let mut consecutive_errors = 0;
     let mut final_warning_shown = false;
+    let mut last_live_session_at = None;
+    let mut next_poll = Instant::now();
+    let mut metadata_jobs = tokio::task::JoinSet::new();
+    // ID-only beacons need an HTTP lookup; full beacons must never wait for it.
+    let mut metadata_pending = std::collections::VecDeque::new();
+    let mut metadata_inflight = HashSet::new();
 
     loop {
-        let session_state = session_rx.borrow().clone();
-        let live_session = has_live_session(&session_state);
-        if live_session {
+        let live = has_live_session(&session_rx.borrow());
+        if live {
             last_live_session_at = Some(Instant::now());
-            poller_idle = false;
         }
-
-        let fallback_allowed =
-            live_session || grace_remaining_since(last_live_session_at).is_some();
+        let fallback_allowed = live || grace_remaining_since(last_live_session_at).is_some();
         let push_active = heartbeat_is_fresh(heartbeat.as_ref());
+        let wait = next_poll.saturating_duration_since(Instant::now());
+        let client = anki_client.read().await.clone();
+        let anki_config = config.read().await.anki.clone();
 
-        if !fallback_allowed {
-            if !push_active && (!poller_idle || heartbeat.is_some()) {
-                set_idle_anki_status(&status).await;
-                heartbeat = None;
-            }
-
-            if !poller_idle {
-                known_ids.clear();
-                initialized = false;
-                next_fallback_poll_at = None;
-                consecutive_errors = 0;
-                final_warning_shown = false;
-                poller_idle = true;
-            }
-
-            let heartbeat_wait = heartbeat
-                .as_ref()
-                .filter(|state| state.is_fresh())
-                .map(HeartbeatState::duration_until_stale);
-
-            match heartbeat_wait {
-                Some(wait_duration) => {
-                    tokio::select! {
-                        event = event_rx.recv() => {
-                            let Some(event) = event else { return; };
-                            if !handle_ankibeacon_event(
-                                event,
-                                &anki_client,
-                                &config,
-                                &status,
-                                &tx,
-                                &mut heartbeat,
-                                &mut processed_push_notes,
-                                &mut consecutive_errors,
-                                &mut final_warning_shown,
-                            ).await {
-                                return;
-                            }
-                        }
-                        changed = session_rx.changed() => {
-                            if changed.is_err() {
-                                return;
-                            }
-                        }
-                        _ = tokio::time::sleep(wait_duration) => {}
-                    }
-                }
-                None => {
-                    tokio::select! {
-                        event = event_rx.recv() => {
-                            let Some(event) = event else { return; };
-                            if !handle_ankibeacon_event(
-                                event,
-                                &anki_client,
-                                &config,
-                                &status,
-                                &tx,
-                                &mut heartbeat,
-                                &mut processed_push_notes,
-                                &mut consecutive_errors,
-                                &mut final_warning_shown,
-                            ).await {
-                                return;
-                            }
-                        }
-                        changed = session_rx.changed() => {
-                            if changed.is_err() {
-                                return;
-                            }
-                        }
-                    }
-                }
-            }
-            continue;
-        }
-
-        let wait_after_poll = if push_active {
-            next_fallback_poll_at = None;
-            heartbeat
-                .as_ref()
-                .map(HeartbeatState::duration_until_stale)
-                .unwrap_or_else(|| Duration::from_secs(30))
-        } else {
-            let now = Instant::now();
-            if next_fallback_poll_at
-                .map(|deadline| now >= deadline)
-                .unwrap_or(true)
-            {
-                let client = anki_client.read().await.clone();
-                let anki_config = config.read().await.anki.clone();
-                match poll_ankiconnect_once(
-                    client,
-                    anki_config,
-                    &status,
-                    &tx,
-                    &mut known_ids,
-                    &mut initialized,
-                    &mut consecutive_errors,
-                    &mut final_warning_shown,
-                )
-                .await
-                {
-                    PollStep::Continue(wait_duration) => {
-                        next_fallback_poll_at = Some(Instant::now() + wait_duration);
-                        wait_duration
-                    }
-                    PollStep::Stop => return,
-                }
-            } else {
-                next_fallback_poll_at
-                    .map(|deadline| deadline.saturating_duration_since(now))
-                    .unwrap_or(Duration::ZERO)
-            }
-        };
-
-        let wait_duration = if live_session {
-            wait_after_poll
-        } else if let Some(remaining_grace) = grace_remaining_since(last_live_session_at) {
-            wait_after_poll.min(remaining_grace)
-        } else {
-            Duration::ZERO
-        };
-
-        if wait_duration.is_zero() {
-            continue;
+        while metadata_jobs.len() < 4 {
+            let Some((note_id, card_ids)) = metadata_pending.pop_front() else {
+                break;
+            };
+            let client = client.clone();
+            metadata_jobs
+                .spawn(async move { (note_id, card_ids, client.notes_info(&[note_id]).await) });
         }
 
         tokio::select! {
-            _ = tokio::time::sleep(wait_duration) => {}
-            event = event_rx.recv() => {
-                let Some(event) = event else {
-                    return;
-                };
-                if !handle_ankibeacon_event(
-                    event,
-                    &anki_client,
-                    &config,
-                    &status,
-                    &tx,
-                    &mut heartbeat,
-                    &mut processed_push_notes,
-                    &mut consecutive_errors,
-                    &mut final_warning_shown,
-                ).await {
-                    return;
+            biased;
+            payload = event_rx.recv() => {
+                let Some(payload) = payload else { return; };
+                if payload.event == AnkiBeaconEventKind::NoteAdded && payload.note_info().is_none() {
+                    if let Some(note_id) = payload.note_id {
+                        if !processed_push_notes.contains(&note_id) && metadata_inflight.insert(note_id) {
+                            if metadata_pending.len() < 128 {
+                                metadata_pending.push_back((note_id, payload.provided_card_ids()));
+                            } else {
+                                metadata_inflight.remove(&note_id);
+                                warn!(note_id, "Anki metadata queue is full; polling will retry");
+                            }
+                        }
+                    }
+                } else if !handle_ankibeacon_event(
+                    payload, &anki_client, &config, &status, &tx, &mut heartbeat,
+                    &mut processed_push_notes, &mut consecutive_errors, &mut final_warning_shown,
+                ).await { return; }
+                // Share deduplication with fallback, including when push starts
+                // halfway through a poll. A fresh heartbeat cancels that poll.
+                known_ids.extend(processed_push_notes.iter().copied());
+            }
+            Some(result) = metadata_jobs.join_next(), if !metadata_jobs.is_empty() => {
+                if let Ok((note_id, card_ids, result)) = result {
+                    metadata_inflight.remove(&note_id);
+                    match result {
+                        Ok(notes) => {
+                            for note in notes {
+                                if processed_push_notes.insert(note.note_id) {
+                                    known_ids.insert(note.note_id);
+                                    if !emit_note_info(note, &anki_config, &tx, card_ids.clone()).await { return; }
+                                }
+                            }
+                        }
+                        Err(error) => warn!(note_id, "Anki note metadata lookup failed: {}", error),
+                    }
                 }
             }
-            changed = session_rx.changed() => {
-                if changed.is_err() {
-                    return;
+            step = async {
+                tokio::time::sleep(wait).await;
+                poll_ankiconnect_once(client, anki_config.clone(), &status, &tx, &mut known_ids,
+                    &mut initialized, &mut consecutive_errors, &mut final_warning_shown).await
+            }, if fallback_allowed && !push_active => {
+                match step {
+                    PollStep::Continue(delay) => {
+                        processed_push_notes.extend(known_ids.iter().copied());
+                        next_poll = Instant::now() + delay;
+                    }
+                    PollStep::Stop => return,
                 }
+            }
+            // Re-evaluate idle/heartbeat state without cancelling in-flight
+            // HTTP polls for every playback position update.
+            _ = tokio::time::sleep(Duration::from_secs(1)), if !fallback_allowed || push_active => {
+                if !fallback_allowed && !push_active { set_idle_anki_status(&status).await; }
             }
         }
     }
@@ -1070,5 +986,147 @@ mod note_filter_tests {
 
         assert!(should_skip_note(&note_with_sentence(None), &cfg));
         assert!(should_skip_note(&note_with_sentence(Some("   ")), &cfg));
+    }
+}
+
+#[cfg(test)]
+mod notification_latency_tests {
+    use super::*;
+    use crate::config::MediaServerKind;
+    use crate::session::SessionSummary;
+    use axum::{Json, Router, routing::post};
+
+    #[tokio::test]
+    async fn full_push_bypasses_slow_poll_and_id_only_lookup() {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let signal = started.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route(
+                    "/",
+                    post(move || {
+                        let signal = signal.clone();
+                        async move {
+                            signal.notify_one();
+                            tokio::time::sleep(Duration::from_secs(10)).await;
+                            Json(json!({"result": [], "error": null}))
+                        }
+                    }),
+                ),
+            )
+            .await
+            .unwrap();
+        });
+        let config = Config::default();
+        let sentence_field = config.anki.fields.sentence.clone();
+        let (event_tx, event_rx) = mpsc::channel(16);
+        let (card_tx, mut card_rx) = mpsc::channel(16);
+        let (_session_tx, session_rx) = watch::channel(SessionState {
+            sessions: vec![SessionSummary {
+                id: "test".into(),
+                server_kind: MediaServerKind::Plex,
+                client: "test".into(),
+                device_name: "test".into(),
+                user_name: None,
+                title: None,
+                is_target_language: true,
+            }],
+            now_playing: None,
+            active_session_id: Some("test".into()),
+        });
+        let poller = tokio::spawn(run_anki_poller(
+            Arc::new(RwLock::new(Arc::new(AnkiClient::new(&format!(
+                "http://{addr}"
+            ))))),
+            Arc::new(RwLock::new(config)),
+            Arc::new(RwLock::new(AnkiStatus::default())),
+            card_tx,
+            event_rx,
+            session_rx,
+        ));
+        tokio::time::timeout(Duration::from_secs(2), started.notified())
+            .await
+            .unwrap();
+        let full = |id| {
+            serde_json::from_value::<AnkiBeaconEvent>(json!({
+                "event": "note_added", "note_id": id, "note_type_name": "Mining",
+                "fields": { sentence_field.clone(): "対象の文" }, "card_ids": [123],
+            }))
+            .unwrap()
+        };
+        let start = Instant::now();
+        event_tx.send(full(1)).await.unwrap();
+        let first = tokio::time::timeout(Duration::from_millis(500), card_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.event.note_id, 1);
+        assert_eq!(first.card_ids, Some(vec![123]));
+        eprintln!("Full push during a 10-second poll: {:?}", start.elapsed());
+
+        event_tx
+            .send(serde_json::from_value(json!({"event":"heartbeat"})).unwrap())
+            .await
+            .unwrap();
+        event_tx
+            .send(serde_json::from_value(json!({"event":"note_added","note_id":2})).unwrap())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), started.notified())
+            .await
+            .unwrap();
+        event_tx.send(full(3)).await.unwrap();
+        let next = tokio::time::timeout(Duration::from_millis(500), card_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(next.event.note_id, 3);
+        event_tx.send(full(3)).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), card_rx.recv())
+                .await
+                .is_err()
+        );
+        poller.abort();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn cards_with_existing_media_are_still_captured_for_review() {
+        let cfg = AnkiConfig::default();
+        let mut note = NoteInfo {
+            note_id: 9,
+            model_name: "Mining".into(),
+            tags: vec![],
+            fields: HashMap::from([(
+                cfg.fields.sentence.clone(),
+                NoteField {
+                    value: "対象の文".into(),
+                    order: 0,
+                },
+            )]),
+        };
+        note.fields.insert(
+            cfg.fields.sentence_audio.clone(),
+            NoteField {
+                value: "[sound:existing.mp3]".into(),
+                order: 1,
+            },
+        );
+        note.fields.insert(
+            cfg.fields.picture.clone(),
+            NoteField {
+                value: "<img src='existing.jpg'>".into(),
+                order: 2,
+            },
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        assert!(emit_note_info(note, &cfg, &tx, None).await);
+        let notification = rx.recv().await.unwrap();
+        assert!(!notification.needs_enhancement);
+        assert_eq!(notification.event.sentence, "対象の文");
     }
 }
