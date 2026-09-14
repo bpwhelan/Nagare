@@ -46,8 +46,13 @@ impl MediaBrowserClient {
         format!("{}{}{}", self.base_url, prefix, path)
     }
 
-    fn auth_param(&self) -> (&str, &str) {
-        ("api_key", &self.api_key)
+    fn auth_params(&self) -> Vec<(&str, &str)> {
+        match self.flavor {
+            ServerFlavor::Emby => vec![("api_key", &self.api_key)],
+            // 12.0 disables legacy authorization. Keep api_key as well for
+            // servers older than 10.8, which do not recognize ApiKey.
+            ServerFlavor::Jellyfin => vec![("ApiKey", &self.api_key), ("api_key", &self.api_key)],
+        }
     }
 
     fn parse_stream_type(s: &str) -> StreamType {
@@ -184,7 +189,7 @@ impl MediaServer for MediaBrowserClient {
         let resp = self
             .http
             .get(self.url("/Sessions"))
-            .query(&[self.auth_param()])
+            .query(&self.auth_params())
             .send()
             .await?;
 
@@ -201,7 +206,7 @@ impl MediaServer for MediaBrowserClient {
         let resp = self
             .http
             .get(self.url("/Users"))
-            .query(&[self.auth_param()])
+            .query(&self.auth_params())
             .send()
             .await?;
 
@@ -234,10 +239,8 @@ impl MediaServer for MediaBrowserClient {
         let mut req = self
             .http
             .get(self.url(&format!("/Items/{item_id}")))
-            .query(&[
-                self.auth_param(),
-                ("Fields", "MediaStreams,Path,MediaSources"),
-            ]);
+            .query(&self.auth_params())
+            .query(&[("Fields", "MediaStreams,Path,MediaSources")]);
 
         if let Some(user_id) = user_id {
             req = req.query(&[("userId", user_id)]);
@@ -296,7 +299,7 @@ impl MediaServer for MediaBrowserClient {
         let resp = self
             .http
             .get(&url)
-            .query(&[self.auth_param()])
+            .query(&self.auth_params())
             .send()
             .await?;
 
@@ -308,9 +311,15 @@ impl MediaServer for MediaBrowserClient {
     }
 
     fn get_stream_url(&self, item_id: &str, media_source_id: &str) -> String {
+        let auth = self
+            .auth_params()
+            .into_iter()
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect::<Vec<_>>()
+            .join("&");
         format!(
-            "{}/Videos/{}/stream?MediaSourceId={}&api_key={}&Static=true",
-            self.base_url, item_id, media_source_id, self.api_key
+            "{}/Videos/{}/stream?MediaSourceId={}&{}&Static=true",
+            self.base_url, item_id, media_source_id, auth
         )
     }
 
@@ -318,10 +327,8 @@ impl MediaServer for MediaBrowserClient {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             self.http
                 .post(self.url(&format!("/Sessions/{session_id}/Playing/Seek")))
-                .query(&[
-                    self.auth_param(),
-                    ("SeekPositionTicks", &position_ticks.to_string()),
-                ])
+                .query(&self.auth_params())
+                .query(&[("SeekPositionTicks", &position_ticks.to_string())])
                 .send()
                 .await?;
             Ok(())
@@ -334,7 +341,7 @@ impl MediaServer for MediaBrowserClient {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             self.http
                 .post(self.url(&format!("/Sessions/{session_id}/Playing/Pause")))
-                .query(&[self.auth_param()])
+                .query(&self.auth_params())
                 .send()
                 .await?;
             Ok(())
@@ -347,7 +354,7 @@ impl MediaServer for MediaBrowserClient {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             self.http
                 .post(self.url(&format!("/Sessions/{session_id}/Playing/Unpause")))
-                .query(&[self.auth_param()])
+                .query(&self.auth_params())
                 .send()
                 .await?;
             Ok(())
@@ -361,6 +368,117 @@ impl MediaServer for MediaBrowserClient {
 mod tests {
     use super::MediaBrowserClient;
     use serde_json::json;
+
+    async fn check_authentication(jellyfin: bool, expected_key: &'static str) {
+        use crate::media_server::{MediaServer, SubtitleFormat};
+        use axum::{Router, extract::Request, http::StatusCode, response::IntoResponse};
+        use std::sync::{Arc, Mutex};
+
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let captured = requests.clone();
+        let app = Router::new().fallback(move |request: Request| {
+            let captured = captured.clone();
+            async move {
+                let url =
+                    reqwest::Url::parse(&format!("http://localhost{}", request.uri())).unwrap();
+                let authenticated = url
+                    .query_pairs()
+                    .any(|(name, value)| name == expected_key && value == "test-key");
+                captured
+                    .lock()
+                    .unwrap()
+                    .push((request.method().clone(), url.clone()));
+                if !authenticated {
+                    return StatusCode::UNAUTHORIZED.into_response();
+                }
+                let body = if url.path().ends_with("/Users") || url.path().ends_with("/Sessions") {
+                    "[]"
+                } else if url.path().contains("/Items/") {
+                    r#"{"Id":"item-1","MediaStreams":[],"MediaSources":[]}"#
+                } else {
+                    "subtitle or stream"
+                };
+                (StatusCode::OK, body).into_response()
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = if jellyfin {
+            MediaBrowserClient::new_jellyfin(&base, "test-key")
+        } else {
+            MediaBrowserClient::new(&base, "test-key")
+        };
+        assert!(client.get_sessions().await.unwrap().is_empty());
+        assert!(client.get_users().await.unwrap().is_empty());
+        assert_eq!(
+            client
+                .get_item_info("item-1", Some("user-1"))
+                .await
+                .unwrap()
+                .id,
+            "item-1"
+        );
+        assert_eq!(
+            client
+                .get_subtitles("item-1", "source-1", 2, SubtitleFormat::Srt)
+                .await
+                .unwrap(),
+            "subtitle or stream"
+        );
+        client.seek_session("session-1", 123).await.unwrap();
+        client.pause_session("session-1").await.unwrap();
+        client.unpause_session("session-1").await.unwrap();
+        let stream = client.get_stream_url("item-1", "source-1");
+        assert_eq!(reqwest::get(stream).await.unwrap().status(), StatusCode::OK);
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 8);
+        for (method, url) in requests.iter() {
+            let pairs = url
+                .query_pairs()
+                .collect::<std::collections::HashMap<_, _>>();
+            assert_eq!(
+                pairs.get(expected_key).map(|v| v.as_ref()),
+                Some("test-key")
+            );
+            if !jellyfin {
+                assert!(!pairs.contains_key("ApiKey"));
+            }
+            if url.path().contains("/Items/") {
+                assert_eq!(pairs.get("userId").unwrap(), "user-1");
+                assert_eq!(
+                    pairs.get("Fields").unwrap(),
+                    "MediaStreams,Path,MediaSources"
+                );
+            }
+            if url.path().ends_with("/Seek") {
+                assert_eq!(pairs.get("SeekPositionTicks").unwrap(), "123");
+            }
+            if url.path().contains("/Playing/") {
+                assert_eq!(method, reqwest::Method::POST);
+            }
+            if !url.path().starts_with("/Videos/") {
+                assert_eq!(url.path().starts_with("/emby/"), !jellyfin);
+            }
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn authenticates_all_jellyfin_requests_without_legacy_auth() {
+        check_authentication(true, "ApiKey").await;
+    }
+
+    #[tokio::test]
+    async fn authenticates_all_jellyfin_requests_with_legacy_auth() {
+        check_authentication(true, "api_key").await;
+    }
+
+    #[tokio::test]
+    async fn preserves_emby_authentication() {
+        check_authentication(false, "api_key").await;
+    }
 
     #[test]
     fn parses_latest_playback_activity_timestamp() {
