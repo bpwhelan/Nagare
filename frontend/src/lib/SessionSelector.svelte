@@ -45,7 +45,7 @@
         <button class="dropdown-item auto" on:click={handleAutoSelect}>
           ⟳ Auto-select
         </button>
-        {#each sessions as session}
+        {#each sessions as session (session.id)}
           <button
             class="dropdown-item"
             class:active={session.id === activeId}

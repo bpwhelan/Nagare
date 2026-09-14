@@ -770,7 +770,7 @@
           on:click={() => (config.tadoku.enabled = false)}
         >
           <strong>Manual review</strong>
-          <span>Choose each completed episode before it is sent.</span>
+          <span>Choose each ready episode or audiobook before it is sent.</span>
         </button>
         <button
           type="button"
@@ -783,7 +783,7 @@
           }}
         >
           <strong>Daily sync</strong>
-          <span>Send all ready episodes once per day.</span>
+          <span>Send all completed episodes once per day.</span>
         </button>
         <button
           type="button"
@@ -796,10 +796,10 @@
           }}
         >
           <strong>Automatic sync</strong>
-          <span>Check every five minutes; long media also syncs when playback ends.</span>
+          <span>Check every five minutes; audiobook checkpoints wait for inactivity.</span>
         </button>
       </div>
-      <p class="hint">Episodes are ready at 80% watched with no more than 5 minutes remaining. In automatic mode, media over 2 hours updates one cumulative Tadoku log every 30 minutes and when playback ends. Durations round up to the next tenth of a minute.</p>
+      <p class="hint">Completed episodes are ready at 80% watched with no more than 5 minutes remaining. AudioBookShelf audiobooks over 2 hours also appear here with their current uncredited playtime, so you can sync them manually if automatic sync misses them. Automatic audiobook syncing still uses its inactivity window. Durations round up to the next tenth of a minute.</p>
     </section>
 
     <section class="section">
@@ -814,9 +814,9 @@
       </div>
 
       {#if loadingTadokuCandidates}
-        <p class="hint">Loading completed episodes…</p>
+        <p class="hint">Loading ready listening…</p>
       {:else if tadokuCandidates.length === 0}
-        <div class="tadoku-empty">No completed episodes are waiting to sync.</div>
+        <div class="tadoku-empty">No completed episodes or in-progress audiobooks are waiting to sync.</div>
       {:else}
         <div class="tadoku-candidate-list">
           {#each tadokuCandidates as candidate}
@@ -856,7 +856,11 @@
                   </strong>
                 {/if}
                 <span>{candidate.series_name} · {formatTadokuDuration(candidate.duration_seconds)}</span>
-                <small>Completed {formatTadokuDate(candidate.watched_at)}</small>
+                {#if candidate.is_in_progress}
+                  <small>Playtime so far · last heard {formatTadokuDate(candidate.watched_at)}</small>
+                {:else}
+                  <small>Completed {formatTadokuDate(candidate.watched_at)}</small>
+                {/if}
                 {#if candidate.last_error}<small class="error-text">Last attempt: {candidate.last_error}</small>{/if}
               </span>
               {#if editingTadokuId !== candidate.history_id}

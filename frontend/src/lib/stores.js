@@ -291,6 +291,7 @@ export function syncPositionFromSessionState(state) {
   }
 
   const nextAnchor = {
+    sessionId: state.active_session_id,
     itemId: np.history_id,
     serverKind: np.server_kind,
     positionMs: np.position_ms,
@@ -300,9 +301,17 @@ export function syncPositionFromSessionState(state) {
   };
 
   const projected = projectedPosition();
-  const itemChanged = !_playbackAnchor || _playbackAnchor.itemId !== nextAnchor.itemId;
+  // Two devices can play the same item with independent playback clocks.
+  const playbackChanged = !_playbackAnchor
+    || _playbackAnchor.sessionId !== nextAnchor.sessionId
+    || _playbackAnchor.itemId !== nextAnchor.itemId;
+  if (playbackChanged) {
+    _seekLockUntil = 0;
+    _playLockUntil = 0;
+  }
   const pauseChanged = !_playbackAnchor || _playbackAnchor.paused !== nextAnchor.paused;
   const serverObservationChanged = !_lastServerObservation
+    || _lastServerObservation.sessionId !== nextAnchor.sessionId
     || _lastServerObservation.itemId !== nextAnchor.itemId
     || _lastServerObservation.paused !== nextAnchor.paused
     || Math.abs(_lastServerObservation.positionMs - nextAnchor.positionMs) > 250;
@@ -310,6 +319,7 @@ export function syncPositionFromSessionState(state) {
     && (!_playbackAnchor || _playbackAnchor.positionMs !== nextAnchor.positionMs);
   const serverJumpedBackward = serverObservationChanged
     && _lastServerObservation
+    && _lastServerObservation.sessionId === nextAnchor.sessionId
     && _lastServerObservation.itemId === nextAnchor.itemId
     && nextAnchor.positionMs < _lastServerObservation.positionMs - 1500;
   const serverAhead = projected == null || nextAnchor.positionMs > projected + 750;
@@ -319,7 +329,7 @@ export function syncPositionFromSessionState(state) {
   // Keep a local playback clock running between coarse server updates and
   // only re-anchor when Plex reports a real state change.
   if (
-    itemChanged
+    playbackChanged
     || pauseChanged
     || authoritativeAbsPositionChanged
     || serverJumpedBackward
@@ -332,6 +342,7 @@ export function syncPositionFromSessionState(state) {
   }
 
   _lastServerObservation = {
+    sessionId: nextAnchor.sessionId,
     itemId: nextAnchor.itemId,
     positionMs: nextAnchor.positionMs,
     paused: nextAnchor.paused,
@@ -351,6 +362,8 @@ export function syncPositionFromSessionState(state) {
 export function forceResync() {
   _playbackAnchor = null;
   _lastServerObservation = null;
+  _seekLockUntil = 0;
+  _playLockUntil = 0;
 }
 
 export function requestTimelineRecenter() {
@@ -388,9 +401,11 @@ export function setOptimisticPosition(ms) {
   positionMs.set(pos);
   _seekLockUntil = Date.now() + SEEK_LOCK_MS;
 
-  const np = get(sessionState).now_playing;
+  const state = get(sessionState);
+  const np = state.now_playing;
   if (np) {
     _playbackAnchor = {
+      sessionId: state.active_session_id,
       itemId: np.history_id,
       serverKind: np.server_kind,
       positionMs: pos,
@@ -419,9 +434,11 @@ export function setOptimisticPlayState(paused) {
   });
   _playLockUntil = Date.now() + SEEK_LOCK_MS;
 
-  const np = get(sessionState).now_playing;
+  const state = get(sessionState);
+  const np = state.now_playing;
   if (np) {
     _playbackAnchor = {
+      sessionId: state.active_session_id,
       itemId: np.history_id,
       serverKind: np.server_kind,
       positionMs: get(positionMs),

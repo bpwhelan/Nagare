@@ -120,9 +120,16 @@ function handleMessage(msg) {
 
     case 'position':
       if (msg.state) {
+        const cur = get(sessionState);
+        if (
+          cur.active_session_id !== msg.state.active_session_id
+          || cur.now_playing?.history_id !== msg.state.now_playing?.history_id
+        ) {
+          // Commands and the projected clock belong to one device and item.
+          forceResync();
+        }
         // During a play-lock, preserve the optimistic is_paused value
         if (isPlayLocked() && msg.state.now_playing) {
-          const cur = get(sessionState);
           if (cur.now_playing) {
             msg.state.now_playing.is_paused = cur.now_playing.is_paused;
           }

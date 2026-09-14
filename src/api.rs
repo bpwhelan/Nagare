@@ -2056,15 +2056,18 @@ async fn clear_tadoku_authentication(
 }
 
 async fn get_tadoku_candidates(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    let language_code = state
-        .config
-        .read()
+    let (language_code, target_audio_language) = {
+        let config = state.config.read().await;
+        (
+            config.tadoku.language_code.trim().to_ascii_lowercase(),
+            config.target_language.clone(),
+        )
+    };
+    match state
+        .db
+        .list_tadoku_candidates(language_code, target_audio_language)
         .await
-        .tadoku
-        .language_code
-        .trim()
-        .to_ascii_lowercase();
-    match state.db.list_tadoku_candidates(language_code).await {
+    {
         Ok(candidates) => Json(serde_json::json!({"ok": true, "candidates": candidates})),
         Err(error) => Json(serde_json::json!({"ok": false, "error": error.to_string()})),
     }

@@ -18,6 +18,9 @@ const POSITION_SAVE_INTERVAL: Duration = Duration::from_secs(5);
 /// Paused sessions remain available briefly for manual selection/mining, but
 /// media servers can otherwise retain them for hours or even indefinitely.
 const PAUSED_SESSION_VISIBLE_AFTER: Duration = Duration::from_secs(5 * 60);
+/// AudioBookShelf keeps downloaded playback in its listening-history endpoint
+/// for fifteen minutes after the last sync, matching the server-side contract.
+const AUDIOBOOKSHELF_PAUSED_SESSION_VISIBLE_AFTER: Duration = Duration::from_secs(15 * 60);
 /// A server that continues to claim a session is playing without checking in
 /// is treated as abandoned. Servers without a reliable activity clock are
 /// still trusted to return only live sessions.
@@ -148,6 +151,11 @@ pub struct HistoryEntry {
     pub file_path: Option<String>,
     pub duration_ms: Option<i64>,
     pub subtitle_count: usize,
+    /// Audio language tags reported by the media server. Automatic Tadoku
+    /// exports use these to ensure the item matches the configured target
+    /// language; entries without a known matching stream stay manual-only.
+    #[serde(default)]
+    pub audio_languages: Vec<String>,
     pub last_position_ms: i64,
     /// Timestamp when we last saw this item playing
     pub last_seen: chrono::DateTime<chrono::Utc>,
@@ -181,18 +189,32 @@ fn is_ignored_episode(now_playing: &NowPlaying) -> bool {
     is_episode && now_playing.name.trim().eq_ignore_ascii_case("theme")
 }
 
-fn session_is_visible(session: &Session, now_ms: i64) -> bool {
+fn session_is_visible(kind: MediaServerKind, session: &Session, now_ms: i64) -> bool {
     let Some(last_activity_at_ms) = session.last_activity_at_ms else {
         return true;
     };
     let age_ms = now_ms.saturating_sub(last_activity_at_ms).max(0) as u64;
     let lifetime = if session.play_state.is_paused {
-        PAUSED_SESSION_VISIBLE_AFTER
+        if kind == MediaServerKind::Audiobookshelf {
+            AUDIOBOOKSHELF_PAUSED_SESSION_VISIBLE_AFTER
+        } else {
+            PAUSED_SESSION_VISIBLE_AFTER
+        }
     } else {
         PLAYING_SESSION_STALE_AFTER
     };
 
     age_ms <= lifetime.as_millis() as u64
+}
+
+/// Prefer the media server's activity timestamp when it has one. This keeps a
+/// paused AudioBookShelf row from looking newly active every time Nagare polls
+/// the unchanged row.
+fn session_playback_activity_at(session: &Session) -> chrono::DateTime<chrono::Utc> {
+    session
+        .last_activity_at_ms
+        .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
+        .unwrap_or_else(chrono::Utc::now)
 }
 
 fn compare_auto_session_priority(
@@ -560,7 +582,11 @@ impl SessionManager {
             .save_session_history(history, subtitle_history)
             .await
         {
-            warn!("Failed to persist session history to SQLite: {}", error);
+            // Back off after a failed write so a transient SQLite lock cannot
+            // turn the fast playback poll into a tight retry loop. The next
+            // poll after the normal interval will retry the latest position.
+            *last = Instant::now();
+            warn!("Failed to persist session history to SQLite: {error:#}");
             return;
         }
 
@@ -572,14 +598,13 @@ impl SessionManager {
         self.save_history(true).await;
     }
 
-    /// Queue a Tadoku export after the media server unloads the current item.
-    /// Eligibility is evaluated from the just-persisted final play position,
-    /// so completed episodes and final long-form progress sync immediately.
-    fn queue_automatic_tadoku_export(&self, finished_history_id: Option<String>) {
+    /// Queue a Tadoku eligibility check after the media server unloads the
+    /// current item. Long-form playback still waits for its inactivity window.
+    fn queue_automatic_tadoku_export(&self) {
         let config = self.config.clone();
         let db = self.db.clone();
         tokio::spawn(async move {
-            match crate::tadoku::export_if_automatic(config, db, finished_history_id).await {
+            match crate::tadoku::export_if_automatic(config, db).await {
                 Ok(Some(count)) => {
                     info!(
                         "Playback-ended Tadoku check completed ({} show logs)",
@@ -657,7 +682,7 @@ impl SessionManager {
                             .filter(|session| {
                                 !session.now_playing.as_ref().is_some_and(is_ignored_episode)
                             })
-                            .filter(|session| session_is_visible(session, now_ms))
+                            .filter(|session| session_is_visible(kind, session, now_ms))
                             .map(|session| ServerSession {
                                 kind,
                                 server: server.clone(),
@@ -727,7 +752,7 @@ impl SessionManager {
         }
     }
 
-    fn language_matches_target(language: Option<&str>, target_lang: &str) -> bool {
+    pub(crate) fn language_matches_target(language: Option<&str>, target_lang: &str) -> bool {
         let Some(language) = language else {
             return false;
         };
@@ -1435,8 +1460,9 @@ impl SessionManager {
                 .then_with(|| left.kind.cmp(&right.kind))
         });
 
-        // Build session summaries
-        let summaries: Vec<SessionSummary> = sessions
+        // Keep the device picker stable while automatic selection ranks the
+        // live sessions separately. Check-ins must not move clickable rows.
+        let mut summaries: Vec<SessionSummary> = sessions
             .iter()
             .filter(|s| s.session.now_playing.is_some())
             .map(|s| {
@@ -1453,6 +1479,13 @@ impl SessionManager {
                 }
             })
             .collect();
+        summaries.sort_by(|left, right| {
+            left.server_kind
+                .cmp(&right.server_kind)
+                .then_with(|| left.device_name.cmp(&right.device_name))
+                .then_with(|| left.client.cmp(&right.client))
+                .then_with(|| left.id.cmp(&right.id))
+        });
 
         // Determine active session
         let user_selected = self.selected_session_id.read().await.clone();
@@ -1464,9 +1497,12 @@ impl SessionManager {
                     .cloned()
             })
         } else {
-            // Sticky auto-select applies only to actual playback. A paused
-            // session must never block a newly playing session, while keeping
-            // the current live player avoids flicker between concurrent ones.
+            // Check-ins from another device must not steal the selection,
+            // including when both devices are paused on the same episode.
+            // A paused session still yields to actual playback elsewhere.
+            let has_playing_session = sessions
+                .iter()
+                .any(|s| s.session.now_playing.is_some() && !s.session.play_state.is_paused);
             let previous_active_id = self.state.read().await.active_session_id.clone();
             let sticky = previous_active_id.as_deref().and_then(|id| {
                 split_scoped_id(id).and_then(|(kind, raw_id)| {
@@ -1476,7 +1512,7 @@ impl SessionManager {
                             s.kind == kind
                                 && s.session.id == raw_id
                                 && s.session.now_playing.is_some()
-                                && !s.session.play_state.is_paused
+                                && (!s.session.play_state.is_paused || !has_playing_session)
                         })
                         .cloned()
                 })
@@ -1511,7 +1547,6 @@ impl SessionManager {
         let mut next_candidates = Vec::new();
         let mut next_override_candidate_id = None;
         let active_item_ended;
-        let finished_history_id;
 
         {
             let mut state = self.state.write().await;
@@ -1533,11 +1568,6 @@ impl SessionManager {
                     .unwrap_or_else(|| format!("mediasource_{}", np.item_id));
                 let item_changed = prev_history_id.as_deref() != Some(&history_id);
                 active_item_ended = item_changed && prev_history_id.is_some();
-                finished_history_id = if active_item_ended {
-                    prev_history_id
-                } else {
-                    None
-                };
                 let requested_override = if item_changed {
                     None
                 } else {
@@ -1622,10 +1652,6 @@ impl SessionManager {
                 }
             } else {
                 active_item_ended = state.now_playing.is_some();
-                finished_history_id = state
-                    .now_playing
-                    .as_ref()
-                    .map(|now_playing| now_playing.history_id.clone());
                 state.active_session_id = None;
                 state.now_playing = None;
             }
@@ -1654,10 +1680,36 @@ impl SessionManager {
             if active_item_ended {
                 debug!("Active playback ended; flushing session history to SQLite");
                 self.flush_history().await;
-                self.queue_automatic_tadoku_export(finished_history_id);
+                self.queue_automatic_tadoku_export();
             }
             return;
         }
+
+        // Persist the latest position before subtitle work can delay the poll or
+        // force a save that resets the position throttle.
+        {
+            let playback_activity_at = active_session
+                .as_ref()
+                .map(|active| session_playback_activity_at(&active.session))
+                .unwrap_or_else(chrono::Utc::now);
+            let state = self.state.read().await;
+            if let Some(ref np) = state.now_playing {
+                let mut hist = self.history.write().await;
+                if let Some(entry) = hist.get_mut(&np.history_id) {
+                    let position_changed = entry.last_position_ms != np.position_ms;
+                    entry.last_position_ms = np.position_ms;
+                    // A visible paused session is intentionally retained for
+                    // a few minutes. Do not let those unchanged polls restart
+                    // the long-form inactivity timer.
+                    if !np.is_paused || position_changed {
+                        entry.last_seen = playback_activity_at;
+                    }
+                }
+            }
+        }
+
+        // Throttled save for position updates (at most once every 5 s)
+        self.save_history(false).await;
 
         // Load subtitles outside the lock
         if let Some((item_changed, history_id, item_id, media_source_id, candidate, active)) =
@@ -1762,8 +1814,21 @@ impl SessionManager {
                     file_path,
                     duration_ms: dur,
                     subtitle_count: sub_count,
+                    audio_languages: active
+                        .session
+                        .now_playing
+                        .as_ref()
+                        .map(|now_playing| {
+                            now_playing
+                                .media_streams
+                                .iter()
+                                .filter(|stream| stream.stream_type == StreamType::Audio)
+                                .filter_map(|stream| stream.language.clone())
+                                .collect()
+                        })
+                        .unwrap_or_default(),
                     last_position_ms: pos,
-                    last_seen: chrono::Utc::now(),
+                    last_seen: session_playback_activity_at(&active.session),
                 };
                 self.history.write().await.insert(history_id.clone(), entry);
             }
@@ -1777,24 +1842,9 @@ impl SessionManager {
             self.save_history(true).await;
         }
 
-        // Update position in history for the active item
-        {
-            let state = self.state.read().await;
-            if let Some(ref np) = state.now_playing {
-                let mut hist = self.history.write().await;
-                if let Some(entry) = hist.get_mut(&np.history_id) {
-                    entry.last_position_ms = np.position_ms;
-                    entry.last_seen = chrono::Utc::now();
-                }
-            }
-        }
-
-        // Throttled save for position updates (at most once every 5 s)
-        self.save_history(false).await;
-
         if active_item_ended {
             debug!("Previous playback item unloaded; checking automatic Tadoku sync");
-            self.queue_automatic_tadoku_export(finished_history_id);
+            self.queue_automatic_tadoku_export();
         }
 
         // Broadcast final state (covers position-only polls where no subtitle
@@ -1854,8 +1904,11 @@ impl SessionManager {
         if let Some((history_id, position_ms)) = history_update {
             let mut history = self.history.write().await;
             if let Some(entry) = history.get_mut(&history_id) {
+                let position_changed = entry.last_position_ms != position_ms;
                 entry.last_position_ms = position_ms;
-                entry.last_seen = chrono::Utc::now();
+                if player_state == "playing" || position_changed {
+                    entry.last_seen = chrono::Utc::now();
+                }
             }
             drop(history);
             self.save_history(false).await;
@@ -2195,13 +2248,9 @@ pub async fn run_session_poller(manager: Arc<SessionManager>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        PAUSED_SESSION_VISIBLE_AFTER, PLAYING_SESSION_STALE_AFTER, SessionManager,
-        SubtitleCandidateSource, SubtitleSelectionMode, compare_auto_session_priority,
-        is_ignored_episode, session_is_visible,
-    };
+    use super::*;
     use crate::config::MediaServerKind;
-    use crate::media_server::{MediaStream, NowPlaying, PlayState, Session, StreamType};
+    use crate::media_server::{MediaStream, MediaUser, NowPlaying, PlayState, Session, StreamType};
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -2259,6 +2308,255 @@ mod tests {
         }
     }
 
+    struct TestServer(RwLock<Vec<Session>>);
+
+    #[async_trait::async_trait]
+    impl MediaServer for TestServer {
+        fn kind(&self) -> MediaServerKind {
+            MediaServerKind::Jellyfin
+        }
+        async fn get_sessions(&self) -> anyhow::Result<Vec<Session>> {
+            Ok(self.0.read().await.clone())
+        }
+        async fn get_users(&self) -> anyhow::Result<Vec<MediaUser>> {
+            Ok(vec![])
+        }
+        async fn get_item_info(&self, _: &str, _: Option<&str>) -> anyhow::Result<ItemInfo> {
+            anyhow::bail!("No item details")
+        }
+        async fn get_subtitles(
+            &self,
+            _: &str,
+            _: &str,
+            _: u32,
+            _: SubtitleFormat,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("Subtitle unavailable; retry on the next poll")
+        }
+        fn get_stream_url(&self, _: &str, _: &str) -> String {
+            String::new()
+        }
+        async fn seek_session(&self, _: &str, _: i64) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn pause_session(&self, _: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn unpause_session(&self, _: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn playback_position_is_persisted_during_subtitle_reload() {
+        let directory =
+            std::env::temp_dir().join(format!("nagare-position-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let db = Arc::new(
+            AppDatabase::new(directory.join("test.db"), None)
+                .await
+                .unwrap(),
+        );
+        let mut session = playback_session("player", false, "jpn", None);
+        session
+            .now_playing
+            .as_mut()
+            .unwrap()
+            .media_streams
+            .push(MediaStream {
+                index: 1,
+                stream_type: StreamType::Subtitle,
+                codec: Some("srt".into()),
+                language: Some("jpn".into()),
+                display_title: None,
+                is_default: true,
+                is_external: true,
+                is_text_subtitle_stream: true,
+                title: None,
+            });
+        let server = Arc::new(TestServer(RwLock::new(vec![session])));
+        let mut servers = ServerMap::new();
+        servers.insert(MediaServerKind::Jellyfin, server.clone());
+        let (tx, _rx) = watch::channel(SessionState {
+            sessions: vec![],
+            active_session_id: None,
+            now_playing: None,
+        });
+        let manager = SessionManager::new(
+            Arc::new(RwLock::new(servers)),
+            Arc::new(RwLock::new(Config::default())),
+            tx,
+            directory.clone(),
+            db.clone(),
+        )
+        .await
+        .unwrap();
+
+        manager.poll_once().await;
+        for position_ms in [12_000, 24_000, 8_000] {
+            server.0.write().await[0].play_state.position_ticks = Some(position_ms * 10_000);
+            // Even within the throttle window, a forced subtitle save must
+            // contain the current position, including backward seeks.
+            manager.poll_once().await;
+            let (history, _) = db
+                .load_session_history(
+                    directory.join("history.json"),
+                    directory.join("subtitle_history.json"),
+                )
+                .await
+                .unwrap();
+            assert_eq!(history["jellyfin|item-1"].last_position_ms, position_ms);
+            assert!(manager.state.read().await.now_playing.is_some());
+        }
+        drop(manager);
+        drop(db);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrent_devices_keep_selection_position_and_list_order_stable() {
+        let directory =
+            std::env::temp_dir().join(format!("nagare-devices-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let db = Arc::new(
+            AppDatabase::new(directory.join("test.db"), None)
+                .await
+                .unwrap(),
+        );
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let mut tv = playback_session("tv", false, "jpn", Some(now_ms));
+        let mut browser = playback_session("browser", false, "jpn", Some(now_ms - 1));
+        // Both devices use the same provider item ID, but have different clocks.
+        tv.play_state.position_ticks = Some(600_000 * 10_000);
+        browser.play_state.position_ticks = Some(420_000 * 10_000);
+        let server = Arc::new(TestServer(RwLock::new(vec![tv.clone(), browser.clone()])));
+        let mut servers = ServerMap::new();
+        servers.insert(MediaServerKind::Jellyfin, server.clone());
+        let (tx, _rx) = watch::channel(SessionState {
+            sessions: vec![],
+            active_session_id: None,
+            now_playing: None,
+        });
+        let manager = SessionManager::new(
+            Arc::new(RwLock::new(servers)),
+            Arc::new(RwLock::new(Config::default())),
+            tx,
+            directory.clone(),
+            db.clone(),
+        )
+        .await
+        .unwrap();
+        manager.poll_once().await;
+        let original_order: Vec<_> = manager
+            .state
+            .read()
+            .await
+            .sessions
+            .iter()
+            .map(|session| session.id.clone())
+            .collect();
+
+        // Alternating check-ins and response order must not move either the
+        // selected device or the buttons under the user's pointer, even paused.
+        for paused in [false, true] {
+            tv.play_state.is_paused = paused;
+            browser.play_state.is_paused = paused;
+            for poll in 0..6 {
+                tv.last_activity_at_ms = Some(now_ms + poll * 2);
+                browser.last_activity_at_ms = Some(now_ms + poll * 2 + 1);
+                if poll % 2 == 0 {
+                    std::mem::swap(
+                        &mut tv.last_activity_at_ms,
+                        &mut browser.last_activity_at_ms,
+                    );
+                }
+                let mut sessions = vec![tv.clone(), browser.clone()];
+                if poll % 2 == 0 {
+                    sessions.reverse();
+                }
+                *server.0.write().await = sessions;
+                manager.poll_once().await;
+                let state = manager.state.read().await;
+                assert_eq!(state.active_session_id.as_deref(), Some("jellyfin|tv"));
+                assert_eq!(state.now_playing.as_ref().unwrap().position_ms, 600_000);
+                assert_eq!(
+                    state
+                        .sessions
+                        .iter()
+                        .map(|session| session.id.clone())
+                        .collect::<Vec<_>>(),
+                    original_order
+                );
+                assert_eq!(
+                    manager.history.read().await["jellyfin|item-1"].last_position_ms,
+                    600_000
+                );
+            }
+        }
+
+        // A playing session still takes over from a paused automatic selection.
+        browser.play_state.is_paused = false;
+        *server.0.write().await = vec![tv.clone(), browser.clone()];
+        manager.poll_once().await;
+        assert_eq!(
+            manager.state.read().await.active_session_id.as_deref(),
+            Some("jellyfin|browser")
+        );
+
+        // An explicit selection stays on that device, including while paused.
+        manager.select_session(Some("jellyfin|tv".into())).await;
+        manager.poll_once().await;
+        assert_eq!(
+            manager.state.read().await.active_session_id.as_deref(),
+            Some("jellyfin|tv")
+        );
+        assert_eq!(
+            manager
+                .state
+                .read()
+                .await
+                .now_playing
+                .as_ref()
+                .unwrap()
+                .position_ms,
+            600_000
+        );
+        manager
+            .select_session(Some("jellyfin|browser".into()))
+            .await;
+        manager.poll_once().await;
+        assert_eq!(
+            manager
+                .state
+                .read()
+                .await
+                .now_playing
+                .as_ref()
+                .unwrap()
+                .position_ms,
+            420_000
+        );
+
+        // Automatic selection releases a device that unloads the episode.
+        manager.select_session(None).await;
+        browser.now_playing = None;
+        *server.0.write().await = vec![browser, tv];
+        manager.poll_once().await;
+        assert_eq!(
+            manager.state.read().await.active_session_id.as_deref(),
+            Some("jellyfin|tv")
+        );
+
+        // Expired sessions must not be kept alive by the sticky selection.
+        server.0.write().await[1].last_activity_at_ms =
+            Some(now_ms - PAUSED_SESSION_VISIBLE_AFTER.as_millis() as i64 - 1);
+        manager.poll_once().await;
+        assert!(manager.state.read().await.active_session_id.is_none());
+        drop(manager);
+        drop(db);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
     #[test]
     fn auto_selection_prioritizes_playing_over_paused_target_session() {
         let mut sessions = [
@@ -2293,6 +2591,7 @@ mod tests {
         let playing_lifetime_ms = PLAYING_SESSION_STALE_AFTER.as_millis() as i64;
 
         assert!(session_is_visible(
+            MediaServerKind::Jellyfin,
             &playback_session(
                 "recent-pause",
                 true,
@@ -2302,6 +2601,7 @@ mod tests {
             now_ms
         ));
         assert!(!session_is_visible(
+            MediaServerKind::Jellyfin,
             &playback_session(
                 "old-pause",
                 true,
@@ -2311,6 +2611,7 @@ mod tests {
             now_ms
         ));
         assert!(!session_is_visible(
+            MediaServerKind::Jellyfin,
             &playback_session(
                 "stalled-player",
                 false,
@@ -2320,8 +2621,20 @@ mod tests {
             now_ms
         ));
         assert!(session_is_visible(
+            MediaServerKind::Jellyfin,
             &playback_session("no-clock", true, "jpn", None),
             now_ms
+        ));
+
+        assert!(session_is_visible(
+            MediaServerKind::Audiobookshelf,
+            &playback_session(
+                "audiobookshelf-local",
+                true,
+                "jpn",
+                Some(now_ms - AUDIOBOOKSHELF_PAUSED_SESSION_VISIBLE_AFTER.as_millis() as i64),
+            ),
+            now_ms,
         ));
     }
 

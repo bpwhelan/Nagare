@@ -12,6 +12,8 @@ use tracing::{error, info, warn};
 
 const TADOKU_AUTH_BASE_URL: &str = "https://account.tadoku.app/kratos";
 const AUTOMATIC_EXPORT_INTERVAL: Duration = Duration::from_secs(5 * 60);
+const LISTENING_MINUTE_UNIT_KEY: &str = "listening_minute";
+const LISTENING_DENSE_MINUTES_UNIT_KEY: &str = "listening_dense_minutes";
 static EXPORT_LOCK: Mutex<()> = Mutex::const_new(());
 
 #[derive(Debug, Serialize)]
@@ -20,6 +22,7 @@ pub struct TadokuConnectionInfo {
     pub display_name: Option<String>,
     pub listening_activity_id: i32,
     pub listening_minutes_unit_id: String,
+    pub listening_dense_minutes_unit_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -60,9 +63,35 @@ struct Language {
 #[derive(Debug, Deserialize)]
 struct Unit {
     id: String,
+    #[serde(default, alias = "key")]
+    unit_key: Option<String>,
     log_activity_id: i32,
     name: String,
     language_code: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct TadokuUnit {
+    id: String,
+    key: Option<String>,
+    name: String,
+}
+
+impl TadokuUnit {
+    fn from_api_unit(unit: &Unit) -> Self {
+        Self {
+            id: unit.id.clone(),
+            key: unit.unit_key.clone(),
+            name: unit.name.clone(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct TadokuConnection {
+    info: TadokuConnectionInfo,
+    listening_minutes_unit: TadokuUnit,
+    listening_dense_minutes_unit: TadokuUnit,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -100,6 +129,10 @@ struct TadokuLog {
     amount: Option<f64>,
     unit_id: Option<String>,
     #[serde(default)]
+    unit_key: Option<String>,
+    #[serde(default)]
+    unit_name: Option<String>,
+    #[serde(default)]
     tags: Vec<String>,
 }
 
@@ -110,6 +143,8 @@ struct CreateLogRequest<'a> {
     activity_id: i32,
     amount: f64,
     unit_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unit_key: Option<&'a str>,
     tags: Vec<String>,
     description: &'a str,
 }
@@ -118,6 +153,8 @@ struct CreateLogRequest<'a> {
 struct UpdateLogRequest<'a> {
     amount: f64,
     unit_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unit_key: Option<&'a str>,
     tags: Vec<String>,
     description: &'a str,
 }
@@ -358,10 +395,7 @@ impl TadokuClient {
         self.login().await
     }
 
-    async fn connection_info(
-        &mut self,
-        language_code: &str,
-    ) -> anyhow::Result<TadokuConnectionInfo> {
+    async fn connection_info(&mut self, language_code: &str) -> anyhow::Result<TadokuConnection> {
         let session_url = self.config.session_url.clone();
         let session: SessionResponse = response_json(
             self.send_authenticated(|http| http.get(&session_url))
@@ -390,31 +424,33 @@ impl TadokuClient {
             .iter()
             .find(|activity| activity.name.eq_ignore_ascii_case("listening"))
             .context("Tadoku did not return a Listening activity")?;
-        let minutes_unit = options
-            .units
-            .iter()
-            .filter(|unit| {
-                unit.log_activity_id == activity.id && unit.name.eq_ignore_ascii_case("minute")
-            })
-            .find(|unit| {
-                unit.language_code
-                    .as_deref()
-                    .is_some_and(|code| code.eq_ignore_ascii_case(language_code))
-            })
-            .or_else(|| {
-                options.units.iter().find(|unit| {
-                    unit.log_activity_id == activity.id
-                        && unit.name.eq_ignore_ascii_case("minute")
-                        && unit.language_code.is_none()
-                })
-            })
-            .context("Tadoku did not return a Minute unit for Listening")?;
+        let minutes_unit = find_listening_unit(
+            &options.units,
+            activity.id,
+            language_code,
+            LISTENING_MINUTE_UNIT_KEY,
+            &["Minute"],
+        )
+        .context("Tadoku did not return a Minute unit for Listening")?;
+        let dense_minutes_unit = find_listening_unit(
+            &options.units,
+            activity.id,
+            language_code,
+            LISTENING_DENSE_MINUTES_UNIT_KEY,
+            &["Dense minute", "Minute (high density)"],
+        )
+        .context("Tadoku did not return a Dense minute unit for Listening")?;
 
-        Ok(TadokuConnectionInfo {
-            user_id: session.identity.id,
-            display_name: session.identity.traits.display_name,
-            listening_activity_id: activity.id,
-            listening_minutes_unit_id: minutes_unit.id.clone(),
+        Ok(TadokuConnection {
+            info: TadokuConnectionInfo {
+                user_id: session.identity.id,
+                display_name: session.identity.traits.display_name,
+                listening_activity_id: activity.id,
+                listening_minutes_unit_id: minutes_unit.id.clone(),
+                listening_dense_minutes_unit_id: dense_minutes_unit.id.clone(),
+            },
+            listening_minutes_unit: TadokuUnit::from_api_unit(minutes_unit),
+            listening_dense_minutes_unit: TadokuUnit::from_api_unit(dense_minutes_unit),
         })
     }
 
@@ -452,8 +488,8 @@ impl TadokuClient {
                     .tags
                     .iter()
                     .any(|tag| tag.eq_ignore_ascii_case("nagare"));
-                if from_nagare && let Some(description) = log.description.clone() {
-                    result.insert(description, log);
+                if from_nagare {
+                    result.insert(log.id.clone(), log);
                 }
             }
             page += 1;
@@ -468,7 +504,7 @@ impl TadokuClient {
         &mut self,
         batch: &TadokuExportBatch,
         listening_activity_id: i32,
-        listening_minutes_unit_id: &str,
+        listening_unit: &TadokuUnit,
         registrations: &[Registration],
     ) -> anyhow::Result<String> {
         let registration_ids =
@@ -478,7 +514,8 @@ impl TadokuClient {
             language_code: &batch.language_code,
             activity_id: listening_activity_id,
             amount: tadoku_minutes(batch.duration_seconds),
-            unit_id: listening_minutes_unit_id,
+            unit_id: &listening_unit.id,
+            unit_key: listening_unit.key.as_deref(),
             tags: tadoku_tags(&self.config, batch),
             description: &batch.description,
         };
@@ -489,7 +526,7 @@ impl TadokuClient {
             "Tadoku log creation",
         )
         .await?;
-        self.ensure_log_minutes(created, batch, listening_minutes_unit_id)
+        self.ensure_log_minutes(created, batch, listening_unit)
             .await
     }
 
@@ -497,14 +534,14 @@ impl TadokuClient {
         &mut self,
         log: TadokuLog,
         batch: &TadokuExportBatch,
-        listening_minutes_unit_id: &str,
+        listening_unit: &TadokuUnit,
     ) -> anyhow::Result<String> {
         let minutes = tadoku_minutes(batch.duration_seconds);
         let desired_tags = tadoku_tags(&self.config, batch);
         let amount_matches = log
             .amount
             .is_some_and(|amount| (amount - minutes).abs() < 0.001);
-        let unit_matches = log.unit_id.as_deref() == Some(listening_minutes_unit_id);
+        let unit_matches = tadoku_log_unit_matches(&log, listening_unit);
         let description_matches = log.description.as_deref() == Some(batch.description.as_str());
         let tags_match = desired_tags.iter().all(|desired| {
             log.tags
@@ -516,7 +553,7 @@ impl TadokuClient {
         }
 
         warn!(
-            "Tadoku log {} is missing the expected title, minutes, unit, or tags; updating it",
+            "Tadoku log {} is missing the expected title, amount, unit, or tags; updating it",
             log.id
         );
         let mut tags = log.tags.clone();
@@ -530,7 +567,8 @@ impl TadokuClient {
         }
         let payload = UpdateLogRequest {
             amount: minutes,
-            unit_id: listening_minutes_unit_id,
+            unit_id: &listening_unit.id,
+            unit_key: listening_unit.key.as_deref(),
             tags,
             description: &batch.description,
         };
@@ -551,7 +589,7 @@ impl TadokuClient {
                 .any(|existing| existing.eq_ignore_ascii_case(desired))
         });
         if !updated_amount_matches
-            || updated.unit_id.as_deref() != Some(listening_minutes_unit_id)
+            || !tadoku_log_unit_matches(&updated, listening_unit)
             || updated.description.as_deref() != Some(batch.description.as_str())
             || !updated_tags_match
         {
@@ -562,6 +600,82 @@ impl TadokuClient {
         }
         Ok(updated.id)
     }
+}
+
+fn tadoku_log_unit_matches(log: &TadokuLog, expected: &TadokuUnit) -> bool {
+    let id_matches = log
+        .unit_id
+        .as_deref()
+        .is_some_and(|id| id.eq_ignore_ascii_case(&expected.id));
+    let key_matches = expected.key.as_deref().is_some_and(|key| {
+        log.unit_key
+            .as_deref()
+            .is_some_and(|actual| actual.eq_ignore_ascii_case(key))
+    });
+    let name_matches = log
+        .unit_name
+        .as_deref()
+        .is_some_and(|name| name.trim().eq_ignore_ascii_case(expected.name.trim()));
+    id_matches || key_matches || name_matches
+}
+
+fn find_listening_unit<'a>(
+    units: &'a [Unit],
+    activity_id: i32,
+    language_code: &str,
+    unit_key: &str,
+    fallback_names: &[&str],
+) -> Option<&'a Unit> {
+    units
+        .iter()
+        .filter(|unit| unit.log_activity_id == activity_id)
+        .filter(|unit| {
+            unit.unit_key
+                .as_deref()
+                .is_some_and(|key| key.eq_ignore_ascii_case(unit_key))
+        })
+        .find(|unit| {
+            unit.language_code
+                .as_deref()
+                .is_some_and(|code| code.eq_ignore_ascii_case(language_code))
+        })
+        .or_else(|| {
+            units
+                .iter()
+                .filter(|unit| unit.log_activity_id == activity_id)
+                .filter(|unit| {
+                    unit.unit_key
+                        .as_deref()
+                        .is_some_and(|key| key.eq_ignore_ascii_case(unit_key))
+                })
+                .find(|unit| unit.language_code.is_none())
+        })
+        .or_else(|| {
+            units
+                .iter()
+                .filter(|unit| unit.log_activity_id == activity_id)
+                .filter(|unit| {
+                    fallback_names
+                        .iter()
+                        .any(|name| unit.name.eq_ignore_ascii_case(name))
+                })
+                .find(|unit| {
+                    unit.language_code
+                        .as_deref()
+                        .is_some_and(|code| code.eq_ignore_ascii_case(language_code))
+                })
+        })
+        .or_else(|| {
+            units
+                .iter()
+                .filter(|unit| unit.log_activity_id == activity_id)
+                .filter(|unit| {
+                    fallback_names
+                        .iter()
+                        .any(|name| unit.name.eq_ignore_ascii_case(name))
+                })
+                .find(|unit| unit.language_code.is_none())
+        })
 }
 
 fn tadoku_tags(config: &TadokuConfig, batch: &TadokuExportBatch) -> Vec<String> {
@@ -674,7 +788,7 @@ pub async fn test_connection(
     let tadoku_config = config.read().await.tadoku.clone();
     let language_code = tadoku_config.language_code.trim().to_ascii_lowercase();
     let mut client = TadokuClient::new(tadoku_config, Some(persistence(config, db)), true)?;
-    client.connection_info(&language_code).await
+    Ok(client.connection_info(&language_code).await?.info)
 }
 
 pub async fn refresh_authentication(
@@ -690,7 +804,7 @@ pub async fn export_once(
     config: Arc<RwLock<Config>>,
     db: Arc<AppDatabase>,
 ) -> anyhow::Result<usize> {
-    export(config, db, None, false, None).await
+    export(config, db, None, false).await
 }
 
 pub async fn export_selected(
@@ -701,7 +815,7 @@ pub async fn export_selected(
     if history_ids.is_empty() {
         bail!("Select at least one episode to sync");
     }
-    export(config, db, Some(history_ids), false, None).await
+    export(config, db, Some(history_ids), false).await
 }
 
 async fn export(
@@ -709,13 +823,15 @@ async fn export(
     db: Arc<AppDatabase>,
     selected_history_ids: Option<Vec<String>>,
     automatic: bool,
-    finished_history_id: Option<String>,
 ) -> anyhow::Result<usize> {
     // A five-minute check, an episode-finished event, and a manual request can
     // arrive together. Serialize them so one completed episode is never
     // prepared for two concurrent Tadoku requests.
     let _export_guard = EXPORT_LOCK.lock().await;
-    let tadoku_config = config.read().await.tadoku.clone();
+    let (tadoku_config, target_audio_language) = {
+        let config = config.read().await;
+        (config.tadoku.clone(), config.target_language.clone())
+    };
     let language_code = tadoku_config.language_code.trim().to_ascii_lowercase();
     let mut client = TadokuClient::new(tadoku_config, Some(persistence(config, db.clone())), true)?;
     let connection = client.connection_info(&language_code).await?;
@@ -723,11 +839,16 @@ async fn export(
     let eastern_date = eastern_time(Utc::now()).date_naive().to_string();
     let batches = match selected_history_ids {
         Some(history_ids) => {
-            db.prepare_selected_tadoku_batches(eastern_date, language_code, history_ids)
-                .await?
+            db.prepare_selected_tadoku_batches(
+                eastern_date,
+                language_code,
+                target_audio_language.clone(),
+                history_ids,
+            )
+            .await?
         }
         None if automatic => {
-            db.prepare_automatic_tadoku_batches(eastern_date, language_code, finished_history_id)
+            db.prepare_automatic_tadoku_batches(eastern_date, language_code, target_audio_language)
                 .await?
         }
         None => {
@@ -740,29 +861,44 @@ async fn export(
         return Ok(0);
     }
 
-    let existing = client.existing_nagare_logs(&connection.user_id).await?;
+    let existing = client
+        .existing_nagare_logs(&connection.info.user_id)
+        .await?;
     let mut completed = 0usize;
     let mut failures = Vec::new();
     for batch in batches {
+        let listening_unit = if batch.is_longform_checkpoint {
+            &connection.listening_dense_minutes_unit
+        } else {
+            &connection.listening_minutes_unit
+        };
         let existing_log = batch
             .tadoku_log_id
             .as_deref()
-            .and_then(|log_id| existing.values().find(|log| log.id == log_id))
-            .or_else(|| existing.get(&batch.description));
+            .and_then(|log_id| existing.get(log_id))
+            .or_else(|| {
+                if batch.is_longform_checkpoint {
+                    None
+                } else {
+                    existing
+                        .values()
+                        .find(|log| log.description.as_deref() == Some(&batch.description))
+                }
+            });
         let result = if let Some(log) = existing_log {
             info!(
                 "Tadoku batch {} already exists remotely as {}; verifying it locally",
                 batch.batch_id, log.id
             );
             client
-                .ensure_log_minutes(log.clone(), &batch, &connection.listening_minutes_unit_id)
+                .ensure_log_minutes(log.clone(), &batch, listening_unit)
                 .await
         } else {
             client
                 .create_log(
                     &batch,
-                    connection.listening_activity_id,
-                    &connection.listening_minutes_unit_id,
+                    connection.info.listening_activity_id,
+                    listening_unit,
                     &registrations,
                 )
                 .await
@@ -804,19 +940,16 @@ async fn export(
 
 /// Export all eligible episodes only when the near-real-time automatic mode is
 /// currently selected. The setting is checked at execution time so a queued
-/// episode-finished task cannot run after the user switches back to daily sync.
+/// playback-ended check cannot run after the user switches back to daily sync.
 pub async fn export_if_automatic(
     config: Arc<RwLock<Config>>,
     db: Arc<AppDatabase>,
-    finished_history_id: Option<String>,
 ) -> anyhow::Result<Option<usize>> {
     if !config.read().await.tadoku.automatic_sync_enabled() {
         return Ok(None);
     }
 
-    export(config, db, None, true, finished_history_id)
-        .await
-        .map(Some)
+    export(config, db, None, true).await.map(Some)
 }
 
 pub async fn run_exporter(config: Arc<RwLock<Config>>, db: Arc<AppDatabase>) {
@@ -829,7 +962,7 @@ pub async fn run_exporter(config: Arc<RwLock<Config>>, db: Arc<AppDatabase>) {
                 .is_none_or(|last_check| last_check.elapsed() >= AUTOMATIC_EXPORT_INTERVAL);
             if automatic_check_due {
                 last_automatic_check = Some(Instant::now());
-                match export_if_automatic(config.clone(), db.clone(), None).await {
+                match export_if_automatic(config.clone(), db.clone()).await {
                     Ok(Some(count)) => {
                         info!("Automatic Tadoku check completed ({} show logs)", count)
                     }
@@ -908,7 +1041,8 @@ fn nth_weekday(year: i32, month: u32, weekday: Weekday, nth: u32) -> NaiveDate {
 mod tests {
     use super::{
         Activity, CreateLogRequest, Language, Registration, RegistrationContest, TadokuClient,
-        eastern_time, eligible_registration_ids, extract_cookie_value, tadoku_minutes, tadoku_tags,
+        TadokuLog, TadokuUnit, eastern_time, eligible_registration_ids, extract_cookie_value,
+        tadoku_log_unit_matches, tadoku_minutes, tadoku_tags,
     };
     use crate::config::TadokuConfig;
     use crate::mining::TadokuExportBatch;
@@ -1020,8 +1154,11 @@ mod tests {
             "activities": [{"id": 2, "name": "Listening"}],
             "languages": [{"code": "jpn"}],
             "units": [{
-                "id": "minutes", "log_activity_id": 2,
-                "name": "Minute", "language_code": "jpn"
+                "id": "minutes", "unit_key": "listening_minute",
+                "log_activity_id": 2, "name": "Minute", "language_code": "jpn"
+            }, {
+                "id": "dense-minutes", "unit_key": "listening_dense_minutes",
+                "log_activity_id": 2, "name": "Dense minute", "language_code": null
             }]
         }))
         .into_response()
@@ -1084,6 +1221,7 @@ mod tests {
         let batch = TadokuExportBatch {
             batch_id: "batch".to_string(),
             tadoku_log_id: None,
+            is_longform_checkpoint: false,
             series_name: "Frieren".to_string(),
             description: "Frieren S01E01".to_string(),
             duration_seconds: 1_400,
@@ -1110,7 +1248,16 @@ mod tests {
             TadokuClient::new_with_auth_url(mock_config(&state), None, false, &state.base_url)
                 .unwrap();
         let connection = client.connection_info("jpn").await.unwrap();
-        assert_eq!(connection.user_id, "user-id");
+        assert_eq!(connection.info.user_id, "user-id");
+        assert_eq!(connection.info.listening_minutes_unit_id, "minutes");
+        assert_eq!(
+            connection.info.listening_dense_minutes_unit_id,
+            "dense-minutes"
+        );
+        assert_eq!(
+            connection.listening_dense_minutes_unit.key.as_deref(),
+            Some("listening_dense_minutes")
+        );
         assert_eq!(state.login_count.load(Ordering::SeqCst), 1);
         let forms = state.login_forms.lock().unwrap();
         let form = forms.first().unwrap();
@@ -1211,14 +1358,35 @@ mod tests {
             activity_id: 2,
             amount: tadoku_minutes(1_415),
             unit_id: "minute-unit",
+            unit_key: Some("listening_minute"),
             tags: vec!["nagare".to_string()],
             description: "NARUTO 疾風伝 S10E10-13",
         };
         let json = serde_json::to_value(payload).unwrap();
         assert_eq!(json["amount"], 23.6);
         assert_eq!(json["unit_id"], "minute-unit");
+        assert_eq!(json["unit_key"], "listening_minute");
         assert!(json.get("duration_seconds").is_none());
         assert_eq!(json["description"], "NARUTO 疾風伝 S10E10-13");
+    }
+
+    #[test]
+    fn accepts_current_tadoku_unit_name_when_legacy_log_has_no_unit_key() {
+        let expected = TadokuUnit {
+            id: "dense-unit".to_string(),
+            key: Some("listening_dense_minutes".to_string()),
+            name: "Dense minute".to_string(),
+        };
+        let log = TadokuLog {
+            id: "log".to_string(),
+            description: None,
+            amount: None,
+            unit_id: Some("00000000-0000-0000-0000-000000000000".to_string()),
+            unit_key: None,
+            unit_name: Some("Dense minute".to_string()),
+            tags: Vec::new(),
+        };
+        assert!(tadoku_log_unit_matches(&log, &expected));
     }
 
     #[test]
