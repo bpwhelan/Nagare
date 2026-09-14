@@ -17,7 +17,7 @@ COPY src/ src/
 COPY --from=frontend-build /app/frontend/dist ./frontend/dist
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/app/target \
-    cargo build --release && cp target/release/nagare /app/nagare
+    cargo build --locked --release && cp target/release/nagare /app/nagare
 
 # ── Stage 3: Runtime ────────────────────────────────────────
 FROM alpine:3.21

@@ -104,8 +104,31 @@ jobs:
             echo "should_release=true" >> "$GITHUB_OUTPUT"
           fi
 
-  build:
+  validate:
     needs: prepare
+    if: needs.prepare.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Test and build frontend
+        working-directory: frontend
+        run: |
+          npm ci
+          npm test
+          npm run build
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Check formatting and test backend
+        run: |
+          cargo fmt --all -- --check
+          cargo test --locked --all-targets
+
+  build:
+    needs: [prepare, validate]
     if: needs.prepare.outputs.should_release == 'true'
     strategy:
       matrix:
@@ -162,7 +185,7 @@ jobs:
           echo "CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++" >> $GITHUB_ENV
 
       - name: Build release binary
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --locked --release --target ${{ matrix.target }}
 
       - name: Package artifact (Unix)
         if: runner.os != 'Windows'
@@ -189,7 +212,7 @@ jobs:
             ${{ matrix.artifact }}.zip
 
   docker:
-    needs: prepare
+    needs: [prepare, validate]
     if: needs.prepare.outputs.should_release == 'true'
     runs-on: ubuntu-latest
     steps:
@@ -237,13 +260,25 @@ jobs:
           path: artifacts
           pattern: "!*.dockerbuild"
 
+      - name: Resolve release notes
+        id: notes
+        env:
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          version="${RELEASE_TAG#v}"
+          notes=".github/release-notes/$version.md"
+          if [ -f "$notes" ]; then
+            echo "path=$notes" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.prepare.outputs.tag }}
           target_commitish: ${{ github.sha }}
           name: Nagare ${{ needs.prepare.outputs.tag }}
-          generate_release_notes: true
+          body_path: ${{ steps.notes.outputs.path }}
+          generate_release_notes: ${{ steps.notes.outputs.path == '' }}
           files: |
             artifacts/**/*.tar.gz
             artifacts/**/*.zip
