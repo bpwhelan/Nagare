@@ -10,7 +10,7 @@ use crate::mining::{
 };
 use crate::session::{
     HistoryEntry, SessionManager, SessionState, SubtitleCandidate, SubtitleSelectionMode,
-    scoped_history_id, split_scoped_id,
+    scoped_history_id,
 };
 use crate::subtitle::{SubtitleTrack, find_all_matching_lines, find_matching_line};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -2723,8 +2723,8 @@ async fn seek_to_line(
         }));
     }
 
-    let (_, session_id) = match split_scoped_id(&scoped_session_id) {
-        Some(parts) => parts,
+    let session_id = match session_state.active_remote_session_id() {
+        Some(id) => id,
         None => {
             return Json(serde_json::json!({"ok": false, "error": "Malformed session identifier"}));
         }
@@ -2821,8 +2821,8 @@ async fn play_pause(
         }));
     }
 
-    let (_, session_id) = match split_scoped_id(&scoped_session_id) {
-        Some(parts) => parts,
+    let session_id = match session_state.active_remote_session_id() {
+        Some(id) => id,
         None => {
             return Json(serde_json::json!({"ok": false, "error": "Malformed session identifier"}));
         }

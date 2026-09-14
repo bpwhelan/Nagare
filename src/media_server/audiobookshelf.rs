@@ -622,6 +622,7 @@ impl AudiobookshelfClient {
         Some((
             Session {
                 id,
+                playback_session_id: None,
                 client: value["mediaPlayer"]
                     .as_str()
                     .unwrap_or("AudioBookShelf")

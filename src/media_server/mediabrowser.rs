@@ -164,6 +164,7 @@ impl MediaBrowserClient {
 
         Some(Session {
             id,
+            playback_session_id: None,
             client,
             device_name,
             user_name,

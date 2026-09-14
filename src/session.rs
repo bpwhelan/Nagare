@@ -25,6 +25,9 @@ const AUDIOBOOKSHELF_PAUSED_SESSION_VISIBLE_AFTER: Duration = Duration::from_sec
 /// is treated as abandoned. Servers without a reliable activity clock are
 /// still trusted to return only live sessions.
 const PLAYING_SESSION_STALE_AFTER: Duration = Duration::from_secs(2 * 60);
+/// Browser tabs can overwrite one provider session row on each check-in.
+/// Keep their individual items available across several ten-second check-ins.
+const SHARED_SESSION_RETENTION: Duration = Duration::from_secs(30);
 
 /// Represents the current state of the monitored session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -34,9 +37,22 @@ pub struct SessionState {
     pub now_playing: Option<NowPlayingState>,
 }
 
+impl SessionState {
+    pub fn active_remote_session_id(&self) -> Option<&str> {
+        let active_id = self.active_session_id.as_deref()?;
+        self.sessions
+            .iter()
+            .find(|session| session.id == active_id)
+            .map(|session| session.remote_session_id.as_str())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionSummary {
     pub id: String,
+    /// Provider ID for commands; the public ID identifies an individual item.
+    #[serde(skip)]
+    pub remote_session_id: String,
     pub server_kind: MediaServerKind,
     pub client: String,
     pub device_name: String,
@@ -166,6 +182,85 @@ struct ServerSession {
     kind: MediaServerKind,
     server: Arc<dyn MediaServer>,
     session: Session,
+    reported: bool,
+    newly_observed: bool,
+}
+
+impl ServerSession {
+    fn id(&self) -> String {
+        scoped_playback_id(
+            self.kind,
+            &self.session.id,
+            self.session
+                .now_playing
+                .as_ref()
+                .map(|item| item.item_id.as_str())
+                .unwrap_or(""),
+            self.session.playback_session_id.as_deref(),
+        )
+    }
+
+    fn same_connection(&self, other: &Self) -> bool {
+        self.kind == other.kind
+            && Arc::ptr_eq(&self.server, &other.server)
+            && self.session.id == other.session.id
+            && self.session.playback_session_id == other.session.playback_session_id
+            && self.session.user_id == other.session.user_id
+    }
+}
+
+#[derive(Default)]
+struct PlaybackSessions {
+    observed: HashMap<String, (ServerSession, Instant)>,
+}
+
+impl PlaybackSessions {
+    fn update(&mut self, reported: Vec<ServerSession>, now: Instant) -> Vec<ServerSession> {
+        // Do not hold sessions through disconnection, unload, filtering, or an
+        // explicit Plex playback-instance change. Only a shared row is retained.
+        self.observed.retain(|_, (previous, last_seen)| {
+            now.duration_since(*last_seen) < SHARED_SESSION_RETENTION
+                && reported.iter().any(|current| {
+                    current.session.now_playing.is_some()
+                        && current.same_connection(previous)
+                        && (current.id() == previous.id()
+                            || previous.kind != MediaServerKind::Audiobookshelf)
+                })
+        });
+        for (previous, _) in self.observed.values_mut() {
+            previous.reported = false;
+            previous.newly_observed = false;
+        }
+        for mut current in reported {
+            if current.session.now_playing.is_none() {
+                continue;
+            }
+            let id = current.id();
+            current.newly_observed = !self.observed.contains_key(&id);
+            current.reported = true;
+            self.observed.insert(id, (current, now));
+        }
+
+        let mut sessions: Vec<_> = self
+            .observed
+            .values()
+            .map(|(session, _)| session.clone())
+            .collect();
+        let mut connections = HashMap::new();
+        for session in &sessions {
+            *connections
+                .entry((session.kind, session.session.id.clone()))
+                .or_insert(0) += 1;
+        }
+        for session in &mut sessions {
+            // A command addressed only to the shared provider ID cannot target
+            // one of these tabs reliably. Restore controls when it is unique.
+            if connections[&(session.kind, session.session.id.clone())] > 1 {
+                session.session.supports_remote_control = false;
+            }
+        }
+        sessions
+    }
 }
 
 pub fn scoped_history_id(kind: MediaServerKind, item_id: &str) -> String {
@@ -176,9 +271,17 @@ pub fn scoped_session_id(kind: MediaServerKind, session_id: &str) -> String {
     format!("{kind}|{session_id}")
 }
 
-pub fn split_scoped_id(scoped_id: &str) -> Option<(MediaServerKind, &str)> {
-    let (kind, raw_id) = scoped_id.split_once('|')?;
-    Some((MediaServerKind::parse(kind)?, raw_id))
+fn scoped_playback_id(
+    kind: MediaServerKind,
+    session_id: &str,
+    item_id: &str,
+    playback_session_id: Option<&str>,
+) -> String {
+    let id = format!("{}|{item_id}", scoped_session_id(kind, session_id));
+    match playback_session_id {
+        Some(playback_id) => format!("{id}|{playback_id}"),
+        None => id,
+    }
 }
 
 fn is_ignored_episode(now_playing: &NowPlaying) -> bool {
@@ -272,6 +375,7 @@ pub struct SessionManager {
     db: Arc<AppDatabase>,
     /// Prevent overlapping poll cycles when the API forces immediate refreshes.
     poll_lock: Mutex<()>,
+    playback_sessions: Mutex<PlaybackSessions>,
     /// Throttle: only persist to SQLite at most once per position-save interval.
     last_save: Arc<Mutex<Instant>>,
     /// Whether the Plex websocket listener is connected and can provide live play-state updates.
@@ -329,6 +433,7 @@ impl SessionManager {
             audio_track_resolution: Arc::new(RwLock::new(AudioTrackResolution::Single)),
             db,
             poll_lock: Mutex::new(()),
+            playback_sessions: Mutex::new(PlaybackSessions::default()),
             last_save,
             plex_ws_connected: AtomicBool::new(false),
         })
@@ -687,6 +792,8 @@ impl SessionManager {
                                 kind,
                                 server: server.clone(),
                                 session,
+                                reported: true,
+                                newly_observed: false,
                             }),
                     );
                 }
@@ -696,6 +803,24 @@ impl SessionManager {
             }
         }
 
+        sessions
+    }
+
+    async fn collect_playback_sessions(&self, servers: ServerMap) -> Vec<ServerSession> {
+        let reported = self.collect_server_sessions(servers).await;
+        let mut sessions = self
+            .playback_sessions
+            .lock()
+            .await
+            .update(reported, Instant::now());
+        let config = self.config.read().await;
+        sessions.retain(|s| {
+            config.is_user_allowed(
+                s.kind,
+                s.session.user_id.as_deref(),
+                s.session.user_name.as_deref(),
+            )
+        });
         sessions
     }
 
@@ -1317,13 +1442,10 @@ impl SessionManager {
                 config.native_language.clone(),
             )
         };
-        let sessions = self.collect_server_sessions(servers).await;
+        let sessions = self.collect_playback_sessions(servers).await;
         let active = sessions
             .into_iter()
-            .find(|server_session| {
-                scoped_session_id(server_session.kind, &server_session.session.id)
-                    == active_session_id
-            })
+            .find(|server_session| server_session.id() == active_session_id)
             .ok_or_else(|| anyhow::anyhow!("Active session is no longer available"))?;
 
         let Some(now_playing) = active.session.now_playing.as_ref() else {
@@ -1425,6 +1547,7 @@ impl SessionManager {
 
         let servers = self.servers.read().await.clone();
         if servers.is_empty() {
+            self.playback_sessions.lock().await.observed.clear();
             {
                 let mut state = self.state.write().await;
                 state.sessions.clear();
@@ -1454,10 +1577,11 @@ impl SessionManager {
         let native_lang = config.native_language.clone();
         drop(config);
 
-        let mut sessions = self.collect_server_sessions(servers).await;
+        let mut sessions = self.collect_playback_sessions(servers).await;
         sessions.sort_by(|left, right| {
             compare_auto_session_priority(&left.session, &right.session, &target_lang)
                 .then_with(|| left.kind.cmp(&right.kind))
+                .then_with(|| left.id().cmp(&right.id()))
         });
 
         // Keep the device picker stable while automatic selection ranks the
@@ -1469,7 +1593,8 @@ impl SessionManager {
                 let np = s.session.now_playing.as_ref().unwrap();
                 let is_target = np.has_audio_language(&target_lang);
                 SessionSummary {
-                    id: scoped_session_id(s.kind, &s.session.id),
+                    id: s.id(),
+                    remote_session_id: s.session.id.clone(),
                     server_kind: s.kind,
                     client: s.session.client.clone(),
                     device_name: s.session.device_name.clone(),
@@ -1490,32 +1615,30 @@ impl SessionManager {
         // Determine active session
         let user_selected = self.selected_session_id.read().await.clone();
         let active_session = if let Some(ref sel_id) = user_selected {
-            split_scoped_id(sel_id).and_then(|(kind, raw_id)| {
-                sessions
-                    .iter()
-                    .find(|s| s.kind == kind && s.session.id == raw_id)
-                    .cloned()
-            })
+            sessions.iter().find(|s| s.id() == *sel_id).cloned()
         } else {
             // Check-ins from another device must not steal the selection,
             // including when both devices are paused on the same episode.
             // A paused session still yields to actual playback elsewhere.
-            let has_playing_session = sessions
-                .iter()
-                .any(|s| s.session.now_playing.is_some() && !s.session.play_state.is_paused);
+            let has_playing_session = sessions.iter().any(|s| {
+                s.reported && s.session.now_playing.is_some() && !s.session.play_state.is_paused
+            });
             let previous_active_id = self.state.read().await.active_session_id.clone();
             let sticky = previous_active_id.as_deref().and_then(|id| {
-                split_scoped_id(id).and_then(|(kind, raw_id)| {
-                    sessions
-                        .iter()
-                        .find(|s| {
-                            s.kind == kind
-                                && s.session.id == raw_id
-                                && s.session.now_playing.is_some()
-                                && (!s.session.play_state.is_paused || !has_playing_session)
-                        })
-                        .cloned()
-                })
+                sessions
+                    .iter()
+                    .find(|s| s.id() == id)
+                    .filter(|previous| {
+                        (!previous.session.play_state.is_paused || !has_playing_session)
+                        // Follow a newly started episode immediately. A known
+                        // tab checking in again must not steal the selection.
+                        && (previous.reported || !sessions.iter().any(|current| {
+                            current.reported && current.newly_observed
+                                && !current.session.play_state.is_paused
+                                && current.same_connection(previous)
+                        }))
+                    })
+                    .cloned()
             });
 
             sticky.or_else(|| {
@@ -1523,6 +1646,7 @@ impl SessionManager {
                 // language and freshness. Paused sessions are a final fallback.
                 sessions
                     .iter()
+                    .filter(|s| s.reported)
                     .find(|s| s.session.now_playing.is_some())
                     .cloned()
             })
@@ -1619,7 +1743,7 @@ impl SessionManager {
                     *self.audio_track_resolution.write().await = audio_resolution;
                 }
 
-                state.active_session_id = Some(scoped_session_id(active.kind, &session.id));
+                state.active_session_id = Some(active.id());
                 state.now_playing = Some(NowPlayingState {
                     history_id: history_id.clone(),
                     server_kind: active.kind,
@@ -1857,10 +1981,16 @@ impl SessionManager {
         &self,
         client_identifier: &str,
         rating_key: &str,
+        playback_session_id: Option<&str>,
         view_offset_ms: Option<i64>,
         player_state: &str,
     ) {
-        let scoped_id = scoped_session_id(MediaServerKind::Plex, client_identifier);
+        let scoped_id = scoped_playback_id(
+            MediaServerKind::Plex,
+            client_identifier,
+            rating_key,
+            playback_session_id,
+        );
         let mut snapshot = None;
         let mut history_update = None;
         let mut should_poll = false;
@@ -2291,6 +2421,7 @@ mod tests {
 
         Session {
             id: id.to_string(),
+            playback_session_id: None,
             client: "Test".to_string(),
             device_name: id.to_string(),
             user_name: None,
@@ -2426,6 +2557,8 @@ mod tests {
         let now_ms = chrono::Utc::now().timestamp_millis();
         let mut tv = playback_session("tv", false, "jpn", Some(now_ms));
         let mut browser = playback_session("browser", false, "jpn", Some(now_ms - 1));
+        tv.device_name = "Firefox".into();
+        browser.device_name = "Firefox".into();
         // Both devices use the same provider item ID, but have different clocks.
         tv.play_state.position_ticks = Some(600_000 * 10_000);
         browser.play_state.position_ticks = Some(420_000 * 10_000);
@@ -2477,7 +2610,10 @@ mod tests {
                 *server.0.write().await = sessions;
                 manager.poll_once().await;
                 let state = manager.state.read().await;
-                assert_eq!(state.active_session_id.as_deref(), Some("jellyfin|tv"));
+                assert_eq!(
+                    state.active_session_id.as_deref(),
+                    Some("jellyfin|tv|item-1")
+                );
                 assert_eq!(state.now_playing.as_ref().unwrap().position_ms, 600_000);
                 assert_eq!(
                     state
@@ -2500,15 +2636,17 @@ mod tests {
         manager.poll_once().await;
         assert_eq!(
             manager.state.read().await.active_session_id.as_deref(),
-            Some("jellyfin|browser")
+            Some("jellyfin|browser|item-1")
         );
 
         // An explicit selection stays on that device, including while paused.
-        manager.select_session(Some("jellyfin|tv".into())).await;
+        manager
+            .select_session(Some("jellyfin|tv|item-1".into()))
+            .await;
         manager.poll_once().await;
         assert_eq!(
             manager.state.read().await.active_session_id.as_deref(),
-            Some("jellyfin|tv")
+            Some("jellyfin|tv|item-1")
         );
         assert_eq!(
             manager
@@ -2522,7 +2660,7 @@ mod tests {
             600_000
         );
         manager
-            .select_session(Some("jellyfin|browser".into()))
+            .select_session(Some("jellyfin|browser|item-1".into()))
             .await;
         manager.poll_once().await;
         assert_eq!(
@@ -2544,7 +2682,7 @@ mod tests {
         manager.poll_once().await;
         assert_eq!(
             manager.state.read().await.active_session_id.as_deref(),
-            Some("jellyfin|tv")
+            Some("jellyfin|tv|item-1")
         );
 
         // Expired sessions must not be kept alive by the sticky selection.
@@ -2554,6 +2692,309 @@ mod tests {
         assert!(manager.state.read().await.active_session_id.is_none());
         drop(manager);
         drop(db);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    async fn session_test_manager(
+        kind: MediaServerKind,
+        sessions: Vec<Session>,
+    ) -> (SessionManager, Arc<TestServer>, PathBuf) {
+        let directory = std::env::temp_dir().join(format!("nagare-tabs-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let db = Arc::new(
+            AppDatabase::new(directory.join("test.db"), None)
+                .await
+                .unwrap(),
+        );
+        let server = Arc::new(TestServer(RwLock::new(sessions)));
+        let mut servers = ServerMap::new();
+        servers.insert(kind, server.clone());
+        let (tx, _rx) = watch::channel(SessionState {
+            sessions: vec![],
+            active_session_id: None,
+            now_playing: None,
+        });
+        let manager = SessionManager::new(
+            Arc::new(RwLock::new(servers)),
+            Arc::new(RwLock::new(Config::default())),
+            tx,
+            directory.clone(),
+            db,
+        )
+        .await
+        .unwrap();
+        (manager, server, directory)
+    }
+
+    fn browser_tab(item_id: &str, paused: bool, position_ms: i64) -> Session {
+        let mut session = playback_session("browser", paused, "jpn", None);
+        session.client = "Web".into();
+        session.device_name = "Firefox".into();
+        let item = session.now_playing.as_mut().unwrap();
+        item.item_id = item_id.into();
+        item.name = item_id.into();
+        session.play_state.position_ticks = Some(position_ms * 10_000);
+        session
+    }
+
+    #[tokio::test]
+    async fn shared_browser_id_keeps_items_and_manual_selection_stable() {
+        for kind in [
+            MediaServerKind::Jellyfin,
+            MediaServerKind::Emby,
+            MediaServerKind::Plex,
+        ] {
+            let first = browser_tab("episode-a", true, 4_355);
+            let second = browser_tab("episode-b", true, 1_446_070);
+            let (manager, server, directory) =
+                session_test_manager(kind, vec![first.clone()]).await;
+            manager.poll_once().await;
+            let first_id = format!("{kind}|browser|episode-a");
+            let second_id = format!("{kind}|browser|episode-b");
+
+            // Reproduce Jellyfin's single row alternating between two paused
+            // Firefox tabs. Neither selection nor playback position may bounce.
+            for manual in [false, true] {
+                if manual {
+                    manager.select_session(Some(second_id.clone())).await;
+                }
+                for poll in 0..12 {
+                    *server.0.write().await = vec![if poll % 2 == 0 {
+                        second.clone()
+                    } else {
+                        first.clone()
+                    }];
+                    manager.poll_once().await;
+                    let state = manager.state.read().await;
+                    assert_eq!(
+                        state.active_session_id.as_deref(),
+                        Some(if manual {
+                            second_id.as_str()
+                        } else {
+                            first_id.as_str()
+                        })
+                    );
+                    let playing = state.now_playing.as_ref().unwrap();
+                    assert_eq!(
+                        playing.item_id,
+                        if manual { "episode-b" } else { "episode-a" }
+                    );
+                    assert_eq!(playing.position_ms, if manual { 1_446_070 } else { 4_355 });
+                    assert!(!playing.supports_remote_control);
+                    assert_eq!(state.active_remote_session_id(), Some("browser"));
+                    assert_eq!(
+                        state
+                            .sessions
+                            .iter()
+                            .map(|session| &session.id)
+                            .collect::<Vec<_>>(),
+                        vec![&first_id, &second_id]
+                    );
+                }
+            }
+            // Subtitle selection must resolve the chosen item from the same
+            // observations, even while the provider row describes its sibling.
+            *server.0.write().await = vec![first.clone()];
+            manager.select_subtitle_candidate(None).await.unwrap();
+            assert_eq!(
+                manager
+                    .state
+                    .read()
+                    .await
+                    .now_playing
+                    .as_ref()
+                    .unwrap()
+                    .item_id,
+                "episode-b"
+            );
+            let history = manager.history.read().await;
+            assert_eq!(
+                history[&format!("{kind}|episode-a")].last_position_ms,
+                4_355
+            );
+            assert_eq!(
+                history[&format!("{kind}|episode-b")].last_position_ms,
+                1_446_070
+            );
+            drop(history);
+
+            // Missing tab observations expire, even while the shared device is
+            // still checking in. Commands then use the original provider ID.
+            manager
+                .playback_sessions
+                .lock()
+                .await
+                .observed
+                .get_mut(&second_id)
+                .unwrap()
+                .1 = Instant::now() - SHARED_SESSION_RETENTION;
+            *server.0.write().await = vec![first.clone()];
+            manager.poll_once().await;
+            assert!(manager.state.read().await.active_session_id.is_none());
+            manager.select_session(None).await;
+            manager.poll_once().await;
+            let state = manager.state.read().await;
+            assert_eq!(state.sessions.len(), 1);
+            assert_eq!(state.active_remote_session_id(), Some("browser"));
+            assert!(state.now_playing.as_ref().unwrap().supports_remote_control);
+            drop(state);
+
+            // An explicit unload removes cached items immediately.
+            let mut unloaded = first;
+            unloaded.now_playing = None;
+            *server.0.write().await = vec![unloaded];
+            manager.poll_once().await;
+            assert!(manager.state.read().await.sessions.is_empty());
+            drop(manager);
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn new_playing_item_takes_over_but_known_tab_checkins_do_not() {
+        let first = browser_tab("episode-a", false, 50_000);
+        let second = browser_tab("episode-b", false, 1_000);
+        let (manager, server, directory) =
+            session_test_manager(MediaServerKind::Jellyfin, vec![first.clone()]).await;
+        manager.poll_once().await;
+        *server.0.write().await = vec![second.clone()];
+        manager.poll_once().await;
+        assert_eq!(
+            manager
+                .state
+                .read()
+                .await
+                .now_playing
+                .as_ref()
+                .unwrap()
+                .item_id,
+            "episode-b"
+        );
+        for poll in 0..6 {
+            *server.0.write().await = vec![if poll % 2 == 0 {
+                first.clone()
+            } else {
+                second.clone()
+            }];
+            manager.poll_once().await;
+            assert_eq!(
+                manager
+                    .state
+                    .read()
+                    .await
+                    .now_playing
+                    .as_ref()
+                    .unwrap()
+                    .item_id,
+                "episode-b"
+            );
+        }
+        let mut paused = second;
+        paused.play_state.is_paused = true;
+        *server.0.write().await = vec![paused];
+        manager.poll_once().await;
+        assert_eq!(
+            manager
+                .state
+                .read()
+                .await
+                .now_playing
+                .as_ref()
+                .unwrap()
+                .item_id,
+            "episode-b"
+        );
+        *server.0.write().await = vec![first];
+        manager.poll_once().await;
+        assert_eq!(
+            manager
+                .state
+                .read()
+                .await
+                .now_playing
+                .as_ref()
+                .unwrap()
+                .item_id,
+            "episode-a"
+        );
+        *server.0.write().await = vec![];
+        manager.poll_once().await;
+        assert!(manager.state.read().await.sessions.is_empty());
+        drop(manager);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn plex_websocket_only_updates_the_selected_playback_instance() {
+        let mut first = browser_tab("episode", false, 10_000);
+        first.playback_session_id = Some("11".into());
+        let mut second = browser_tab("episode", false, 80_000);
+        second.playback_session_id = Some("22".into());
+        let (manager, server, directory) =
+            session_test_manager(MediaServerKind::Plex, vec![first, second.clone()]).await;
+        manager.poll_once().await;
+        assert_eq!(manager.state.read().await.sessions.len(), 2);
+        manager
+            .handle_plex_playing_event("browser", "episode", Some("22"), Some(81_000), "paused")
+            .await;
+        assert_eq!(
+            manager
+                .state
+                .read()
+                .await
+                .now_playing
+                .as_ref()
+                .unwrap()
+                .position_ms,
+            10_000
+        );
+        manager
+            .handle_plex_playing_event("browser", "episode", Some("11"), Some(11_000), "playing")
+            .await;
+        assert_eq!(
+            manager
+                .state
+                .read()
+                .await
+                .now_playing
+                .as_ref()
+                .unwrap()
+                .position_ms,
+            11_000
+        );
+        // Old servers/events without an instance key fall back to polling,
+        // instead of applying a possibly unrelated tab's playback clock.
+        manager
+            .handle_plex_playing_event("browser", "episode", None, Some(999_000), "playing")
+            .await;
+        assert_eq!(
+            manager
+                .state
+                .read()
+                .await
+                .now_playing
+                .as_ref()
+                .unwrap()
+                .position_ms,
+            10_000
+        );
+        // A vanished Plex instance is not retained merely because its sibling
+        // shares the same machineIdentifier and item.
+        *server.0.write().await = vec![second];
+        manager.poll_once().await;
+        assert_eq!(manager.state.read().await.sessions.len(), 1);
+        assert_eq!(
+            manager
+                .state
+                .read()
+                .await
+                .now_playing
+                .as_ref()
+                .unwrap()
+                .position_ms,
+            80_000
+        );
+        drop(manager);
         fs::remove_dir_all(directory).unwrap();
     }
 

@@ -127,6 +127,10 @@ impl PlexClient {
         let player = &v["Player"];
         // Use Player.machineIdentifier as the session ID for remote control
         let id = player["machineIdentifier"].as_str()?.to_string();
+        let playback_session_id = v["sessionKey"]
+            .as_str()
+            .map(str::to_string)
+            .or_else(|| v["sessionKey"].as_u64().map(|key| key.to_string()));
         let client = player["product"].as_str().unwrap_or("Unknown").to_string();
         let device_name = player["title"]
             .as_str()
@@ -186,6 +190,7 @@ impl PlexClient {
         if item_id.is_empty() {
             return Some(Session {
                 id,
+                playback_session_id,
                 client,
                 device_name,
                 user_name,
@@ -240,6 +245,7 @@ impl PlexClient {
 
         Some(Session {
             id,
+            playback_session_id,
             client,
             device_name,
             user_name,
@@ -948,5 +954,33 @@ impl MediaServer for PlexClient {
         )
         .await
         .map_err(|_| anyhow::anyhow!("Plex unpause timed out after 5s"))?
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn separates_playback_instance_from_remote_control_identifier() {
+        for key in [json!("29"), json!(29)] {
+            let value = json!({
+                "sessionKey": key,
+                "ratingKey": "episode",
+                "Player": { "machineIdentifier": "shared-browser", "product": "Plex Web", "state": "paused" }
+            });
+            let session = PlexClient::parse_session(&value).unwrap();
+            assert_eq!(session.id, "shared-browser");
+            assert_eq!(session.playback_session_id.as_deref(), Some("29"));
+        }
+        let legacy =
+            json!({ "ratingKey": "episode", "Player": { "machineIdentifier": "browser" } });
+        assert!(
+            PlexClient::parse_session(&legacy)
+                .unwrap()
+                .playback_session_id
+                .is_none()
+        );
     }
 }

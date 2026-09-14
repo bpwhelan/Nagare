@@ -147,9 +147,13 @@ This discovery uses the administrator-only `/api/sessions` endpoint, so the conf
 ## How it works
 
 1. Nagare polls your media server(s) for active playback sessions
-2. Select a session or allow Nagare to auto-select the most recently active one
+2. Select a session or let Nagare choose automatically and stay with that playback
 3. Create a card in Anki — Nagare matches it to the exact subtitle context
 4. Confirm the match, preview audio/screenshot, and enrich the card
+
+When browser tabs share a media-server session ID, Nagare keeps their different items as separate entries in the session picker. Each item remains available for up to 30 seconds between check-ins, so paused tabs do not repeatedly replace one another. Choose an entry by its title to keep mining that item. Newly started playback can take over in automatic mode, and disconnected or unloaded sessions are removed. Plex playback-instance IDs also keep separate tabs playing the same item from mixing their progress updates.
+
+Remote playback controls are unavailable while several items share the same server control ID, because that ID cannot reliably address an individual tab. Controls return when only one entry remains.
 
 ### Review a mining session later
 

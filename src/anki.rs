@@ -1027,6 +1027,7 @@ mod notification_latency_tests {
         let (_session_tx, session_rx) = watch::channel(SessionState {
             sessions: vec![SessionSummary {
                 id: "test".into(),
+                remote_session_id: "test".into(),
                 server_kind: MediaServerKind::Plex,
                 client: "test".into(),
                 device_name: "test".into(),

@@ -61,6 +61,10 @@ pub struct MediaUser {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
     pub id: String,
+    /// Playback-instance identifier when the provider exposes one separately
+    /// from the device/session ID used for remote control (for example Plex).
+    #[serde(default)]
+    pub playback_session_id: Option<String>,
     pub client: String,
     pub device_name: String,
     pub user_name: Option<String>,

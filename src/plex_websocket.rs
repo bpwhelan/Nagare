@@ -28,6 +28,8 @@ struct PlexNotificationContainer {
 
 #[derive(Debug, Deserialize)]
 struct PlexPlayingNotification {
+    #[serde(default, rename = "sessionKey")]
+    session_key: Option<String>,
     #[serde(rename = "clientIdentifier")]
     client_identifier: String,
     #[serde(rename = "ratingKey")]
@@ -110,6 +112,7 @@ async fn handle_message(manager: &Arc<SessionManager>, message: Message) -> anyh
             .handle_plex_playing_event(
                 &event.client_identifier,
                 &event.rating_key,
+                event.session_key.as_deref(),
                 event.view_offset,
                 &event.state,
             )
@@ -186,6 +189,7 @@ mod tests {
         assert_eq!(envelope.notification.kind, "playing");
         assert_eq!(envelope.notification.playing.len(), 1);
         let event = &envelope.notification.playing[0];
+        assert_eq!(event.session_key.as_deref(), Some("29"));
         assert_eq!(event.client_identifier, "ytgcp5ywyn8xzsyp6yybukey");
         assert_eq!(event.rating_key, "144504");
         assert_eq!(event.view_offset, Some(154000));
