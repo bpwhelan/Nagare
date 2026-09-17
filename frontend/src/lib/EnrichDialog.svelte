@@ -193,7 +193,7 @@
 
   $: if (card && cardKey !== lastCardKey) {
     lastCardKey = cardKey;
-    editedSentence = card.matched_text && card.source === 'pending'
+    editedSentence = card.matched_text && (card.source === 'pending' || card.source === 'retry')
       ? mergeSentenceMarkup(card.matched_text, card.event.sentence) : card.event.sentence || '';
     editedTranslation = '';
     translationDirty = false;
@@ -203,6 +203,7 @@
     includedLineLast = card.included_line_last ?? null;
     startMs = card.start_ms ?? 0;
     endMs = card.end_ms ?? 0;
+    editedTranslation = gatherTranslation($nativeSubtitles, startMs, endMs);
     generateAvif = card.generate_avif ?? $defaultGenerateAvif;
     submitting = false;
     reusePrompt = false;
