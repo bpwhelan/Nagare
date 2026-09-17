@@ -1,4 +1,5 @@
 <script>
+  import { onDestroy } from 'svelte';
   import { audioTracks, selectedAudioTrackIndex, showAudioTrackModal, showErrorToast, applyAudioTracksPayload } from './stores.js';
   import { selectAudioTrack, previewAudioTrack } from './api.js';
   import { audioMimeType } from './utils.js';
@@ -72,6 +73,8 @@
       showErrorToast(e.message || 'Selection failed');
     }
   }
+
+  onDestroy(cleanup);
 </script>
 
 {#if $showAudioTrackModal}

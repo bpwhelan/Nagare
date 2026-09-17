@@ -1214,6 +1214,11 @@
           <label for="show-download-button">Show subtitle download button</label>
         </div>
       </div>
+      <details class="browser-companion">
+        <summary>Optional browser companion</summary>
+        <p class="hint">View subtitles and review cards directly in your Jellyfin tab with Nagare Companion. Requires a userscript manager.</p>
+        <a href="/userscript/nagare.user.js">Install Nagare Companion userscript</a>
+      </details>
     </section>
     {/if}
 
@@ -1223,6 +1228,11 @@
 </div>
 
 <style>
+  .browser-companion { margin-top: 1rem; border-top: 1px solid var(--border); padding-top: 0.75rem; }
+  .browser-companion summary { cursor: pointer; font-size: 0.85rem; color: var(--text-secondary); }
+  .browser-companion p { margin: 0.6rem 0; }
+  .browser-companion a { color: var(--accent); font-size: 0.85rem; }
+
   .config-page {
     padding: 1.5rem;
     width: 100%;

@@ -4,10 +4,11 @@
   import { gatherTranslation } from './utils.js';
   import { contextSentence } from './review.js';
 
+  export let enabled = true;
   let busy = false;
   let lastMine = null;
   const attempted = new Set();
-  $: next = $autoApprove && !busy
+  $: next = enabled && $autoApprove && !busy
     ? $pendingCards.find(c => c.source === 'pending' && !attempted.has(c.event.note_id)
       && c.end_ms > c.start_ms)
     : null;

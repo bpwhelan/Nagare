@@ -3,10 +3,14 @@
   "private": true,
   "version": "0.0.0",
   "type": "module",
+  "imports": {
+    "#runtime": "./src/lib/runtime.js"
+  },
   "scripts": {
     "dev": "vite",
-    "test": "node --test src/lib/*.test.js",
-    "build": "vite build",
+    "test": "node --test src/lib/*.test.js src/userscript/*.test.js",
+    "build": "vite build && npm run build:userscript",
+    "build:userscript": "vite build --config vite.userscript.config.js",
     "preview": "vite preview"
   },
   "devDependencies": {

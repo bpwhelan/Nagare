@@ -1,4 +1,5 @@
 import { writable, derived, get } from 'svelte/store';
+import { readPreference, writePreference } from '#runtime';
 
 /**
  * A writable store that persists its value in localStorage.
@@ -7,10 +8,9 @@ import { writable, derived, get } from 'svelte/store';
  * @param {T} defaultValue
  */
 function localStorageStore(key, defaultValue) {
-  const stored = localStorage.getItem(key);
-  const initial = stored !== null ? JSON.parse(stored) : defaultValue;
+  const initial = readPreference(key, defaultValue);
   const store = writable(initial);
-  store.subscribe(value => localStorage.setItem(key, JSON.stringify(value)));
+  store.subscribe(value => writePreference(key, value));
   return store;
 }
 

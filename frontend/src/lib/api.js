@@ -1,15 +1,5 @@
-const BASE = '';
-
+import { requestJson as api } from '#runtime';
 import { showErrorToast, pendingCards } from './stores.js';
-
-async function api(path, options = {}) {
-  const resp = await fetch(`${BASE}${path}`, {
-    headers: { 'Content-Type': 'application/json' },
-    ...options,
-  });
-  if (!resp.ok) throw new Error(`Request failed (${resp.status})`);
-  return resp.json();
-}
 
 export async function getState() {
   return api('/api/state');

@@ -96,7 +96,7 @@ export function resyncFromBackground() {
   }
 }
 
-function handleMessage(msg) {
+export function handleMessage(msg) {
   if (msg.anki_status) {
     ankiStatus.set(msg.anki_status);
   }

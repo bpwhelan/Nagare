@@ -53,6 +53,7 @@ Nagare watches your active media server playback sessions, displays a live subti
 ## Features
 
 - Live subtitle timeline synced to playback
+- Configurable userscript sidebar for Jellyfin and other enabled sites, sharing the subtitle and enhancement workflow
 - Sentence audio extraction and animated AVIF screenshot clips
 - AnkiConnect integration with automatic card matching
 - Playback controls (seek, pause, resume) from the browser.
@@ -155,6 +156,18 @@ This discovery uses the administrator-only `/api/sessions` endpoint, so the conf
 When browser tabs share a media-server session ID, Nagare keeps their different items as separate entries in the session picker. Each item remains available for up to 30 seconds between check-ins, so paused tabs do not repeatedly replace one another. Choose an entry by its title to keep mining that item. Newly started playback can take over in automatic mode, and disconnected or unloaded sessions are removed. Plex playback-instance IDs also keep separate tabs playing the same item from mixing their progress updates.
 
 Remote playback controls are unavailable while several items share the same server control ID, because that ID cannot reliably address an individual tab. Controls return when only one entry remains.
+
+### Use Nagare inside Jellyfin
+
+Install **Nagare Companion** under **Settings → Frontend → Interface → Optional
+browser companion** (or `/userscript/nagare.user.js` on your server). It starts on `https://jellyfin.*`
+by default. Set the Nagare address in the Companion's settings, then use the
+sidebar or **Alt+N** to view subtitles, expand card context, confirm enhancements,
+or enable auto-confirm. Card review appears centered over the video and keeps
+the sidebar's current visibility. The position, width, hotkey, enabled sites, and mining
+preferences are configurable in the script's UI.
+
+See [userscript installation and smoke testing](docs/userscript.md).
 
 ### Review a mining session later
 

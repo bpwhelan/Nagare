@@ -1,5 +1,6 @@
 mod anki;
 mod api;
+mod companion;
 mod config;
 mod kechimochi;
 mod media;
@@ -255,6 +256,7 @@ async fn main() -> anyhow::Result<()> {
         pending_enrichments: Arc::new(RwLock::new(Vec::new())),
         enhancement_result_tx,
         remote_result_tx,
+        companion_events: Default::default(),
         audio_tracks,
         selected_audio_track,
         audio_track_resolution,
@@ -262,6 +264,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Start background tasks
     tokio::spawn(kechimochi_sync.run_scheduler());
+    companion::start(&app_state);
     let sm = session_manager.clone();
     tokio::spawn(async move {
         session::run_session_poller(sm).await;

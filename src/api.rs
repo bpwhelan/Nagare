@@ -34,6 +34,7 @@ use crate::anki::AnkiMedia;
 
 /// Shared application state passed to handlers.
 pub struct AppState {
+    pub companion_events: crate::companion::EventLog,
     pub config: Arc<RwLock<Config>>,
     pub db: Arc<AppDatabase>,
     pub kechimochi_sync: Arc<crate::kechimochi::SyncService>,
@@ -75,6 +76,7 @@ pub struct AppState {
 
 pub fn create_router(state: Arc<AppState>) -> Router {
     Router::new()
+        .route("/api/companion", get(crate::companion::snapshot))
         .route("/api/state", get(get_state))
         .route("/api/sessions", get(get_sessions))
         .route("/api/sessions/select", post(select_session))
@@ -188,7 +190,7 @@ async fn select_session(
     Json(serde_json::json!({"ok": true}))
 }
 
-async fn active_subtitle_data(state: &Arc<AppState>) -> SubtitleData {
+pub(crate) async fn active_subtitle_data(state: &Arc<AppState>) -> SubtitleData {
     let track = state.subtitles.read().await.clone();
     let candidates = state.subtitle_candidates.read().await.clone();
     let session_state = state.session_rx.borrow().clone();
@@ -346,7 +348,7 @@ async fn current_subtitle_offset(state: &Arc<AppState>, history_id: Option<&str>
         .unwrap_or(0)
 }
 
-async fn get_pending_enrichments(
+pub(crate) async fn get_pending_enrichments(
     State(state): State<Arc<AppState>>,
 ) -> Json<Vec<EnrichmentDialogState>> {
     let mut pending = state.pending_enrichments.write().await;
@@ -1066,6 +1068,7 @@ mod anki_intake_tests {
             .insert("plex|one".into(), track(&[(1_000, 2_000, "対象の文")]));
         let (new_card_tx, mut published) = broadcast::channel(4);
         let state = Arc::new(AppState {
+            companion_events: Default::default(),
             kechimochi_sync: Arc::new(crate::kechimochi::SyncService::new(
                 config.clone(),
                 db.clone(),
@@ -3153,14 +3156,14 @@ struct WsMessage {
 }
 
 #[derive(Serialize, Clone, PartialEq)]
-struct AudioTracksData {
+pub(crate) struct AudioTracksData {
     tracks: Vec<crate::session::AudioTrack>,
     selected_index: Option<u32>,
     resolution: crate::session::AudioTrackResolution,
 }
 
 #[derive(Serialize)]
-struct SubtitleData {
+pub(crate) struct SubtitleData {
     lines: Vec<crate::subtitle::SubtitleLine>,
     count: usize,
     /// Secondary native-language lines shown alongside the target subtitles.
@@ -3175,7 +3178,7 @@ struct SubtitleData {
     loading: bool,
 }
 
-async fn audio_tracks_data(state: &Arc<AppState>) -> AudioTracksData {
+pub(crate) async fn audio_tracks_data(state: &Arc<AppState>) -> AudioTracksData {
     let tracks = state.audio_tracks.read().await.clone();
     let selected_index = *state.selected_audio_track.read().await;
     let resolution = *state.audio_track_resolution.read().await;

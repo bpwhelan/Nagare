@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8" />
+<title>Nagare Companion smoke fixture</title>
+<style>
+  body { margin: 0; color: #c9d1df; background: #0b101b; font: 16px/1.6 system-ui; }
+  main { padding: 32px; max-width: 700px; } h1 { margin: 0; font-size: 24px; }
+  button, input { font: inherit; padding: 8px 12px; margin: 4px; }
+  .player { padding: 35px; background: #18233b; border: 1px solid #344766; border-radius: 12px; }
+  .player video { display: block; width: 100%; aspect-ratio: 16 / 9; background: #060a12; }
+  .player.compact video { width: 70%; }
+  .player:fullscreen { box-sizing: border-box; width: 100%; height: 100%; padding: 16px; display: flex; flex-direction: column; }
+  .player:fullscreen video { flex: 1; min-height: 0; aspect-ratio: auto; }
+  .player:fullscreen .player-actions { flex-shrink: 0; }
+  pre { font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere; }
+</style>
+<main>
+  <h1>Companion smoke fixture</h1>
+  <p>This page runs the production userscript with mock manager APIs. It never contacts Nagare, Jellyfin, or Anki.</p>
+  <div class="player" id="player">
+    <video id="video" muted playsinline aria-label="Test video"></video>
+    <div class="player-actions">
+    <button id="fullscreen">Enter fullscreen</button>
+    <button id="resize">Resize video</button>
+    <button id="replace">Replace video</button>
+    <button id="card">Receive card</button>
+    <button id="fail">Fail next enhancement</button>
+    <button id="offline">Toggle connection</button>
+    <button id="settings">Manager: settings</button>
+    <input aria-label="Player search" placeholder="Typing must not toggle the sidebar" />
+    </div>
+  </div>
+  <h2>Requests and browser errors</h2>
+  <pre id="log" role="log"></pre>
+</main>
+<script src="/tests/companion-fixture.js"></script>
+</html>

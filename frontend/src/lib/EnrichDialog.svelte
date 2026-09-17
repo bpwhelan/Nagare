@@ -21,7 +21,8 @@
   import { enrichCard, skipEnrichment, previewAudio, previewScreenshot, getSubtitleMatches, firePlayPause, queueEnrichCard } from './api.js';
   import { audioMimeType, formatTime, imageMimeType, gatherTranslation } from './utils.js';
 
-  $: card = $dialogCard || ($currentView === 'timeline' && !$autoApprove ? $pendingCards[0] : null) || null;
+  export let enabled = true;
+  $: card = enabled ? ($dialogCard || ($currentView === 'timeline' && !$autoApprove ? $pendingCards[0] : null) || null) : null;
   $: isRouteCard = $dialogCard != null;
   $: isHistoryCard = card?.source === 'mining_history';
   $: mediaItemId = card?.history_id || $activeHistoryItemId || null;
@@ -101,6 +102,16 @@
 
   // Track if we paused playback when the dialog opened
   let pausedByDialog = false;
+
+  // A companion can suspend review while retaining the user's draft.
+  $: if (!enabled) {
+    cleanupAudio();
+    cleanupScreenshot();
+    if (pausedByDialog) {
+      firePlayPause(false);
+      pausedByDialog = false;
+    }
+  }
 
   // Slider window: show ±15s around the anchor line for the range slider
   const SLIDER_PADDING_MS = 15000;
