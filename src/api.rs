@@ -36,6 +36,7 @@ use crate::anki::AnkiMedia;
 pub struct AppState {
     pub config: Arc<RwLock<Config>>,
     pub db: Arc<AppDatabase>,
+    pub kechimochi_sync: Arc<crate::kechimochi::SyncService>,
     pub session_manager: Arc<SessionManager>,
     pub servers: Arc<RwLock<ServerMap>>,
     pub anki_client: Arc<RwLock<Arc<AnkiClient>>>,
@@ -113,6 +114,12 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         )
         .route("/api/tadoku/sync", post(sync_tadoku_candidates))
         .route("/api/tadoku/decline", post(decline_tadoku_candidates))
+        .route("/api/kechimochi/status", get(crate::kechimochi::get_status))
+        .route(
+            "/api/kechimochi/test",
+            post(crate::kechimochi::test_connection),
+        )
+        .route("/api/kechimochi/sync", post(crate::kechimochi::sync_now))
         .route("/api/users", get(get_server_users))
         .route("/api/seek", post(seek_to_line))
         .route("/api/play-pause", post(play_pause))
@@ -1059,6 +1066,10 @@ mod anki_intake_tests {
             .insert("plex|one".into(), track(&[(1_000, 2_000, "対象の文")]));
         let (new_card_tx, mut published) = broadcast::channel(4);
         let state = Arc::new(AppState {
+            kechimochi_sync: Arc::new(crate::kechimochi::SyncService::new(
+                config.clone(),
+                db.clone(),
+            )),
             config,
             db: db.clone(),
             session_manager: manager.clone(),
@@ -2525,6 +2536,9 @@ async fn update_config(
     Json(mut new_config): Json<Config>,
 ) -> Json<serde_json::Value> {
     new_config.tadoku.normalize();
+    if let Err(error) = new_config.kechimochi.normalize_and_validate() {
+        return Json(serde_json::json!({"ok": false, "error": error.to_string()}));
+    }
     // Detect if server config changed
     let (server_changed, anki_url_changed) = {
         let old = state.config.read().await;
@@ -2575,6 +2589,7 @@ async fn update_config(
     }
 
     info!("Configuration updated via web UI");
+    state.kechimochi_sync.wake();
     Json(serde_json::json!({"ok": true}))
 }
 

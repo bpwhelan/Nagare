@@ -1,3 +1,4 @@
+use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -38,6 +39,9 @@ pub struct Config {
 
     #[serde(default)]
     pub tadoku: TadokuConfig,
+
+    #[serde(default)]
+    pub kechimochi: KechimochiConfig,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -427,6 +431,7 @@ impl Default for Config {
             media_access_mode: default_media_access_mode(),
             mining: MiningConfig::default(),
             tadoku: TadokuConfig::default(),
+            kechimochi: KechimochiConfig::default(),
         }
     }
 }
@@ -768,4 +773,74 @@ fn default_tadoku_path_tag_rules() -> Vec<TadokuPathTagRule> {
         contains: "anime".to_string(),
         tag: "anime".to_string(),
     }]
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct KechimochiConfig {
+    pub enabled: bool,
+    pub api_url: String,
+    pub sync_mode: KechimochiSyncMode,
+    pub interval_minutes: u32,
+    pub daily_hour: u32,
+    pub daily_minute: u32,
+    pub timezone: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum KechimochiSyncMode {
+    #[default]
+    Automatic,
+    Daily,
+}
+
+impl Default for KechimochiConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            api_url: "http://127.0.0.1:3031".into(),
+            sync_mode: KechimochiSyncMode::Automatic,
+            interval_minutes: 5,
+            daily_hour: 20,
+            daily_minute: 0,
+            timezone: "America/New_York".into(),
+        }
+    }
+}
+
+impl KechimochiConfig {
+    pub fn normalize_and_validate(&mut self) -> anyhow::Result<()> {
+        let mut url = reqwest::Url::parse(self.api_url.trim())
+            .context("Kechimochi needs a valid HTTP or HTTPS base URL")?;
+        if !matches!(url.scheme(), "http" | "https")
+            || url.host_str().is_none()
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            bail!(
+                "Kechimochi URL must use HTTP or HTTPS without credentials, a query, or a fragment"
+            );
+        }
+        let path = url
+            .path()
+            .trim_end_matches('/')
+            .trim_end_matches("/api")
+            .to_string();
+        url.set_path(&path);
+        self.api_url = url.as_str().trim_end_matches('/').to_string();
+        self.timezone = self.timezone.trim().to_string();
+        self.timezone
+            .parse::<chrono_tz::Tz>()
+            .context("Unknown Kechimochi time zone; use an IANA name such as America/New_York")?;
+        if !(1..=1440).contains(&self.interval_minutes) {
+            bail!("Kechimochi sync interval must be between 1 and 1440 minutes");
+        }
+        if self.daily_hour > 23 || self.daily_minute > 59 {
+            bail!("Kechimochi daily sync time must be a valid hour and minute");
+        }
+        Ok(())
+    }
 }

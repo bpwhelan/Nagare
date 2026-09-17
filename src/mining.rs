@@ -464,7 +464,8 @@ fn init_database(path: &Path, legacy_db_path: Option<&Path>) -> anyhow::Result<(
     }
 
     let conn = open_connection(path)?;
-    crate::review::initialize(&conn)
+    crate::review::initialize(&conn)?;
+    crate::kechimochi::initialize(&conn)
 }
 
 pub(crate) fn open_connection(path: &Path) -> anyhow::Result<Connection> {
@@ -2159,7 +2160,7 @@ fn parse_episode_number(series_name: &str, title: &str) -> Option<(u32, u32)> {
     Some((season, episode))
 }
 
-fn load_history_map(conn: &Connection) -> anyhow::Result<HashMap<String, HistoryEntry>> {
+pub(crate) fn load_history_map(conn: &Connection) -> anyhow::Result<HashMap<String, HistoryEntry>> {
     let mut stmt = conn.prepare(
         "
         SELECT

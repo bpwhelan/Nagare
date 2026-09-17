@@ -61,6 +61,7 @@ Nagare watches your active media server playback sessions, displays a live subti
 - Session card review with saved SRT snapshots, review progress, context expansion, and audio previews
 - Multi-server support (Emby + Jellyfin + Plex + AudioBookShelf simultaneously)
 - Manual-review, daily, or automatic Tadoku listening-log sync, grouped by show with duplicate protection
+- Automatic Kechimochi sync for all saved media history and playback progress, with interval or daily scheduling, retries, and ongoing reconciliation. See [Kechimochi sync](docs/kechimochi.md).
 
 
 ## Roadmap

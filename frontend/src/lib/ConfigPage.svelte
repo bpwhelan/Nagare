@@ -1,5 +1,6 @@
 <script>
   import { onDestroy, onMount } from 'svelte';
+  import KechimochiSettings from './KechimochiSettings.svelte';
   import {
     getConfig,
     updateConfig,
@@ -41,6 +42,7 @@
     { id: 'server', label: 'Server' },
     { id: 'anki', label: 'Anki & Media' },
     { id: 'tadoku', label: 'Tadoku' },
+    { id: 'kechimochi', label: 'Kechimochi' },
     { id: 'frontend', label: 'Frontend' },
   ];
 
@@ -95,6 +97,11 @@
     if (!config.anki.require_tags) config.anki.require_tags = [];
     if (!config.anki.note_types) config.anki.note_types = [];
     if (!config.mining) config.mining = {};
+    config.kechimochi = {
+      enabled: false, api_url: 'http://127.0.0.1:3031', sync_mode: 'automatic',
+      interval_minutes: 5, daily_hour: 20, daily_minute: 0, timezone: 'America/New_York',
+      ...config.kechimochi,
+    };
     if (!config.tadoku) config.tadoku = {};
     if (config.tadoku.enabled == null) config.tadoku.enabled = false;
     if (!['daily', 'automatic'].includes(config.tadoku.sync_mode)) config.tadoku.sync_mode = 'daily';
@@ -407,6 +414,12 @@
     } else {
       selectedTadokuIds = selectedTadokuIds.filter((id) => id !== historyId);
     }
+  }
+
+  async function saveBeforeKechimochiAction() {
+    queueConfigSave(serializeConfig(config));
+    await startSaveLoop();
+    if (saveError) throw new Error(saveError);
   }
 
   function editTadokuTitle(candidate) {
@@ -960,6 +973,10 @@
         </button>
       </div>
     </section>
+    {/if}
+
+    {#if activeTab === 'kechimochi'}
+      <KechimochiSettings bind:settings={config.kechimochi} ensureSaved={saveBeforeKechimochiAction} />
     {/if}
 
     {#if activeTab === 'anki'}

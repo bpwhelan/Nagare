@@ -121,6 +121,10 @@ export async function getConfig() {
   return api('/api/config');
 }
 
+export const getKechimochiStatus = () => api('/api/kechimochi/status');
+export const testKechimochiConnection = () => api('/api/kechimochi/test', { method: 'POST' });
+export const syncKechimochi = () => api('/api/kechimochi/sync', { method: 'POST' });
+
 /**
  * List the users available on each enabled media server for the per-server
  * allowlist. Connection settings must be saved first.

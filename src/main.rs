@@ -1,6 +1,7 @@
 mod anki;
 mod api;
 mod config;
+mod kechimochi;
 mod media;
 mod media_server;
 mod mining;
@@ -229,9 +230,11 @@ async fn main() -> anyhow::Result<()> {
     let (enhancement_result_tx, _) = tokio::sync::broadcast::channel(16);
     let (remote_result_tx, _) = tokio::sync::broadcast::channel(16);
     let (enhancement_tx, enhancement_rx) = tokio::sync::mpsc::channel(64);
+    let kechimochi_sync = Arc::new(kechimochi::SyncService::new(config.clone(), db.clone()));
     let app_state = Arc::new(AppState {
         config: config.clone(),
         db: db.clone(),
+        kechimochi_sync: kechimochi_sync.clone(),
         session_manager: session_manager.clone(),
         servers: session_manager.servers(),
         anki_client: Arc::new(RwLock::new(anki_client)),
@@ -258,6 +261,7 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // Start background tasks
+    tokio::spawn(kechimochi_sync.run_scheduler());
     let sm = session_manager.clone();
     tokio::spawn(async move {
         session::run_session_poller(sm).await;
