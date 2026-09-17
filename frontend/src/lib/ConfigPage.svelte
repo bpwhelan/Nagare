@@ -132,6 +132,9 @@
     if (config.mining.animated_screenshot_encoder == null) config.mining.animated_screenshot_encoder = 'libsvtav1';
     if (config.mining.avif_max_width == null) config.mining.avif_max_width = 480;
     if (config.mining.avif_max_fps == null) config.mining.avif_max_fps = 10;
+    if (config.mining.avif_sizing_mode == null) config.mining.avif_sizing_mode = 'duration';
+    if (config.mining.avif_target_size_kb == null) config.mining.avif_target_size_kb = 500;
+    if (config.mining.avif_size_priority == null) config.mining.avif_size_priority = 'prefer_quality';
     if (config.mining.static_screenshot_format == null) config.mining.static_screenshot_format = 'webp';
     delete config.mining.auto_approve;
     applyMiningConfig(config.mining);
@@ -284,6 +287,10 @@
   async function persistConfig(serialized) {
     const payload = JSON.parse(serialized);
     try {
+      if (payload.mining.avif_sizing_mode === 'target_size'
+        && (!Number.isInteger(payload.mining.avif_target_size_kb) || payload.mining.avif_target_size_kb < 1)) {
+        throw new Error('Target image size must be a whole number of at least 1 KB');
+      }
       const result = await updateConfig(payload);
       if (!result.ok) throw new Error(result.error || 'Failed to save');
       applyMiningConfig(payload.mining);
@@ -1155,19 +1162,47 @@
         </select>
       </div>
       <div class="field">
-        <label for="avif-max-width">Animated Screenshot Max Width <span class="hint">(px, never upscaled; longer clips scale down further)</span></label>
+        <label for="avif-max-width">Animated Screenshot Max Width <span class="hint">(px, never upscaled)</span></label>
         <input id="avif-max-width" type="number" min="480" max="1280" step="16" bind:value={config.mining.avif_max_width} />
       </div>
       <div class="field">
-        <label for="avif-max-fps">Animated Screenshot Max FPS <span class="hint">(longer clips scale down further)</span></label>
+        <label for="avif-max-fps">Animated Screenshot Max FPS</label>
         <input id="avif-max-fps" type="number" min="1" max="30" step="1" bind:value={config.mining.avif_max_fps} />
       </div>
+      <div class="field">
+        <label for="avif-sizing-mode">Animated Screenshot Sizing</label>
+        <select id="avif-sizing-mode" bind:value={config.mining.avif_sizing_mode}>
+          <option value="duration">Duration based</option>
+          <option value="target_size">Target image size</option>
+        </select>
+        {#if config.mining.avif_sizing_mode === 'duration'}
+          <p class="hint">Clips over 5 and 10 seconds progressively reduce FPS, width, and quality.</p>
+        {/if}
+      </div>
+      {#if config.mining.avif_sizing_mode === 'target_size'}
+        <div class="field">
+          <label for="avif-target-size">Target image size <span class="hint">(KB)</span></label>
+          <input id="avif-target-size" type="number" min="1" step="1" required bind:value={config.mining.avif_target_size_kb} aria-describedby="avif-target-size-hint" />
+          <p id="avif-target-size-hint" class="hint">Estimates size from short samples of the clip, then reduces settings only as needed. Sampling adds encoding time. The final size may vary, especially for very small targets. 1 KB = 1,024 bytes.</p>
+        </div>
+        <div class="field">
+          <label for="avif-size-priority">Size preference</label>
+          <select id="avif-size-priority" bind:value={config.mining.avif_size_priority}>
+            <option value="prefer_fps">Prefer FPS</option>
+            <option value="prefer_quality">Prefer quality</option>
+          </select>
+          <p class="hint">{config.mining.avif_size_priority === 'prefer_fps'
+            ? 'Keep motion smooth by reducing image quality and width before lowering FPS.'
+            : 'Keep image detail by lowering FPS before reducing quality and width.'}</p>
+        </div>
+      {/if}
       <div class="field">
         <label for="static-screenshot-format">Static Screenshot Format</label>
         <select id="static-screenshot-format" bind:value={config.mining.static_screenshot_format}>
           <option value="webp">WebP</option>
           <option value="jpg">JPG</option>
           <option value="png">PNG</option>
+          <option value="avif">AVIF (still)</option>
         </select>
       </div>
     </section>

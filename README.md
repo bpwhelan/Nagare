@@ -157,6 +157,12 @@ When browser tabs share a media-server session ID, Nagare keeps their different 
 
 Remote playback controls are unavailable while several items share the same server control ID, because that ID cannot reliably address an individual tab. Controls return when only one entry remains.
 
+### Control animated screenshot size
+
+Under **Settings → Anki & Media → Mining Options**, set **Animated Screenshot Sizing** to **Target image size** and enter a size in KB (1 KB = 1,024 bytes). Nagare estimates AVIF size from short encoded samples and keeps the configured maximum width and FPS whenever the estimate fits. **Prefer FPS** reduces image quality and width first; **Prefer quality** lowers FPS first to preserve detail. Both settings may decrease for very small targets. Sampling adds encoding time, and the final file size can differ from the estimate.
+
+**Duration based** retains the existing reductions for clips over 5 and 10 seconds and remains the default for existing configurations. The size target applies to animated AVIF screenshots.
+
 ### Use Nagare inside Jellyfin
 
 Install **Nagare Companion** under **Settings → Frontend → Interface → Optional

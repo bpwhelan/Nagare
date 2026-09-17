@@ -1941,9 +1941,7 @@ async fn perform_enrichment(
                     &source,
                     req.start_ms,
                     req.end_ms,
-                    avif_encoder,
-                    config.mining.avif_max_width,
-                    config.mining.avif_max_fps,
+                    &config.mining,
                 )
                 .await
                 {
@@ -2539,6 +2537,9 @@ async fn update_config(
     Json(mut new_config): Json<Config>,
 ) -> Json<serde_json::Value> {
     new_config.tadoku.normalize();
+    if let Err(error) = new_config.mining.validate_avif_settings() {
+        return Json(serde_json::json!({"ok": false, "error": error.to_string()}));
+    }
     if let Err(error) = new_config.kechimochi.normalize_and_validate() {
         return Json(serde_json::json!({"ok": false, "error": error.to_string()}));
     }

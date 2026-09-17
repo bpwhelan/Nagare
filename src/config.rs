@@ -226,15 +226,23 @@ pub struct MiningConfig {
     pub animated_screenshot_encoder: AnimatedScreenshotEncoder,
 
     /// Upper bound on the animated screenshot width in pixels. The source is
-    /// never upscaled past its native width, and longer clips are scaled down
-    /// further from this cap to keep file sizes small.
+    /// never upscaled past its native width. Adaptive sizing may lower this cap.
     #[serde(default = "default_avif_max_width")]
     pub avif_max_width: u32,
 
-    /// Upper bound on the animated screenshot frame rate. Longer clips are
-    /// scaled down further from this cap.
+    /// Upper bound on the animated screenshot frame rate.
     #[serde(default = "default_avif_max_fps")]
     pub avif_max_fps: u32,
+
+    #[serde(default)]
+    pub avif_sizing_mode: AvifSizingMode,
+
+    /// Approximate animated image size in KiB (1,024 bytes), used in target-size mode.
+    #[serde(default = "default_avif_target_size_kb")]
+    pub avif_target_size_kb: u32,
+
+    #[serde(default)]
+    pub avif_size_priority: AvifSizePriority,
 
     #[serde(default = "default_static_screenshot_format")]
     pub static_screenshot_format: StaticScreenshotFormat,
@@ -378,12 +386,29 @@ impl AnimatedScreenshotEncoder {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AvifSizingMode {
+    #[default]
+    Duration,
+    TargetSize,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AvifSizePriority {
+    PreferFps,
+    #[default]
+    PreferQuality,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum StaticScreenshotFormat {
     Webp,
     Jpg,
     Png,
+    Avif,
 }
 
 impl StaticScreenshotFormat {
@@ -392,6 +417,7 @@ impl StaticScreenshotFormat {
             Self::Webp => "webp",
             Self::Jpg => "jpg",
             Self::Png => "png",
+            Self::Avif => "avif",
         }
     }
 
@@ -404,6 +430,7 @@ impl StaticScreenshotFormat {
             Self::Webp => "image/webp",
             Self::Jpg => "image/jpeg",
             Self::Png => "image/png",
+            Self::Avif => "image/avif",
         }
     }
 }
@@ -647,8 +674,70 @@ impl Default for MiningConfig {
             animated_screenshot_encoder: default_animated_screenshot_encoder(),
             avif_max_width: default_avif_max_width(),
             avif_max_fps: default_avif_max_fps(),
+            avif_sizing_mode: AvifSizingMode::default(),
+            avif_target_size_kb: default_avif_target_size_kb(),
+            avif_size_priority: AvifSizePriority::default(),
             static_screenshot_format: default_static_screenshot_format(),
             auto_approve: false,
+        }
+    }
+}
+
+impl MiningConfig {
+    pub fn validate_avif_settings(&self) -> anyhow::Result<()> {
+        if self.avif_sizing_mode == AvifSizingMode::TargetSize && self.avif_target_size_kb == 0 {
+            bail!("Target image size must be at least 1 KB");
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod avif_settings_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_mining_settings_keep_duration_sizing() {
+        let config: MiningConfig =
+            serde_json::from_str(r#"{"avif_max_width":640,"avif_max_fps":15}"#).unwrap();
+        assert_eq!(config.avif_sizing_mode, AvifSizingMode::Duration);
+        assert_eq!(config.avif_target_size_kb, 500);
+        assert_eq!(config.avif_size_priority, AvifSizePriority::PreferQuality);
+        assert_eq!(config.avif_max_width, 640);
+        assert_eq!(config.avif_max_fps, 15);
+    }
+
+    #[test]
+    fn size_settings_round_trip_and_reject_invalid_values() {
+        for priority in [AvifSizePriority::PreferFps, AvifSizePriority::PreferQuality] {
+            let config = MiningConfig {
+                avif_sizing_mode: AvifSizingMode::TargetSize,
+                avif_target_size_kb: 256,
+                avif_size_priority: priority,
+                ..MiningConfig::default()
+            };
+            let mut loaded: MiningConfig =
+                serde_json::from_value(serde_json::to_value(config).unwrap()).unwrap();
+            assert_eq!(loaded.avif_sizing_mode, AvifSizingMode::TargetSize);
+            assert_eq!(loaded.avif_target_size_kb, 256);
+            assert_eq!(loaded.avif_size_priority, priority);
+            assert!(loaded.validate_avif_settings().is_ok());
+            loaded.avif_target_size_kb = 0;
+            assert!(loaded.validate_avif_settings().is_err());
+            loaded.avif_sizing_mode = AvifSizingMode::Duration;
+            assert!(loaded.validate_avif_settings().is_ok());
+        }
+        for value in [
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::Value::Null,
+        ] {
+            assert!(
+                serde_json::from_value::<MiningConfig>(
+                    serde_json::json!({"avif_target_size_kb": value})
+                )
+                .is_err()
+            );
         }
     }
 }
@@ -751,6 +840,9 @@ fn default_avif_max_width() -> u32 {
 }
 fn default_avif_max_fps() -> u32 {
     10
+}
+fn default_avif_target_size_kb() -> u32 {
+    500
 }
 fn default_static_screenshot_format() -> StaticScreenshotFormat {
     StaticScreenshotFormat::Webp

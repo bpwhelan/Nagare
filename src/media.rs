@@ -5,10 +5,10 @@ use tokio::process::Command;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use crate::config::{AnimatedScreenshotEncoder, AudioCodec, StaticScreenshotFormat};
+use crate::config::{AudioCodec, StaticScreenshotFormat};
 
-/// Set to true locally to force AVIF generation through the configured encoder's fallback path.
-const FORCE_AVIF_ENCODER_FALLBACK: bool = false;
+mod avif;
+pub use avif::generate_avif;
 
 /// Set to true locally to force static screenshot generation through its fallback path.
 const FORCE_SCREENSHOT_JPEG_FALLBACK: bool = false;
@@ -223,144 +223,6 @@ pub async fn extract_audio(
     Ok((output_path, data))
 }
 
-fn build_avif_command(
-    source: &str,
-    start_secs: f64,
-    duration: f64,
-    vf: &str,
-    crf: i32,
-    encoder: AnimatedScreenshotEncoder,
-    output_path: &Path,
-) -> Command {
-    let mut cmd = Command::new("ffmpeg");
-    for arg in http_input_args(source) {
-        cmd.arg(arg);
-    }
-    cmd.arg("-y")
-        .arg("-ss")
-        .arg(format!("{:.3}", start_secs))
-        .arg("-i")
-        .arg(source)
-        .arg("-t")
-        .arg(format!("{:.3}", duration))
-        .arg("-vf")
-        .arg(vf)
-        .arg("-c:v")
-        .arg(encoder.as_str())
-        .arg("-crf")
-        .arg(crf.to_string());
-
-    if encoder == AnimatedScreenshotEncoder::Libsvtav1 {
-        cmd.args(["-preset", "8"]);
-    }
-
-    cmd.arg("-an")
-        .arg("-movflags")
-        .arg("+faststart")
-        .arg(output_path);
-    cmd
-}
-
-/// Generate an animated AVIF from a video source.
-///
-/// `max_width` and `max_fps` are upper bounds: the source is never upscaled
-/// past them, and longer clips are scaled down further from these caps to keep
-/// the resulting file small (mirroring the adaptive tiers used in GSM).
-pub async fn generate_avif(
-    source: &str,
-    start_ms: i64,
-    end_ms: i64,
-    encoder: AnimatedScreenshotEncoder,
-    max_width: u32,
-    max_fps: u32,
-) -> Result<(PathBuf, Vec<u8>)> {
-    let id = Uuid::new_v4();
-    let output_path = temp_dir().join(format!("{}.avif", id));
-
-    let start_secs = start_ms as f64 / 1000.0;
-    let duration = (end_ms - start_ms) as f64 / 1000.0;
-
-    // Adaptive multipliers scale the configured caps down for longer clips.
-    let (fps_multiplier, width_multiplier, crf) = if duration > 10.0 {
-        (0.6, 0.75, 45)
-    } else if duration > 5.0 {
-        (0.8, 5.0 / 6.0, 42)
-    } else {
-        (1.0, 1.0, 40)
-    };
-
-    let fps = ((max_fps as f64 * fps_multiplier).round() as u32).max(1);
-    // Round the width cap down to an even value; AV1 encoders (notably
-    // SVT-AV1) reject odd dimensions for the YUV 4:2:0 colorspace.
-    let width = (((max_width as f64 * width_multiplier).round() as u32) & !1).max(2);
-
-    // `min(width,iw)` avoids upscaling past the source. `2*trunc(.../2)` clamps
-    // the result down to an even width even when the source width (`iw`) is odd,
-    // and `-2` keeps an even, aspect-correct height. Both are required by the
-    // AV1 encoders for YUV_420 (odd dimensions raise "must be even" errors).
-    let vf = format!("fps={},scale='2*trunc(min({},iw)/2)':-2", fps, width);
-
-    let primary_result = if FORCE_AVIF_ENCODER_FALLBACK {
-        Err(anyhow::anyhow!(
-            "forced AVIF encoder fallback via FORCE_AVIF_ENCODER_FALLBACK"
-        ))
-    } else {
-        run_ffmpeg(build_avif_command(
-            source,
-            start_secs,
-            duration,
-            &vf,
-            crf,
-            encoder,
-            &output_path,
-        ))
-        .await
-    };
-
-    if let Err(primary_error) = primary_result {
-        let fallback_encoder = encoder.fallback();
-        warn!(
-            "AVIF generation with {} failed; retrying with {}: {}",
-            encoder.as_str(),
-            fallback_encoder.as_str(),
-            primary_error
-        );
-        let _ = tokio::fs::remove_file(&output_path).await;
-        run_ffmpeg(build_avif_command(
-            source,
-            start_secs,
-            duration,
-            &vf,
-            crf,
-            fallback_encoder,
-            &output_path,
-        ))
-        .await
-        .map_err(|fallback_error| {
-            anyhow::anyhow!(
-                "ffmpeg AVIF generation failed with {} and {}\n{}: {}\n{}: {}",
-                encoder.as_str(),
-                fallback_encoder.as_str(),
-                encoder.as_str(),
-                primary_error,
-                fallback_encoder.as_str(),
-                fallback_error
-            )
-        })?;
-    }
-
-    let data = tokio::fs::read(&output_path).await?;
-    info!(
-        "Generated AVIF: {:.1}s, max {}px @ {}fps ({} bytes)",
-        duration,
-        width,
-        fps,
-        data.len()
-    );
-
-    Ok((output_path, data))
-}
-
 fn build_screenshot_command(
     source: &str,
     time_secs: f64,
@@ -390,6 +252,23 @@ fn build_screenshot_command(
         }
         StaticScreenshotFormat::Png => {
             cmd.args(["-c:v", "png", "-compression_level", "6"]);
+        }
+        StaticScreenshotFormat::Avif => {
+            cmd.args([
+                "-c:v",
+                "libaom-av1",
+                "-still-picture",
+                "1",
+                "-crf",
+                "30",
+                "-b:v",
+                "0",
+                "-cpu-used",
+                "6",
+                "-pix_fmt",
+                "yuv420p",
+                "-an",
+            ]);
         }
     }
 
