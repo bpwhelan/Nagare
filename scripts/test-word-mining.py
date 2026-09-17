@@ -238,6 +238,9 @@ def main():
         body = batch(workspace, ["食べる", "魚", "猫"])
         invalid = {**body, "revision": "outdated"}
         assert not request(base + path + "/jobs", invalid)["ok"]
+        invalid_audio = {**body, "settings": {**body["settings"], "audio_ordinal": 63}}
+        assert not request(base + path + "/jobs", invalid_audio)["ok"]
+        assert not request(base + f"/api/word-mining/jobs/{body['request_id']}")["ok"], "Invalid media must not leave a stranded batch"
         job = api(path + "/jobs", body)["job"]
         job = wait_job(job["id"])
         assert job["status"] == "needs_attention", job
@@ -293,6 +296,17 @@ def main():
         note = MockAnki.notes[job["cards"][0]["note_id"]]
         assert "[sound:" in note["fields"]["SentenceAudio"] and not note["fields"].get("Picture")
         print("PASS: Built-in vocabulary note type creation and audio-only mining", flush=True)
+        uploaded = api(audio_path + "/analyze", dict(split_mode="C", subtitle_name="replacement.srt",
+                       subtitle_text="\ufeff5\n00:00:01,250 --> 00:00:03,750\n国際連合で働く。\n\n19\n00:00:05,000 --> 00:00:07,000\n猫は寝ています。\n"))["workspace"]
+        assert uploaded["split_mode"] == "C" and uploaded["subtitle_name"] == "replacement.srt"
+        assert uploaded["track"]["lines"][0]["start_ms"] == 1250
+        assert len(uploaded["track"]["lines"]) == 2 and uploaded["revision"] != audio_workspace["revision"]
+        assert any(c["term"] == "国際連合" for c in uploaded["candidates"]), "Mode C should keep the compound"
+        original = request(base + "/api/history/jellyfin%7Caudio/subtitles")
+        assert len(original["lines"]) == len(LINES), "Uploads must not replace live/history subtitles"
+        assert len(api(f"/api/review/{job['id']}")["review"]["track"]["lines"]) == len(LINES)
+        assert not request(base + audio_path + "/jobs", batch(audio_workspace, ["猫"], fields=FIELDS, model="Nagare Vocabulary"))["ok"]
+        print("PASS: Subtitle upload, Sudachi compound mode, stale revision rejection, immutable review history", flush=True)
         print(f"All mining integration checks passed. Fixture: {directory}", flush=True)
         if args.serve:
             info = dict(base=base, history_url=base + "/history/jellyfin%7Cvideo/mine", directory=str(directory))
