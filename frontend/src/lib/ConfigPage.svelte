@@ -803,7 +803,7 @@
           }}
         >
           <strong>Daily sync</strong>
-          <span>Send all completed episodes once per day.</span>
+          <span>Send completed episodes and new audiobook progress once per day.</span>
         </button>
         <button
           type="button"
@@ -819,7 +819,7 @@
           <span>Check every five minutes; audiobook checkpoints wait for inactivity.</span>
         </button>
       </div>
-      <p class="hint">Completed episodes are ready at 80% watched with no more than 5 minutes remaining. AudioBookShelf audiobooks over 2 hours also appear here with their current uncredited playtime, so you can sync them manually if automatic sync misses them. Automatic audiobook syncing still uses its inactivity window. Durations round up to the next tenth of a minute.</p>
+      <p class="hint">Completed episodes are ready at 80% watched with no more than 5 minutes remaining. AudioBookShelf audiobooks over 2 hours also appear here with their current uncredited playtime for manual sync. Daily sync sends new audiobook progress at the scheduled hour once at least 30 uncredited minutes have accumulated. Automatic sync uses the same minimum and waits for inactivity. Durations round up to the next tenth of a minute.</p>
     </section>
 
     <section class="section">

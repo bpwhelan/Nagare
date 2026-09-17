@@ -127,6 +127,13 @@ const LONGFORM_TADOKU_MIN_SESSION_MS: i64 = 30 * 60 * 1_000;
 /// offer a card for a title that was only opened for a few seconds.
 const MANUAL_LONGFORM_MIN_PROGRESS_MS: i64 = 60 * 1_000;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TadokuBatchPolicy {
+    Manual,
+    Daily,
+    Automatic,
+}
+
 impl MiningHistoryEntry {
     pub fn dialog_state(&self) -> EnrichmentDialogState {
         EnrichmentDialogState {
@@ -248,17 +255,25 @@ impl AppDatabase {
             .context("SQLite mined-note card lookup task failed")?
     }
 
-    pub async fn prepare_tadoku_batches(
+    pub async fn prepare_daily_tadoku_batches(
         &self,
         export_date: String,
         language_code: String,
+        target_audio_language: String,
     ) -> anyhow::Result<Vec<TadokuExportBatch>> {
         let db_path = self.db_path.clone();
         tokio::task::spawn_blocking(move || {
-            prepare_tadoku_batches_sync(&db_path, &export_date, &language_code, None)
+            prepare_tadoku_batches_with_policy_sync(
+                &db_path,
+                &export_date,
+                &language_code,
+                None,
+                TadokuBatchPolicy::Daily,
+                Some(&target_audio_language),
+            )
         })
         .await
-        .context("SQLite Tadoku batch preparation task failed")?
+        .context("SQLite daily Tadoku batch preparation task failed")?
     }
 
     pub async fn prepare_automatic_tadoku_batches(
@@ -274,7 +289,7 @@ impl AppDatabase {
                 &export_date,
                 &language_code,
                 None,
-                true,
+                TadokuBatchPolicy::Automatic,
                 Some(&target_audio_language),
             )
         })
@@ -314,7 +329,7 @@ impl AppDatabase {
                 &export_date,
                 &language_code,
                 Some(&selected),
-                false,
+                TadokuBatchPolicy::Manual,
                 Some(&target_audio_language),
             )
         })
@@ -909,6 +924,7 @@ fn save_session_history_conn(
     Ok(())
 }
 
+#[cfg(test)]
 fn prepare_tadoku_batches_sync(
     db_path: &Path,
     export_date: &str,
@@ -920,8 +936,12 @@ fn prepare_tadoku_batches_sync(
         export_date,
         language_code,
         selected_history_ids,
-        false,
-        None,
+        if selected_history_ids.is_some() {
+            TadokuBatchPolicy::Manual
+        } else {
+            TadokuBatchPolicy::Daily
+        },
+        Some(language_code),
     )
 }
 
@@ -930,7 +950,7 @@ fn prepare_tadoku_batches_with_policy_sync(
     export_date: &str,
     language_code: &str,
     selected_history_ids: Option<&HashSet<String>>,
-    automatic: bool,
+    policy: TadokuBatchPolicy,
     target_audio_language: Option<&str>,
 ) -> anyhow::Result<Vec<TadokuExportBatch>> {
     let mut conn = open_connection(db_path)?;
@@ -940,12 +960,13 @@ fn prepare_tadoku_batches_with_policy_sync(
 
     refresh_pending_tadoku_batches(&tx, language_code)?;
 
-    if automatic {
+    if policy != TadokuBatchPolicy::Manual {
         prepare_longform_tadoku_checkpoints(
             &tx,
             export_date,
             language_code,
             target_audio_language.unwrap_or_default(),
+            policy,
         )?;
     }
 
@@ -960,23 +981,27 @@ fn prepare_tadoku_batches_with_policy_sync(
     };
 
     let mut candidates = query_tadoku_candidates(&tx, language_code)?;
-    if selected_history_ids.is_some() && !automatic {
+    if selected_history_ids.is_some() && policy == TadokuBatchPolicy::Manual {
         candidates.extend(query_manual_longform_tadoku_candidates(
             &tx,
             language_code,
             target_audio_language.unwrap_or(language_code),
         )?);
     }
-    if automatic {
-        // Completed episodes can sync promptly. The 30-minute inactivity and
-        // minimum-progress rule belongs only to the AudioBookShelf long-form
-        // path below, not to ordinary anime episodes.
+    if policy != TadokuBatchPolicy::Manual {
+        // Both scheduled modes use incremental checkpoints for long books,
+        // even when the book has reached the completed-media threshold.
         let now = Utc::now();
         candidates.retain(|candidate| {
             if candidate.server_kind == MediaServerKind::Audiobookshelf.as_str()
                 && candidate.duration_ms > LONGFORM_TADOKU_THRESHOLD_MS
             {
                 return false;
+            }
+            // Daily sync continues to include all completed episodes since
+            // the candidate cutoff. Only automatic sync requires recency.
+            if policy == TadokuBatchPolicy::Daily {
+                return true;
             }
             let target_language = target_audio_language.unwrap_or_default();
             if !tadoku_audio_matches_target(
@@ -1110,11 +1135,20 @@ fn prepare_tadoku_batches_with_policy_sync(
     for batch in &mut batches {
         batch.file_paths = tadoku_batch_file_paths(&conn, &batch.batch_id)?;
     }
-    if automatic {
+    if policy != TadokuBatchPolicy::Manual {
         let target_language = target_audio_language.unwrap_or_default();
         let mut eligible_batches = Vec::new();
         for batch in batches {
-            if tadoku_batch_is_automatically_eligible(&conn, &batch.batch_id, target_language)? {
+            // Preserve daily completed-episode retries; audiobook checkpoints
+            // use the same language guard as automatic sync.
+            if (policy == TadokuBatchPolicy::Daily && !batch.is_longform_checkpoint)
+                || tadoku_batch_is_scheduled_eligible(
+                    &conn,
+                    &batch.batch_id,
+                    target_language,
+                    policy,
+                )?
+            {
                 eligible_batches.push(batch);
             }
         }
@@ -1123,14 +1157,13 @@ fn prepare_tadoku_batches_with_policy_sync(
     Ok(batches)
 }
 
-/// Pending batches can outlive an automatic exporter restart. Recheck their
-/// source items at export time so an old batch never bypasses the current
-/// target-language, playback-duration, or recency rules. The batch remains in
-/// manual review when it is not eligible for automatic sync.
-fn tadoku_batch_is_automatically_eligible(
+/// Recheck pending batches against the scheduled mode's language and timing
+/// rules. Daily audiobook snapshots do not expire between scheduled runs.
+fn tadoku_batch_is_scheduled_eligible(
     conn: &Connection,
     batch_id: &str,
     target_language: &str,
+    policy: TadokuBatchPolicy,
 ) -> anyhow::Result<bool> {
     if target_language.is_empty() {
         return Ok(false);
@@ -1174,7 +1207,9 @@ fn tadoku_batch_is_automatically_eligible(
                 &audio_languages,
                 file_path.as_deref(),
                 target_language,
-            ) && if is_longform_checkpoint {
+            ) && if policy == TadokuBatchPolicy::Daily {
+                true
+            } else if is_longform_checkpoint {
                 automatic_tadoku_longform_session_is_eligible(&last_seen, position_ms, now)
             } else {
                 automatic_tadoku_completed_media_is_recent(&last_seen, now)
@@ -1183,19 +1218,17 @@ fn tadoku_batch_is_automatically_eligible(
     ))
 }
 
-/// Prepare one batch for each recent, substantial listening session of
-/// AudioBookShelf media whose maximum runtime is over two hours. A session must have at least 30
-/// minutes of new progress, then be inactive for 30 minutes but no longer than
-/// an hour, so old history cannot be exported as current listening.
+/// Prepare incremental batches for AudioBookShelf media over two hours with
+/// at least 30 minutes of uncredited progress. Automatic sync requires 30–60
+/// minutes of inactivity; daily sync snapshots progress at its scheduled hour.
 fn prepare_longform_tadoku_checkpoints(
     conn: &Connection,
     export_date: &str,
     language_code: &str,
     target_audio_language: &str,
+    policy: TadokuBatchPolicy,
 ) -> anyhow::Result<()> {
     let now = Utc::now();
-    let inactivity_cutoff = now - chrono::Duration::minutes(30);
-    let recency_cutoff = now - chrono::Duration::hours(1);
     let mut candidate_stmt = conn.prepare(
         "
         SELECT
@@ -1274,16 +1307,15 @@ fn prepare_longform_tadoku_checkpoints(
         ) {
             continue;
         }
-        let last_activity = parse_timestamp(&watched_at)
-            .with_context(|| format!("Invalid last-playback timestamp for history {history_id}"))?;
-        if !(recency_cutoff..=inactivity_cutoff).contains(&last_activity) {
-            continue;
-        }
-
         let checkpoint_ms = position_ms.clamp(0, duration_ms);
         let credited_ms = credited_seconds.saturating_mul(1_000);
         let unsynced_ms = checkpoint_ms.saturating_sub(credited_ms);
         if unsynced_ms < LONGFORM_TADOKU_MIN_SESSION_MS {
+            continue;
+        }
+        if policy == TadokuBatchPolicy::Automatic
+            && !automatic_tadoku_longform_session_is_eligible(&watched_at, unsynced_ms, now)
+        {
             continue;
         }
 
@@ -2485,9 +2517,10 @@ fn parse_timestamp(raw: &str) -> Result<DateTime<Utc>, std::io::Error> {
 #[cfg(test)]
 mod tests {
     use super::{
-        decline_tadoku_candidates_sync, list_tadoku_candidates_sync, open_connection,
-        prepare_tadoku_batches_sync, prepare_tadoku_batches_with_policy_sync,
-        save_session_history_sync, set_tadoku_candidate_title_sync,
+        AppDatabase, TadokuBatchPolicy, decline_tadoku_candidates_sync,
+        list_tadoku_candidates_sync, open_connection, prepare_tadoku_batches_sync,
+        prepare_tadoku_batches_with_policy_sync, save_session_history_sync,
+        set_tadoku_candidate_title_sync,
     };
     use crate::config::MediaServerKind;
     use crate::session::HistoryEntry;
@@ -2759,7 +2792,7 @@ mod tests {
             "2026-08-24",
             "jpn",
             None,
-            true,
+            TadokuBatchPolicy::Automatic,
             Some("jpn"),
         )
         .unwrap();
@@ -2775,7 +2808,7 @@ mod tests {
             "2026-08-24",
             "jpn",
             None,
-            true,
+            TadokuBatchPolicy::Automatic,
             Some("jpn"),
         )
         .unwrap();
@@ -2791,7 +2824,7 @@ mod tests {
             "2026-08-24",
             "jpn",
             None,
-            true,
+            TadokuBatchPolicy::Automatic,
             Some("jpn"),
         )
         .unwrap();
@@ -2804,7 +2837,7 @@ mod tests {
             "2026-08-24",
             "jpn",
             None,
-            true,
+            TadokuBatchPolicy::Automatic,
             Some("jpn"),
         )
         .unwrap();
@@ -2826,7 +2859,7 @@ mod tests {
             "2026-08-24",
             "jpn",
             None,
-            true,
+            TadokuBatchPolicy::Automatic,
             Some("jpn"),
         )
         .unwrap();
@@ -2848,6 +2881,248 @@ mod tests {
             .unwrap();
         assert_eq!(completed_batch, ("completed".to_string(), 5 * 60 * 60));
         drop(conn);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn daily_tadoku_syncs_incremental_audiobook_progress_once_per_day() {
+        let path = std::env::temp_dir().join(format!(
+            "nagare-tadoku-daily-longform-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let db = AppDatabase::new(path.clone(), None).await.unwrap();
+        let conn = open_connection(&path).unwrap();
+        conn.execute(
+            "UPDATE app_metadata SET value = ?1 WHERE key = 'tadoku_candidate_cutoff'",
+            [(Utc::now() - Duration::days(3)).to_rfc3339()],
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut book = history_entry("daily-book", "Daily book", 45 * 60 * 1_000);
+        book.history_id = "audiobookshelf|daily-book".into();
+        book.server_kind = MediaServerKind::Audiobookshelf;
+        book.duration_ms = Some(5 * 60 * 60 * 1_000);
+        book.last_seen = Utc::now() - Duration::hours(8);
+        let book_id = book.history_id.clone();
+        let mut episode = history_entry("daily-episode", "Daily show", 25 * 60 * 1_000);
+        episode.duration_ms = Some(25 * 60 * 1_000);
+        episode.last_seen = Utc::now() - Duration::hours(12);
+        let mut history = HashMap::from([
+            (book_id.clone(), book),
+            (episode.history_id.clone(), episode),
+        ]);
+        save_session_history_sync(&path, &history, None).unwrap();
+
+        let first_date = "2026-09-13".to_string();
+        assert!(db.tadoku_export_due(first_date.clone()).await.unwrap());
+        db.mark_tadoku_run_started(first_date.clone())
+            .await
+            .unwrap();
+        let first = db
+            .prepare_daily_tadoku_batches(first_date.clone(), "jpn".into(), "jpn".into())
+            .await
+            .unwrap();
+        assert_eq!(first.len(), 2);
+        let checkpoint = first
+            .iter()
+            .find(|batch| batch.is_longform_checkpoint)
+            .unwrap();
+        assert_eq!(checkpoint.duration_seconds, 45 * 60);
+        assert_eq!(
+            first
+                .iter()
+                .find(|batch| !batch.is_longform_checkpoint)
+                .unwrap()
+                .duration_seconds,
+            25 * 60
+        );
+
+        // Retrying a failed snapshot does not add the already-pending credit.
+        db.mark_tadoku_batch_failed(checkpoint.batch_id.clone(), "Retry later".into())
+            .await
+            .unwrap();
+        history.get_mut(&book_id).unwrap().last_position_ms = 60 * 60 * 1_000;
+        save_session_history_sync(&path, &history, None).unwrap();
+        let retry = db
+            .prepare_daily_tadoku_batches(first_date.clone(), "jpn".into(), "jpn".into())
+            .await
+            .unwrap();
+        assert_eq!(retry.len(), 2);
+        for batch in &first {
+            assert!(
+                retry
+                    .iter()
+                    .any(|retried| retried.batch_id == batch.batch_id
+                        && retried.duration_seconds == batch.duration_seconds)
+            );
+            db.mark_tadoku_batch_completed(
+                batch.batch_id.clone(),
+                format!("log-{}", batch.batch_id),
+            )
+            .await
+            .unwrap();
+        }
+        db.mark_tadoku_run_finished(first_date.clone(), None)
+            .await
+            .unwrap();
+
+        // More listening after today's successful run waits for the next day.
+        history.get_mut(&book_id).unwrap().last_position_ms = 120 * 60 * 1_000;
+        history.get_mut(&book_id).unwrap().last_seen = Utc::now();
+        save_session_history_sync(&path, &history, None).unwrap();
+        assert!(!db.tadoku_export_due(first_date).await.unwrap());
+        let second_date = "2026-09-14".to_string();
+        assert!(db.tadoku_export_due(second_date.clone()).await.unwrap());
+        let second = db
+            .prepare_daily_tadoku_batches(second_date.clone(), "jpn".into(), "jpn".into())
+            .await
+            .unwrap();
+        assert_eq!(second.len(), 1);
+        assert!(second[0].is_longform_checkpoint);
+        assert_eq!(second[0].duration_seconds, 75 * 60);
+        db.mark_tadoku_batch_completed(second[0].batch_id.clone(), "second-log".into())
+            .await
+            .unwrap();
+        db.mark_tadoku_run_finished(second_date.clone(), None)
+            .await
+            .unwrap();
+        assert!(!db.tadoku_export_due(second_date.clone()).await.unwrap());
+        assert!(
+            db.prepare_daily_tadoku_batches(second_date, "jpn".into(), "jpn".into())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // Finishing the book exports only its remaining uncredited playtime.
+        history.get_mut(&book_id).unwrap().last_position_ms = 5 * 60 * 60 * 1_000;
+        save_session_history_sync(&path, &history, None).unwrap();
+        let final_batches = db
+            .prepare_daily_tadoku_batches("2026-09-15".into(), "jpn".into(), "jpn".into())
+            .await
+            .unwrap();
+        assert_eq!(final_batches.len(), 1);
+        assert!(final_batches[0].is_longform_checkpoint);
+        assert_eq!(final_batches[0].duration_seconds, 180 * 60);
+        db.mark_tadoku_batch_completed(final_batches[0].batch_id.clone(), "final-log".into())
+            .await
+            .unwrap();
+        assert!(
+            db.prepare_daily_tadoku_batches("2026-09-16".into(), "jpn".into(), "jpn".into())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn daily_tadoku_longform_keeps_progress_language_and_history_guards() {
+        let path = std::env::temp_dir().join(format!(
+            "nagare-tadoku-daily-longform-guards-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let conn = open_connection(&path).unwrap();
+        conn.execute(
+            "UPDATE app_metadata SET value = ?1 WHERE key = 'tadoku_candidate_cutoff'",
+            [(Utc::now() - Duration::days(3)).to_rfc3339()],
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut history = HashMap::new();
+        for (id, progress_minutes, age_hours, language, server_kind, duration_hours) in [
+            ("minimum", 30, 8, "jpn", MediaServerKind::Audiobookshelf, 5),
+            ("active", 45, 0, "jpn", MediaServerKind::Audiobookshelf, 5),
+            (
+                "missed-day",
+                45,
+                48,
+                "jpn",
+                MediaServerKind::Audiobookshelf,
+                5,
+            ),
+            (
+                "too-short",
+                29,
+                8,
+                "jpn",
+                MediaServerKind::Audiobookshelf,
+                5,
+            ),
+            (
+                "wrong-language",
+                45,
+                8,
+                "eng",
+                MediaServerKind::Audiobookshelf,
+                5,
+            ),
+            (
+                "completed-wrong-language",
+                300,
+                8,
+                "eng",
+                MediaServerKind::Audiobookshelf,
+                5,
+            ),
+            (
+                "short-book",
+                45,
+                8,
+                "jpn",
+                MediaServerKind::Audiobookshelf,
+                2,
+            ),
+            ("movie", 45, 8, "jpn", MediaServerKind::Plex, 5),
+            (
+                "before-cutoff",
+                45,
+                96,
+                "jpn",
+                MediaServerKind::Audiobookshelf,
+                5,
+            ),
+            ("declined", 45, 8, "jpn", MediaServerKind::Audiobookshelf, 5),
+        ] {
+            let mut book = history_entry(id, id, progress_minutes * 60 * 1_000);
+            book.history_id = format!("{}|{id}", server_kind.as_str());
+            book.server_kind = server_kind;
+            book.duration_ms = Some(duration_hours * 60 * 60 * 1_000);
+            book.last_seen = Utc::now() - Duration::hours(age_hours);
+            book.audio_languages = vec![language.into()];
+            history.insert(book.history_id.clone(), book);
+        }
+        save_session_history_sync(&path, &history, None).unwrap();
+        decline_tadoku_candidates_sync(&path, &["audiobookshelf|declined".into()]).unwrap();
+        let batches = prepare_tadoku_batches_sync(&path, "2026-09-14", "jpn", None).unwrap();
+        let mut exported = batches
+            .iter()
+            .map(|batch| {
+                assert!(batch.is_longform_checkpoint);
+                (batch.series_name.as_str(), batch.duration_seconds)
+            })
+            .collect::<Vec<_>>();
+        exported.sort_unstable();
+        assert_eq!(
+            exported,
+            vec![
+                ("active", 45 * 60),
+                ("minimum", 30 * 60),
+                ("missed-day", 45 * 60)
+            ]
+        );
+
+        // A pending checkpoint is rechecked if its language metadata changes.
+        history
+            .get_mut("audiobookshelf|active")
+            .unwrap()
+            .audio_languages = vec!["eng".into()];
+        save_session_history_sync(&path, &history, None).unwrap();
+        let retry = prepare_tadoku_batches_sync(&path, "2026-09-15", "jpn", None).unwrap();
+        assert_eq!(retry.len(), 2);
+        assert!(retry.iter().all(|batch| batch.series_name != "active"));
         std::fs::remove_file(path).unwrap();
     }
 
@@ -2877,7 +3152,7 @@ mod tests {
             "2026-08-24",
             "jpn",
             None,
-            true,
+            TadokuBatchPolicy::Automatic,
             Some("jpn"),
         )
         .unwrap();
@@ -2904,7 +3179,7 @@ mod tests {
             "2026-08-24",
             "jpn",
             None,
-            true,
+            TadokuBatchPolicy::Automatic,
             Some("jpn"),
         )
         .unwrap();
@@ -2939,7 +3214,7 @@ mod tests {
             "2026-08-24",
             "jpn",
             None,
-            true,
+            TadokuBatchPolicy::Automatic,
             Some("jpn"),
         )
         .unwrap();
@@ -2983,7 +3258,7 @@ mod tests {
             "2026-08-24",
             "jpn",
             None,
-            true,
+            TadokuBatchPolicy::Automatic,
             Some("jpn"),
         )
         .unwrap();
@@ -3035,7 +3310,7 @@ mod tests {
             "2026-08-24",
             "jpn",
             None,
-            true,
+            TadokuBatchPolicy::Automatic,
             Some("jpn"),
         )
         .unwrap();
@@ -3053,7 +3328,7 @@ mod tests {
             "2026-08-24",
             "jpn",
             Some(&selected),
-            false,
+            TadokuBatchPolicy::Manual,
             Some("jpn"),
         )
         .unwrap();
@@ -3088,7 +3363,7 @@ mod tests {
                 "2026-09-13",
                 "jpn",
                 Some(&selected),
-                false,
+                TadokuBatchPolicy::Manual,
                 Some("jpn"),
             )
             .unwrap()
@@ -3167,7 +3442,7 @@ mod tests {
             "2026-08-24",
             "jpn",
             None,
-            true,
+            TadokuBatchPolicy::Automatic,
             Some("jpn"),
         )
         .unwrap();

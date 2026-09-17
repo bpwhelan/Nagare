@@ -852,7 +852,7 @@ async fn export(
                 .await?
         }
         None => {
-            db.prepare_tadoku_batches(eastern_date, language_code)
+            db.prepare_daily_tadoku_batches(eastern_date, language_code, target_audio_language)
                 .await?
         }
     };
