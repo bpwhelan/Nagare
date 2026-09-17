@@ -158,7 +158,7 @@
                 {/if}
                 <span class="meta-time">{timeAgo(item.last_seen)}</span>
               </div>
-              <div class="watch-actions"><button on:click={() => handleActivate(item)}>Open subtitles</button><button on:click={() => { historyFilter = item.history_id; activeTab = 'sessions'; }}>Review cards ({sessions.filter(s => s.history_id === item.history_id).reduce((n,s) => n + s.card_count, 0)})</button></div>
+              <div class="watch-actions"><button on:click={() => navigate(`/history/${encodeURIComponent(item.history_id)}/mine`)}>Mine words</button><button on:click={() => handleActivate(item)}>Open subtitles</button><button on:click={() => { historyFilter = item.history_id; activeTab = 'sessions'; }}>Review cards ({sessions.filter(s => s.history_id === item.history_id).reduce((n,s) => n + s.card_count, 0)})</button></div>
             </div>
           {/each}
         </div>

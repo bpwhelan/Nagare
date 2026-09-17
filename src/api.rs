@@ -76,6 +76,7 @@ pub struct AppState {
 
 pub fn create_router(state: Arc<AppState>) -> Router {
     Router::new()
+        .merge(crate::word_mining::router())
         .route("/api/companion", get(crate::companion::snapshot))
         .route("/api/state", get(get_state))
         .route("/api/sessions", get(get_sessions))
@@ -1812,7 +1813,15 @@ async fn perform_enrichment(
         );
 
         info!("[enhance {}] Reading config...", note_id);
-        let config = state.config.read().await.clone();
+        let mut config = state.config.read().await.clone();
+        if let Some(fields) = crate::word_mining::db::note_fields(state.db.db_path.clone(), note_id)
+            .await.map_err(|e| e.to_string())? {
+            config.anki.fields.sentence = fields.sentence;
+            config.anki.fields.sentence_audio = fields.audio;
+            config.anki.fields.picture = fields.picture;
+            config.anki.fields.source_name = Some(fields.source);
+            config.anki.fields.sentence_translation = None;
+        }
         info!("[enhance {}] Getting server...", note_id);
         let server_opt = get_server(state, media_ctx.server_kind).await;
         info!("[enhance {}] Reading anki client...", note_id);
@@ -2036,6 +2045,7 @@ async fn perform_enrichment(
             note_id,
             fields.len()
         );
+        fields.retain(|name, _| !name.is_empty());
         if let Err(error) = anki_client
             .update_note_fields(req.note_id, fields.clone(), None, None)
             .await

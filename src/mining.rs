@@ -480,7 +480,8 @@ fn init_database(path: &Path, legacy_db_path: Option<&Path>) -> anyhow::Result<(
 
     let conn = open_connection(path)?;
     crate::review::initialize(&conn)?;
-    crate::kechimochi::initialize(&conn)
+    crate::kechimochi::initialize(&conn)?;
+    crate::word_mining::db::initialize(&conn)
 }
 
 pub(crate) fn open_connection(path: &Path) -> anyhow::Result<Connection> {

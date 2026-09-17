@@ -1,4 +1,5 @@
 mod anki;
+mod word_mining;
 mod api;
 mod companion;
 mod config;

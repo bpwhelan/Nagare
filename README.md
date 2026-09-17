@@ -59,6 +59,7 @@ Nagare watches your active media server playback sessions, displays a live subti
 - Playback controls (seek, pause, resume) from the browser.
 - Yomitan-aware pause behavior. (Must turn off Secure Popup in Yomitan) 
 - Watch history for mining after playback ends
+- Sudachi vocabulary mining from each History file: discover words, preview scenes, and create individual or bulk Anki cards. See [Word mining](docs/word-mining.md).
 - Session card review with saved SRT snapshots, review progress, context expansion, and audio previews
 - Multi-server support (Emby + Jellyfin + Plex + AudioBookShelf simultaneously)
 - Manual-review, daily, or automatic Tadoku listening-log sync, grouped by show with duplicate protection

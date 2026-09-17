@@ -33,6 +33,7 @@
   import EnrichDialog from './lib/EnrichDialog.svelte';
   import ConfigPage from './lib/ConfigPage.svelte';
   import HistoryPage from './lib/HistoryPage.svelte';
+  import WordMining from './lib/WordMining.svelte';
   import SessionReview from './lib/SessionReview.svelte';
   import AutoEnhance from './lib/AutoEnhance.svelte';
   import ToastContainer from './lib/ToastContainer.svelte';
@@ -186,17 +187,21 @@
     ? `note:${$route.noteId}`
     : $route.name === 'mine_card'
       ? `card:${$route.cardId}`
-      : $route.name === 'review' ? `review:${$route.sessionId}` : 'home';
+      : $route.name === 'review' ? `review:${$route.sessionId}`
+      : $route.name === 'word_mining' ? `words:${$route.historyId}` : 'home';
 
   $: if (routeKey !== lastRouteKey) {
     lastRouteKey = routeKey;
     routeRequestId++;
-    if ($route.name === 'review') {
+    if ($route.name === 'word_mining') {
+      dialogCard.set(null);
+      currentView.set('word_mining');
+    } else if ($route.name === 'review') {
       dialogCard.set(null);
       currentView.set('review');
     } else if (routeKey === 'home') {
       dialogCard.set(null);
-      if ($currentView === 'review') currentView.set('history');
+      if (['review', 'word_mining'].includes($currentView)) currentView.set('history');
     } else {
       hydrateDialogRoute($route);
     }
@@ -205,7 +210,7 @@
 
 <svelte:window on:popstate={syncRouteFromLocation} />
 
-<div class="app" class:mobile-playing={$isPlaying && !mobileChrome} class:review-open={$currentView === 'review'}>
+<div class="app" class:mobile-playing={$isPlaying && !mobileChrome} class:review-open={['review', 'word_mining'].includes($currentView)}>
   <!-- Top bar -->
   <header class="topbar">
     <!-- Desktop: full topbar always. Mobile-playing: compact. Mobile-paused: compact. -->
@@ -327,6 +332,8 @@
       <HistoryPage />
     {:else if $currentView === 'review' && $route.name === 'review'}
       {#key $route.sessionId}<SessionReview sessionId={$route.sessionId} />{/key}
+    {:else if $currentView === 'word_mining' && $route.name === 'word_mining'}
+      {#key $route.historyId}<WordMining historyId={$route.historyId} />{/key}
     {:else if $currentView === 'config'}
       <ConfigPage />
     {/if}

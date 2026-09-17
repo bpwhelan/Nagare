@@ -102,6 +102,11 @@ export function applyAudioTracksPayload(payload) {
 }
 
 function parseRoute(pathname = location.pathname) {
+  const miningMatch = pathname.match(/^\/history\/([^/]+)\/mine$/);
+  if (miningMatch) {
+    try { return { name: 'word_mining', historyId: decodeURIComponent(miningMatch[1]) }; }
+    catch { return { name: 'home' }; }
+  }
   const reviewMatch = pathname.match(/^\/review\/([^/]+)$/);
   if (reviewMatch) {
     try { return { name: 'review', sessionId: decodeURIComponent(reviewMatch[1]) }; }

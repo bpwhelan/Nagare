@@ -37,3 +37,7 @@ futures-util = "0.3"
 async-trait = "0.1"
 rusqlite = { version = "0.32", features = ["bundled"] }
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
+sudachi = { git = "https://github.com/WorksApplications/sudachi.rs.git", rev = "90fd6068c80c2fc3b63e0dbab0e341475bad4d8f" }
+zip = { version = "2", default-features = false, features = ["deflate"] }
+flate2 = "1"
+tar = "0.4"

@@ -216,7 +216,7 @@ impl AnkiClient {
         }
     }
 
-    async fn invoke(&self, action: &str, params: Value) -> anyhow::Result<Value> {
+    pub(crate) async fn invoke(&self, action: &str, params: Value) -> anyhow::Result<Value> {
         self.invoke_retried(action, params, 0).await
     }
 
@@ -450,6 +450,10 @@ pub fn note_info_to_event(note: NoteInfo, sentence_field: &str) -> NewCardEvent 
 /// 3. Require-tag whitelist
 /// 4. Media-field population (skip only when *all* configured fields already have values)
 fn should_skip_note(note: &NoteInfo, cfg: &AnkiConfig) -> bool {
+    // The history miner creates complete cards and records its own exact source.
+    if note.tags.iter().any(|tag| tag == "nagare::word_miner") {
+        return true;
+    }
     let sentence = note
         .fields
         .get(&cfg.fields.sentence)
