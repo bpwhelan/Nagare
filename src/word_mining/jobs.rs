@@ -276,6 +276,7 @@ async fn record_card(state: &Arc<AppState>, job: &Job, index: usize) -> anyhow::
         included_line_last: Some(draft.last),
         card_ids: vec![],
         source: EnrichmentSource::MiningHistory,
+        skip_confirmation: false,
         updated_at: Some(chrono::Utc::now()),
     };
     db::save_note_fields(

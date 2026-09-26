@@ -6,7 +6,7 @@ import { DEFAULTS } from './src/userscript/settings.js';
 const header = `// ==UserScript==
 // @name         Nagare Companion
 // @namespace    https://github.com/bpwhelan/Nagare
-// @version      0.1.1
+// @version      0.1.3
 // @description  Nagare subtitles, context, and Anki enhancement alongside your player.
 // @homepageURL  https://github.com/bpwhelan/Nagare
 // @match        https://*/*

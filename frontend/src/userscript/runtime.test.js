@@ -30,3 +30,14 @@ test('proxy login pages and connection failures produce actionable errors', asyn
   await assert.rejects(promise, /allow it in your userscript manager/);
   assert.equal(runtime.requestState().mutations, 0);
 });
+
+test('slow media previews and diagnostics never block receipt of new cards', async () => {
+  const before = runtime.requestState();
+  const preview = runtime.requestJson('/api/preview-audio', { method: 'POST' });
+  const report = runtime.requestJson('/api/enrich/client-event', { method: 'POST' });
+  assert.deepEqual(runtime.requestState(), before);
+  requests.pop().onload({ status: 200, responseText: '{"ok":true}' });
+  requests.pop().onload({ status: 200, responseText: '{"audio_base64":""}' });
+  await Promise.all([preview, report]);
+  assert.deepEqual(runtime.requestState(), before);
+});

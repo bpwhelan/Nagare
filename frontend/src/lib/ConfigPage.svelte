@@ -91,6 +91,8 @@
     if (!config.anki.fields) config.anki.fields = {};
     if (!config.path_mappings) config.path_mappings = [];
     if (!config.anki.add_tags) config.anki.add_tags = [];
+    if (!config.anki.remove_tags) config.anki.remove_tags = [];
+    if (!config.anki.skip_confirmation_tags) config.anki.skip_confirmation_tags = [];
     if (config.anki.series_tag_enabled == null) config.anki.series_tag_enabled = false;
     if (config.anki.series_tag_parent == null) config.anki.series_tag_parent = '';
     if (!config.anki.ignore_tags) config.anki.ignore_tags = [];
@@ -776,6 +778,14 @@
     </section>
     {/if}
 
+    {#if activeTab === 'server'}
+      <details class="database-tools">
+        <summary>Advanced maintenance</summary>
+        <p class="hint">Inspect or repair Nagare’s live SQLite database. Intended for manual troubleshooting.</p>
+        <a href="/database.html" target="_blank" rel="noopener noreferrer">Open database viewer ↗</a>
+      </details>
+    {/if}
+
     {#if activeTab === 'tadoku'}
     <p class="hint tab-hint">Review completed episodes yourself, sync daily, or sync automatically as you finish watching.</p>
 
@@ -918,7 +928,7 @@
             on:click={() => syncTadokuEpisodes(tadokuCandidates.map((candidate) => candidate.history_id))}
           >Sync all ({tadokuCandidates.length})</button>
         </div>
-        <p class="hint tadoku-decline-hint">Declined episodes stay in Nagare history and will never be sent to Tadoku.</p>
+        <p class="hint tadoku-decline-hint">Declined watches stay in Nagare history and will never be sent to Tadoku. A confirmed rewatch can be logged separately.</p>
       {/if}
     </section>
 
@@ -1082,6 +1092,37 @@
             on:keydown={(e) => handleTagKeydown(e, 'add_tags')} />
           <button class="btn-small" on:click={() => addTag('add_tags')}>Add</button>
         </div>
+      </div>
+
+      <div class="field">
+        <!-- svelte-ignore a11y_label_has_associated_control -->
+        <label>Remove Tags <span class="hint">(removed after successful enhancement)</span></label>
+        <div class="tag-list">
+          {#each config.anki.remove_tags as tag, i}
+            <span class="tag">{tag} <button on:click={() => removeTag('remove_tags', i)}>✕</button></span>
+          {/each}
+        </div>
+        <div class="tag-input-row">
+          <input id="tag-input-remove_tags" type="text" placeholder="Add tag..."
+            on:keydown={(e) => handleTagKeydown(e, 'remove_tags')} />
+          <button class="btn-small" on:click={() => addTag('remove_tags')}>Add</button>
+        </div>
+      </div>
+
+      <div class="field">
+        <!-- svelte-ignore a11y_label_has_associated_control -->
+        <label>Skip Confirmation Tags <span class="hint">(automatically enhance new cards with any of these tags)</span></label>
+        <div class="tag-list">
+          {#each config.anki.skip_confirmation_tags as tag, i}
+            <span class="tag">{tag} <button on:click={() => removeTag('skip_confirmation_tags', i)}>✕</button></span>
+          {/each}
+        </div>
+        <div class="tag-input-row">
+          <input id="tag-input-skip_confirmation_tags" type="text" placeholder="Add tag..."
+            on:keydown={(e) => handleTagKeydown(e, 'skip_confirmation_tags')} />
+          <button class="btn-small" on:click={() => addTag('skip_confirmation_tags')}>Add</button>
+        </div>
+        <p class="hint">Applies in a browser that is open and mining; failed enhancements still require manual review.</p>
       </div>
 
       <div class="field">
@@ -1263,6 +1304,10 @@
 </div>
 
 <style>
+  .database-tools { margin: 2rem 0 1rem; border-top: 1px solid var(--border); padding-top: 0.75rem; }
+  .database-tools summary { cursor: pointer; font-size: 0.8rem; color: var(--text-secondary); }
+  .database-tools p { margin: 0.75rem 0; }
+  .database-tools a { color: var(--text-secondary); font-size: 0.85rem; }
   .browser-companion { margin-top: 1rem; border-top: 1px solid var(--border); padding-top: 0.75rem; }
   .browser-companion summary { cursor: pointer; font-size: 0.85rem; color: var(--text-secondary); }
   .browser-companion p { margin: 0.6rem 0; }

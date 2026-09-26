@@ -680,6 +680,9 @@ fn find_listening_unit<'a>(
 
 fn tadoku_tags(config: &TadokuConfig, batch: &TadokuExportBatch) -> Vec<String> {
     let mut tags = vec!["nagare".to_string()];
+    if batch.has_rewatch {
+        tags.push(rewatch_batch_tag(batch));
+    }
     for rule in &config.path_tag_rules {
         let needle = rule.contains.to_lowercase();
         if batch
@@ -694,6 +697,38 @@ fn tadoku_tags(config: &TadokuConfig, batch: &TadokuExportBatch) -> Vec<String> 
         }
     }
     tags
+}
+
+fn rewatch_batch_tag(batch: &TadokuExportBatch) -> String {
+    format!("nagare-watch-{}", batch.batch_id)
+}
+
+fn matching_existing_log<'a>(
+    batch: &TadokuExportBatch,
+    existing: &'a HashMap<String, TadokuLog>,
+) -> Option<&'a TadokuLog> {
+    batch
+        .tadoku_log_id
+        .as_deref()
+        .and_then(|id| existing.get(id))
+        .or_else(|| {
+            if batch.has_rewatch {
+                // A rewatch may have exactly the same title and runtime as an old
+                // log. Match only its persisted batch identity, including when a
+                // previous POST succeeded but its response was lost.
+                let marker = rewatch_batch_tag(batch);
+                existing
+                    .values()
+                    .find(|log| log.tags.iter().any(|tag| tag == &marker))
+            } else if batch.is_longform_checkpoint {
+                None
+            } else {
+                existing.values().find(|log| {
+                    log.description.as_deref() == Some(&batch.description)
+                        && !log.tags.iter().any(|tag| tag.starts_with("nagare-watch-"))
+                })
+            }
+        })
 }
 
 fn tadoku_minutes(duration_seconds: i32) -> f64 {
@@ -872,19 +907,7 @@ async fn export(
         } else {
             &connection.listening_minutes_unit
         };
-        let existing_log = batch
-            .tadoku_log_id
-            .as_deref()
-            .and_then(|log_id| existing.get(log_id))
-            .or_else(|| {
-                if batch.is_longform_checkpoint {
-                    None
-                } else {
-                    existing
-                        .values()
-                        .find(|log| log.description.as_deref() == Some(&batch.description))
-                }
-            });
+        let existing_log = matching_existing_log(&batch, &existing);
         let result = if let Some(log) = existing_log {
             info!(
                 "Tadoku batch {} already exists remotely as {}; verifying it locally",
@@ -1042,7 +1065,7 @@ mod tests {
     use super::{
         Activity, CreateLogRequest, Language, Registration, RegistrationContest, TadokuClient,
         TadokuLog, TadokuUnit, eastern_time, eligible_registration_ids, extract_cookie_value,
-        tadoku_log_unit_matches, tadoku_minutes, tadoku_tags,
+        matching_existing_log, tadoku_log_unit_matches, tadoku_minutes, tadoku_tags,
     };
     use crate::config::TadokuConfig;
     use crate::mining::TadokuExportBatch;
@@ -1054,7 +1077,7 @@ mod tests {
     use axum::{Json, Router};
     use chrono::{TimeZone, Timelike, Utc};
     use serde_json::json;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     struct MockTadoku {
@@ -1067,6 +1090,8 @@ mod tests {
         options_count: AtomicUsize,
         login_forms: Mutex<Vec<String>>,
         request_cookies: Mutex<Vec<String>>,
+        logs: Mutex<Vec<serde_json::Value>>,
+        lose_log_response: AtomicBool,
     }
 
     async fn login_flow(State(state): State<Arc<MockTadoku>>) -> Response {
@@ -1182,12 +1207,37 @@ mod tests {
             options_count: AtomicUsize::new(0),
             login_forms: Mutex::new(Vec::new()),
             request_cookies: Mutex::new(Vec::new()),
+            logs: Mutex::new(Vec::new()),
+            lose_log_response: AtomicBool::new(false),
         });
         let app = Router::new()
             .route("/self-service/login/browser", get(login_flow))
             .route("/self-service/login", post(submit_login))
             .route("/sessions/whoami", get(whoami))
             .route("/logs/configuration-options", get(configuration_options))
+            .route(
+                "/users/user-id/logs",
+                get(|State(state): State<Arc<MockTadoku>>| async move {
+                    let logs = state.logs.lock().unwrap();
+                    Json(json!({"logs": *logs, "total_size": logs.len()}))
+                }),
+            )
+            .route(
+                "/logs",
+                post(
+                    |State(state): State<Arc<MockTadoku>>,
+                     Json(mut log): Json<serde_json::Value>| async move {
+                        let mut logs = state.logs.lock().unwrap();
+                        log["id"] = json!(format!("log-{}", logs.len() + 1));
+                        logs.push(log.clone());
+                        if state.lose_log_response.swap(false, Ordering::SeqCst) {
+                            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                        } else {
+                            Json(log).into_response()
+                        }
+                    },
+                ),
+            )
             .with_state(state.clone());
         let server = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
@@ -1222,6 +1272,7 @@ mod tests {
             batch_id: "batch".to_string(),
             tadoku_log_id: None,
             is_longform_checkpoint: false,
+            has_rewatch: false,
             series_name: "Frieren".to_string(),
             description: "Frieren S01E01".to_string(),
             duration_seconds: 1_400,
@@ -1229,6 +1280,63 @@ mod tests {
             file_paths: vec!["/media/Anime/Frieren/episode01.mkv".to_string()],
         };
         assert_eq!(tadoku_tags(&config, &batch), vec!["nagare", "anime"]);
+    }
+
+    #[tokio::test]
+    async fn rewatch_export_ignores_original_log_and_recovers_a_lost_creation_response() {
+        let (state, server) = spawn_mock_tadoku(true, true, true, false).await;
+        let config = mock_config(&state);
+        let mut client =
+            TadokuClient::new_with_auth_url(config.clone(), None, false, &state.base_url).unwrap();
+        let unit = client
+            .connection_info("jpn")
+            .await
+            .unwrap()
+            .listening_minutes_unit;
+        let mut batch = TadokuExportBatch {
+            batch_id: uuid::Uuid::new_v4().to_string(),
+            tadoku_log_id: None,
+            is_longform_checkpoint: false,
+            has_rewatch: true,
+            series_name: "Show".into(),
+            description: "Show — S01E01".into(),
+            duration_seconds: 1_440,
+            language_code: "jpn".into(),
+            file_paths: Vec::new(),
+        };
+        let original = json!({
+            "id": "original", "description": batch.description,
+            "amount": 24.0, "unit_id": "minutes", "unit_key": "listening_minute",
+            "tags": ["nagare"]
+        });
+        state.logs.lock().unwrap().push(original.clone());
+        let existing = client.existing_nagare_logs("user-id").await.unwrap();
+        assert!(matching_existing_log(&batch, &existing).is_none());
+        state.lose_log_response.store(true, Ordering::SeqCst);
+        assert!(client.create_log(&batch, 2, &unit, &[]).await.is_err());
+        assert_eq!(state.logs.lock().unwrap().len(), 2);
+
+        // A new client represents retrying after Nagare restarts. Discovery
+        // finds this batch's marker despite the original log's identical text.
+        let mut restarted =
+            TadokuClient::new_with_auth_url(config, None, false, &state.base_url).unwrap();
+        let existing = restarted.existing_nagare_logs("user-id").await.unwrap();
+        let recovered = matching_existing_log(&batch, &existing).unwrap();
+        assert_ne!(recovered.id, "original");
+        restarted
+            .ensure_log_minutes(recovered.clone(), &batch, &unit)
+            .await
+            .unwrap();
+        assert_eq!(state.logs.lock().unwrap().len(), 2);
+        assert_eq!(state.logs.lock().unwrap()[0], original);
+        batch.batch_id = uuid::Uuid::new_v4().to_string();
+        assert!(matching_existing_log(&batch, &existing).is_none());
+        batch.has_rewatch = false;
+        assert_eq!(
+            matching_existing_log(&batch, &existing).unwrap().id,
+            "original"
+        );
+        server.abort();
     }
 
     #[test]

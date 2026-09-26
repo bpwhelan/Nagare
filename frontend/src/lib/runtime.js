@@ -1,5 +1,6 @@
 // The website uses browser APIs. The userscript build substitutes an adapter
 // with privileged cross-origin requests and userscript-manager storage.
+export const clientKind = 'website';
 export async function requestJson(path, options = {}) {
   const response = await fetch(path, {
     headers: { 'Content-Type': 'application/json' },

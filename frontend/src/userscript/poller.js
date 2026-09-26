@@ -1,6 +1,6 @@
 // Transport-independent polling loop, also exercised with delayed mock replies.
 // One request at a time; stop/restart invalidates every outstanding response.
-export function createPoller({ request, apply, status, requestState, interval, schedule = setTimeout, cancel = clearTimeout }) {
+export function createPoller({ request, apply, status, requestState, interval, longPoll = false, schedule = setTimeout, cancel = clearTimeout }) {
   let generation = 0;
   let timer;
   let stopped = true;
@@ -17,6 +17,7 @@ export function createPoller({ request, apply, status, requestState, interval, s
       if (epoch) query.set('epoch', epoch);
       if (cursor != null) query.set('after', cursor);
       if (subtitleRevision) query.set('subtitle_revision', subtitleRevision);
+      if (longPoll) query.set('wait_ms', String(delay));
       const result = await request(`/api/companion?${query}`);
       if (run !== generation || stopped) return;
       const after = requestState();
@@ -29,6 +30,9 @@ export function createPoller({ request, apply, status, requestState, interval, s
       cursor = result.cursor;
       subtitleRevision = result.subtitle_revision;
       status(null);
+      // The server has already waited, and wakes on a new card/result. Start
+      // listening again immediately instead of adding a client polling delay.
+      if (longPoll) delay = 0;
     } catch (error) {
       if (run !== generation || stopped) return;
       status(error.message || 'Connection lost. Retrying…');

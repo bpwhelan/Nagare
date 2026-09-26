@@ -35,7 +35,7 @@ sent to Tadoku by this integration.
 | Nagare data | Kechimochi representation |
 | --- | --- |
 | Series, media server, media category, language | A grouped media entry in a Nagare variant |
-| Individual episode, movie, or audiobook with positive recorded progress | One activity log per history item |
+| Individual episode, movie, or audiobook with positive recorded progress | One activity log per watch, including confirmed rewatches |
 | History without recorded playback | Stored with the media; creates an activity when playback is recorded |
 | Saved playback position | Activity duration, capped at runtime and rounded to the nearest whole minute, with a one-minute minimum for positive progress |
 | Latest observed playback timestamp | Activity date in the configured time zone |
@@ -43,16 +43,29 @@ sent to Tadoku by this integration.
 | Full history metadata, exact position, runtime, subtitle count, mined-note count | Media's `extra_data.nagare.history` |
 | Title, progress in seconds, mined-note count | Managed section of the activity's notes |
 
-**Playback progress is not elapsed watch time.** Nagare's existing history has
-one resume position and latest playback timestamp for each server/item. It does
-not contain a ledger of sessions, rewatches, or daily time spent. Sync mirrors
-that information: later playback changes the existing log's duration and date,
-including when the saved position moves backwards. It cannot reconstruct
-historical sessions or treat seeking as measured immersion time. Kechimochi
+**Playback progress is not elapsed watch time.** Nagare observes all permitted
+clients, independently of the player selected for subtitle mining. A paused or
+stalled tab does not overwrite another client's advancing playback. Each watch
+has its own saved position and latest playback timestamp. Sync mirrors those
+values; it does not measure daily immersion time. Kechimochi
 requires positive whole-minute durations for these activities, so positive
 sub-minute progress becomes one minute. Items with zero progress remain in the
 media metadata without inventing activity time. If progress resets to zero,
 the previous managed log is removed and its media history remains.
+
+After a completed item is restarted below 80% and more than a minute behind its
+saved position, **five consecutive real minutes of advancing playback** confirm
+a rewatch. Playback speed cannot shorten those five minutes. Pauses, backward
+seeks, implausible forward jumps, and gaps of more than 25 seconds without
+progress restart qualification. Repeated server positions between normal
+check-ins do not add credit by themselves. Client changes and Nagare restarts
+cannot combine separate qualification streaks.
+
+Until confirmation, the completed watch keeps its progress and date. Once
+confirmed, the new watch gets a separate activity log and the previous watch is
+preserved. The new watch must reach the usual completion threshold before
+Tadoku offers it as a completed episode. Qualified watch history survives
+restarts; watches from before this feature cannot be reconstructed.
 
 Media identity is separated by server, category, and language to avoid merging
 different records that happen to share a title. Video paths containing `anime`

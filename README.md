@@ -59,7 +59,7 @@ Nagare watches your active media server playback sessions, displays a live subti
 - Playback controls (seek, pause, resume) from the browser.
 - Yomitan-aware pause behavior. (Must turn off Secure Popup in Yomitan) 
 - Watch history for mining after playback ends
-- Sudachi vocabulary mining from each History file: discover words, preview scenes, and create individual or bulk Anki cards. See [Word mining](docs/word-mining.md).
+- **WIP / untested in real-world use:** Sudachi vocabulary mining from each History file, including word discovery, scene previews, and individual or bulk Anki cards. See [Word mining](docs/word-mining.md).
 - Session card review with saved SRT snapshots, review progress, context expansion, and audio previews
 - Multi-server support (Emby + Jellyfin + Plex + AudioBookShelf simultaneously)
 - Manual-review, daily, or automatic Tadoku listening-log sync, grouped by show with duplicate protection
@@ -183,6 +183,14 @@ Open **History → Card sessions**, or choose **Review cards** on a watch-histor
 **Automatically enhance new cards** uses the existing browser preference and keeps working while that browser is open, including on the review page. Cards are recorded before enhancement completes, so skipped cards, failed attempts, and cards that already had media remain available for review. Failures require a deliberate retry. Changing the media, subtitle/audio track, playback session, or returning after 30 minutes without mining starts another card session. Earlier enhanced notes are imported by title with the subtitle history available at upgrade time; their original session boundaries cannot be reconstructed.
 
 AnkiBeacon full payloads take the fastest notification path: they do not wait for fallback polling or optional card-ID lookups. ID-only payloads still need AnkiConnect metadata, but those lookups run separately. The UI distinguishes **Card received** from the confirmation that enhancement finished.
+
+Cards are published from their in-memory subtitle/note snapshot as soon as matching finishes. Saving the review snapshot happens separately; confirming or skipping preserves the save order and the original audio track. Both the main page and Companion use WebSocket delivery. If the player's browser security rules block the Companion's WebSocket, its privileged HTTP connection waits for events and wakes immediately when a card arrives.
+
+While an episode is active, Nagare prepares decoded mono audio in one-minute segments: the current minute, the previous minute, and two minutes ahead. Seeking or changing the episode/audio track reprioritizes preparation. Clips can cross segment boundaries, and matching previews and enhancements share a single encoded clip. The caches are process-local and bounded (16 decoded segments, plus up to 32 encoded clips / 64 MiB); unused entries expire after ten minutes. Ranges that are not ready use normal extraction without delaying the confirmation dialog.
+
+Enhancement diagnostics appear in the normal server logs, correlated by `note_id` and `stage`: Beacon receipt, metadata source, filtering, matching, publication, browser receipt/display, review persistence, queue wait, media preparation/cache hits, uploads, note updates, and results. Stage durations use milliseconds, and browser events distinguish the website from the Companion. Browser events also appear under `[Nagare enhancement]` in the browser console. Set `RUST_LOG=info,nagare::anki=debug` for individual AnkiConnect request timings; slow requests and retries are reported at normal log levels. Routine lifecycle logs use IDs and timings rather than full note payloads.
+
+Filter the browser console for `[Nagare connection]` to check the website or Companion's WebSocket URL, handshake, first server message, disconnects, and reconnects. Card/result events include their delivery transport and note ID, and Companion fallback transitions explain why HTTP was needed. See [connection diagnostics](docs/userscript.md#checking-the-connection) for checking a reverse proxy and comparing card receipt with dialog display.
 
 
 ## Project structure

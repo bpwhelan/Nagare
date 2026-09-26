@@ -1,5 +1,7 @@
 <script>
-  import { onDestroy } from 'svelte';
+  import { onDestroy, tick } from 'svelte';
+  import { logEnrichment } from './enrichmentLog.js';
+  import { needsConfirmation } from './enhancementPolicy.js';
   import {
     activeHistoryItemId,
     audioEndOffset,
@@ -22,7 +24,8 @@
   import { audioMimeType, formatTime, imageMimeType, gatherTranslation } from './utils.js';
 
   export let enabled = true;
-  $: card = enabled ? ($dialogCard || ($currentView === 'timeline' && !$autoApprove ? $pendingCards[0] : null) || null) : null;
+  $: card = enabled ? ($dialogCard || ($currentView === 'timeline' && !$autoApprove
+    ? $pendingCards.find(c => needsConfirmation(c, $autoApprove)) : null) || null) : null;
   $: isRouteCard = $dialogCard != null;
   $: isHistoryCard = card?.source === 'mining_history';
   $: mediaItemId = card?.history_id || $activeHistoryItemId || null;
@@ -95,6 +98,25 @@
   let audioIsPlaying = false;
   let audioRangeStart = null; // startMs the cached audio was built for
   let audioRangeEnd = null;   // endMs the cached audio was built for
+  let audioGeneration = 0;
+
+  function trackDialog(node, current) {
+    let lastKey;
+    let frame;
+    const update = next => {
+      const key = `${next.event.note_id}:${next.source}:${next.updated_at}`;
+      if (key === lastKey) return;
+      lastKey = key;
+      tick().then(() => {
+        if (lastKey !== key || !node.isConnected) return;
+        frame = requestAnimationFrame(() => {
+          if (lastKey === key && node.isConnected) logEnrichment(next.event.note_id, 'dialog_shown');
+        });
+      });
+    };
+    update(current);
+    return { update, destroy() { lastKey = null; cancelAnimationFrame(frame); } };
+  }
 
   // Screenshot preview state
   let screenshotUrl = null;
@@ -374,7 +396,7 @@
       lastMinedLine = { noteId, itemId: mediaItemId, lineKey: activeLineKey };
     }
 
-    console.log('[EnrichDialog] Confirming note', noteId, payload);
+    logEnrichment(noteId, 'confirmed');
 
     // Close dialog immediately — enhancement runs in the background. Queuing is
     // silent; the processing banner already shows pending/running items.
@@ -387,6 +409,7 @@
   async function handleSkip() {
     if (!card || submitting) return;
     submitting = true;
+    logEnrichment(card.event.note_id, 'skipped');
     reusePrompt = false;
     if (pausedByDialog) {
       firePlayPause(false);
@@ -395,7 +418,14 @@
     cleanupAudio();
     cleanupScreenshot();
     if (!isHistoryCard) {
-      await skipEnrichment(card.event.note_id);
+      try {
+        const result = await skipEnrichment(card.event.note_id);
+        if (!result.ok) throw new Error(result.error || 'Could not skip this card');
+      } catch (error) {
+        showErrorToast(error.message);
+        submitting = false;
+        return;
+      }
       removeCardFromQueue(card.event.note_id);
     }
     if (isRouteCard) {
@@ -412,6 +442,7 @@
   // ── Audio preview ──
 
   function cleanupAudio() {
+    audioGeneration++;
     if (audioElement) {
       audioElement.pause();
       audioElement = null;
@@ -435,7 +466,12 @@
   }
 
   async function fetchAudioPreview() {
-    const result = await previewAudio(startMs, endMs, mediaItemId);
+    const generation = audioGeneration;
+    const noteId = card.event.note_id;
+    const from = startMs, to = endMs;
+    const started = performance.now();
+    const result = await previewAudio(from, to, mediaItemId, noteId);
+    if (generation !== audioGeneration || card?.event.note_id !== noteId || startMs !== from || endMs !== to) return false;
     if (result.error) {
       throw new Error(result.error);
     }
@@ -458,8 +494,10 @@
 
     audioPreviewUrl = nextUrl;
     audioElement = buildAudioElement(nextUrl);
-    audioRangeStart = startMs;
-    audioRangeEnd = endMs;
+    audioRangeStart = from;
+    audioRangeEnd = to;
+    logEnrichment(noteId, 'audio_ready', performance.now() - started);
+    return true;
   }
 
   async function handlePlayAudio() {
@@ -467,7 +505,7 @@
       const audioStale = !audioElement || audioRangeStart !== startMs || audioRangeEnd !== endMs;
       if (audioStale) {
         audioLoading = true;
-        await fetchAudioPreview();
+        if (!await fetchAudioPreview()) return;
       }
 
       if (!audioElement) return;
@@ -598,7 +636,7 @@
 
 {#if card && !reusePrompt}
   <div class="overlay">
-    <div class="dialog">
+    <div class="dialog" use:trackDialog={card}>
       <div class="dialog-header">
         <h2>{isHistoryCard ? 'Edit Mined Note' : 'New Card Detected'}</h2>
         <span class="note-id">Note #{card.event.note_id}</span>

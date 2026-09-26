@@ -146,6 +146,14 @@ pub struct AnkiConfig {
     #[serde(default)]
     pub add_tags: Vec<String>,
 
+    /// Automatically enhance new cards with any of these tags without showing confirmation.
+    #[serde(default)]
+    pub skip_confirmation_tags: Vec<String>,
+
+    /// Tags to remove after a successful enhancement.
+    #[serde(default)]
+    pub remove_tags: Vec<String>,
+
     /// When enabled, a per-series tag is added, derived from the show title.
     #[serde(default)]
     pub series_tag_enabled: bool,
@@ -640,6 +648,8 @@ impl Default for AnkiConfig {
             url: default_ankiconnect_url(),
             fields: AnkiFieldMapping::default(),
             add_tags: Vec::new(),
+            skip_confirmation_tags: Vec::new(),
+            remove_tags: Vec::new(),
             series_tag_enabled: false,
             series_tag_parent: String::new(),
             ignore_tags: Vec::new(),
@@ -739,6 +749,25 @@ mod avif_settings_tests {
                 .is_err()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod anki_tag_settings_tests {
+    use super::AnkiConfig;
+
+    #[test]
+    fn tag_options_default_for_existing_configs_and_round_trip() {
+        let mut config: AnkiConfig = serde_json::from_str("{}").unwrap();
+        assert!(config.skip_confirmation_tags.is_empty());
+        assert!(config.remove_tags.is_empty());
+
+        config.skip_confirmation_tags = vec!["quick".into()];
+        config.remove_tags = vec!["temporary".into()];
+        let loaded: AnkiConfig =
+            serde_json::from_value(serde_json::to_value(config).unwrap()).unwrap();
+        assert_eq!(loaded.skip_confirmation_tags, ["quick"]);
+        assert_eq!(loaded.remove_tags, ["temporary"]);
     }
 }
 

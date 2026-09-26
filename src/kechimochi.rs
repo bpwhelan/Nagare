@@ -5,7 +5,7 @@
 //! response is lost. Retrying that POST blindly would duplicate immersion time.
 use crate::api::AppState;
 use crate::config::{Config, KechimochiConfig, KechimochiSyncMode as SyncMode, MediaServerKind};
-use crate::mining::{AppDatabase, load_history_map, open_connection};
+use crate::mining::{AppDatabase, load_watch_history_map, open_connection};
 use crate::session::HistoryEntry;
 use anyhow::{Context, bail};
 use axum::{Json, extract::State, http::StatusCode};
@@ -123,7 +123,7 @@ impl AppDatabase {
                 [],
                 |row| row.get(0),
             )?;
-            let history = load_history_map(&tx)?;
+            let history = load_watch_history_map(&tx)?;
             let mut stmt =
                 tx.prepare("SELECT history_id, COUNT(*) FROM mined_notes GROUP BY history_id")?;
             let counts: HashMap<String, u64> = stmt

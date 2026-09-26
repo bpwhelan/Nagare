@@ -14,6 +14,10 @@ use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock, watch};
 use tracing::{debug, info, warn};
 
+mod history;
+use history::HistoryTracker;
+pub use history::PreviousWatch;
+
 const POSITION_SAVE_INTERVAL: Duration = Duration::from_secs(5);
 /// Paused sessions remain available briefly for manual selection/mining, but
 /// media servers can otherwise retain them for hours or even indefinitely.
@@ -175,6 +179,9 @@ pub struct HistoryEntry {
     pub last_position_ms: i64,
     /// Timestamp when we last saw this item playing
     pub last_seen: chrono::DateTime<chrono::Utc>,
+    /// Frozen positions/dates of watches preceding the current qualified watch.
+    #[serde(default)]
+    pub previous_watches: Vec<PreviousWatch>,
 }
 
 #[derive(Clone)]
@@ -376,6 +383,7 @@ pub struct SessionManager {
     /// Prevent overlapping poll cycles when the API forces immediate refreshes.
     poll_lock: Mutex<()>,
     playback_sessions: Mutex<PlaybackSessions>,
+    history_tracker: Mutex<HistoryTracker>,
     /// Throttle: only persist to SQLite at most once per position-save interval.
     last_save: Arc<Mutex<Instant>>,
     /// Whether the Plex websocket listener is connected and can provide live play-state updates.
@@ -434,6 +442,7 @@ impl SessionManager {
             db,
             poll_lock: Mutex::new(()),
             playback_sessions: Mutex::new(PlaybackSessions::default()),
+            history_tracker: Mutex::new(HistoryTracker::default()),
             last_save,
             plex_ws_connected: AtomicBool::new(false),
         })
@@ -701,6 +710,15 @@ impl SessionManager {
     /// Persist all in-memory history immediately, bypassing the position throttle.
     pub async fn flush_history(&self) {
         self.save_history(true).await;
+    }
+
+    async fn observe_history(&self, sessions: &[ServerSession], now: Instant) {
+        let force_save = self.history_tracker.lock().await.update(
+            &mut *self.history.write().await,
+            sessions,
+            now,
+        );
+        self.save_history(force_save).await;
     }
 
     /// Queue a Tadoku eligibility check after the media server unloads the
@@ -1547,6 +1565,7 @@ impl SessionManager {
 
         let servers = self.servers.read().await.clone();
         if servers.is_empty() {
+            self.observe_history(&[], Instant::now()).await;
             self.playback_sessions.lock().await.observed.clear();
             {
                 let mut state = self.state.write().await;
@@ -1583,6 +1602,10 @@ impl SessionManager {
                 .then_with(|| left.kind.cmp(&right.kind))
                 .then_with(|| left.id().cmp(&right.id()))
         });
+
+        // Observe every client before subtitle loading or UI selection can delay
+        // the poll. A paused mining tab must not hide another device's progress.
+        self.observe_history(&sessions, Instant::now()).await;
 
         // Keep the device picker stable while automatic selection ranks the
         // live sessions separately. Check-ins must not move clickable rows.
@@ -1809,32 +1832,6 @@ impl SessionManager {
             return;
         }
 
-        // Persist the latest position before subtitle work can delay the poll or
-        // force a save that resets the position throttle.
-        {
-            let playback_activity_at = active_session
-                .as_ref()
-                .map(|active| session_playback_activity_at(&active.session))
-                .unwrap_or_else(chrono::Utc::now);
-            let state = self.state.read().await;
-            if let Some(ref np) = state.now_playing {
-                let mut hist = self.history.write().await;
-                if let Some(entry) = hist.get_mut(&np.history_id) {
-                    let position_changed = entry.last_position_ms != np.position_ms;
-                    entry.last_position_ms = np.position_ms;
-                    // A visible paused session is intentionally retained for
-                    // a few minutes. Do not let those unchanged polls restart
-                    // the long-form inactivity timer.
-                    if !np.is_paused || position_changed {
-                        entry.last_seen = playback_activity_at;
-                    }
-                }
-            }
-        }
-
-        // Throttled save for position updates (at most once every 5 s)
-        self.save_history(false).await;
-
         // Load subtitles outside the lock
         if let Some((item_changed, history_id, item_id, media_source_id, candidate, active)) =
             needs_subtitle_load
@@ -1853,11 +1850,6 @@ impl SessionManager {
                 .as_ref()
                 .map(|np| np.display_title())
                 .unwrap_or_else(|| item_id.clone());
-            let series_name = active
-                .session
-                .now_playing
-                .as_ref()
-                .and_then(|np| np.series_name.clone());
             if item_changed {
                 info!(
                     "New item detected: {} ({}) on {}",
@@ -1919,42 +1911,12 @@ impl SessionManager {
                     Some(file_path)
                 };
 
-                let state = self.state.read().await;
-                let pos = state
-                    .now_playing
-                    .as_ref()
-                    .map(|np| np.position_ms)
-                    .unwrap_or(0);
-                let dur = state.now_playing.as_ref().and_then(|np| np.duration_ms);
-                drop(state);
-
-                let entry = HistoryEntry {
-                    history_id: history_id.clone(),
-                    server_kind: active.kind,
-                    item_id: item_id.clone(),
-                    title: display_title.clone(),
-                    series_name: series_name.clone(),
-                    media_source_id: media_source_id.clone(),
-                    file_path,
-                    duration_ms: dur,
-                    subtitle_count: sub_count,
-                    audio_languages: active
-                        .session
-                        .now_playing
-                        .as_ref()
-                        .map(|now_playing| {
-                            now_playing
-                                .media_streams
-                                .iter()
-                                .filter(|stream| stream.stream_type == StreamType::Audio)
-                                .filter_map(|stream| stream.language.clone())
-                                .collect()
-                        })
-                        .unwrap_or_default(),
-                    last_position_ms: pos,
-                    last_seen: session_playback_activity_at(&active.session),
-                };
-                self.history.write().await.insert(history_id.clone(), entry);
+                if let Some(entry) = self.history.write().await.get_mut(&history_id) {
+                    if file_path.is_some() {
+                        entry.file_path = file_path;
+                    }
+                    entry.subtitle_count = sub_count;
+                }
             }
 
             // Broadcast before the potentially-slow SQLite write so listeners
@@ -1992,7 +1954,6 @@ impl SessionManager {
             playback_session_id,
         );
         let mut snapshot = None;
-        let mut history_update = None;
         let mut should_poll = false;
 
         {
@@ -2018,8 +1979,6 @@ impl SessionManager {
                             _ => {}
                         }
 
-                        history_update =
-                            Some((now_playing.history_id.clone(), now_playing.position_ms));
                         snapshot = Some(state.clone());
                     }
                     Some(_) | None => {
@@ -2031,18 +1990,9 @@ impl SessionManager {
             }
         }
 
-        if let Some((history_id, position_ms)) = history_update {
-            let mut history = self.history.write().await;
-            if let Some(entry) = history.get_mut(&history_id) {
-                let position_changed = entry.last_position_ms != position_ms;
-                entry.last_position_ms = position_ms;
-                if player_state == "playing" || position_changed {
-                    entry.last_seen = chrono::Utc::now();
-                }
-            }
-            drop(history);
-            self.save_history(false).await;
-        }
+        // History uses the regular all-client polls. Mixing REST positions
+        // with a newer websocket clock would look like repeated backward seeks
+        // and break rewatch qualification; websocket events still drive the UI.
 
         if let Some(snapshot) = snapshot {
             let _ = self.state_tx.send(snapshot);
@@ -2735,6 +2685,179 @@ mod tests {
         item.name = item_id.into();
         session.play_state.position_ticks = Some(position_ms * 10_000);
         session
+    }
+
+    #[tokio::test]
+    async fn history_tracks_other_clients_while_a_paused_tab_is_selected() {
+        let open_tab = browser_tab("episode", true, 4_000);
+        let mut tv = browser_tab("episode", false, 600_000);
+        tv.id = "tv".into();
+        let (manager, server, directory) = session_test_manager(
+            MediaServerKind::Jellyfin,
+            vec![open_tab.clone(), tv.clone()],
+        )
+        .await;
+        manager
+            .select_session(Some("jellyfin|browser|episode".into()))
+            .await;
+        manager.poll_once().await;
+        tv.play_state.position_ticks = Some(1_300_000 * 10_000);
+        tv.now_playing.as_mut().unwrap().run_time_ticks = Some(1_440_000 * 10_000);
+        let mut background = browser_tab("another-episode", false, 300_000);
+        background.id = "phone".into();
+        *server.0.write().await = vec![open_tab, tv, background];
+        manager.poll_once().await;
+        manager.flush_history().await;
+        let state = manager.state.read().await;
+        assert_eq!(
+            state.active_session_id.as_deref(),
+            Some("jellyfin|browser|episode")
+        );
+        assert_eq!(state.now_playing.as_ref().unwrap().position_ms, 4_000);
+        drop(state);
+        let (saved, _) = manager
+            .db
+            .load_session_history(
+                directory.join("history.json"),
+                directory.join("subtitles.json"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(saved["jellyfin|episode"].last_position_ms, 1_300_000);
+        assert_eq!(saved["jellyfin|another-episode"].last_position_ms, 300_000);
+        let candidates = manager
+            .db
+            .list_tadoku_candidates("jpn".into(), "jpn".into())
+            .await
+            .unwrap();
+        assert!(
+            candidates
+                .iter()
+                .any(|c| c.history_id == "jellyfin|episode")
+        );
+        drop(manager);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn qualified_rewatch_survives_saves_reload_and_stale_clients() {
+        let mut tv = browser_tab("episode", false, 1_400_000);
+        tv.id = "tv".into();
+        tv.now_playing.as_mut().unwrap().run_time_ticks = Some(1_440_000 * 10_000);
+        let (manager, server, directory) =
+            session_test_manager(MediaServerKind::Jellyfin, vec![tv.clone()]).await;
+        manager.poll_once().await;
+        let original_seen = manager.history.read().await["jellyfin|episode"].last_seen;
+        let mut old_tab = tv.clone();
+        old_tab.id = "old-tab".into();
+        old_tab.play_state.is_paused = true;
+        manager
+            .select_session(Some("jellyfin|old-tab|episode".into()))
+            .await;
+        let start = Instant::now();
+        for seconds in (0..=360).step_by(10) {
+            tv.play_state.position_ticks = Some(seconds * 1_000 * 10_000);
+            *server.0.write().await = vec![old_tab.clone(), tv.clone()];
+            let sessions = manager
+                .collect_playback_sessions(manager.servers.read().await.clone())
+                .await;
+            manager
+                .observe_history(&sessions, start + Duration::from_secs(seconds as u64))
+                .await;
+            let history = manager.history.read().await;
+            let entry = &history["jellyfin|episode"];
+            if seconds < 300 {
+                assert!(entry.previous_watches.is_empty());
+                assert_eq!(entry.last_position_ms, 1_400_000);
+                assert_eq!(entry.last_seen, original_seen);
+            } else {
+                assert_eq!(entry.previous_watches.len(), 1);
+                assert_eq!(entry.last_position_ms, seconds * 1_000);
+                assert_eq!(entry.previous_watches[0].last_seen, original_seen);
+            }
+        }
+        // The old player's final check-in must not complete the new watch.
+        old_tab.play_state.position_ticks = Some(1_430_000 * 10_000);
+        old_tab.play_state.is_paused = false;
+        *server.0.write().await = vec![old_tab, tv];
+        let sessions = manager
+            .collect_playback_sessions(manager.servers.read().await.clone())
+            .await;
+        manager
+            .observe_history(&sessions, start + Duration::from_secs(370))
+            .await;
+        manager.flush_history().await;
+        let (saved, _) = manager
+            .db
+            .load_session_history(
+                directory.join("history.json"),
+                directory.join("subtitles.json"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(saved["jellyfin|episode"].last_position_ms, 360_000);
+        assert_eq!(saved["jellyfin|episode"].previous_watches.len(), 1);
+        assert_eq!(
+            saved["jellyfin|episode"].previous_watches[0].last_position_ms,
+            1_400_000
+        );
+        let conn = crate::mining::open_connection(&manager.db.db_path).unwrap();
+        let watches = crate::mining::load_watch_history_map(&conn).unwrap();
+        assert_eq!(watches.len(), 2);
+        assert_eq!(watches["jellyfin|episode"].last_position_ms, 1_400_000);
+        assert_eq!(
+            watches["rewatch:1:jellyfin|episode"].last_position_ms,
+            360_000
+        );
+        // Starting Nagare again with only the old paused tab open must not
+        // promote its static end position into the newer watch's progress.
+        *manager.history_tracker.lock().await = HistoryTracker::default();
+        server
+            .0
+            .write()
+            .await
+            .retain(|session| session.id == "old-tab");
+        server.0.write().await[0].play_state.is_paused = true;
+        let sessions = manager
+            .collect_playback_sessions(manager.servers.read().await.clone())
+            .await;
+        manager
+            .observe_history(&sessions, start + Duration::from_secs(380))
+            .await;
+        assert_eq!(
+            manager.history.read().await["jellyfin|episode"].last_position_ms,
+            360_000
+        );
+        drop(conn);
+        drop(manager);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn history_keeps_missing_clocks_and_offline_listening_without_false_rewatches() {
+        let mut book = browser_tab("book", true, 0);
+        book.play_state.position_ticks = None;
+        let (manager, server, directory) =
+            session_test_manager(MediaServerKind::Audiobookshelf, vec![book.clone()]).await;
+        manager.poll_once().await;
+        assert_eq!(
+            manager.history.read().await["audiobookshelf|book"].last_position_ms,
+            0
+        );
+        for minutes in [20, 40, 60] {
+            book.id = format!("downloaded-session-{minutes}");
+            book.play_state.position_ticks = Some(minutes * 60_000 * 10_000);
+            *server.0.write().await = vec![book.clone()];
+            manager.poll_once().await;
+            let history = manager.history.read().await;
+            assert_eq!(
+                history["audiobookshelf|book"].last_position_ms,
+                minutes * 60_000
+            );
+            assert!(history["audiobookshelf|book"].previous_watches.is_empty());
+        }
+        drop(manager);
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[tokio::test]

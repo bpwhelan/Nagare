@@ -324,6 +324,7 @@ mod tests {
             included_line_last: Some(0),
             card_ids: vec![],
             source: EnrichmentSource::Pending,
+            skip_confirmation: false,
             updated_at: Some(Utc::now()),
         };
         db.record_review_card(

@@ -7,7 +7,9 @@ use uuid::Uuid;
 
 use crate::config::{AudioCodec, StaticScreenshotFormat};
 
+pub mod audio_cache;
 mod avif;
+pub mod episode_audio;
 pub use avif::generate_avif;
 
 /// Set to true locally to force static screenshot generation through its fallback path.
@@ -157,6 +159,72 @@ async fn run_ffmpeg(mut cmd: Command) -> Result<()> {
         );
     }
     Ok(())
+}
+
+// Also removes partial files if a seek cancels background preparation.
+struct TemporaryMedia(PathBuf);
+impl Drop for TemporaryMedia {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+pub async fn extract_pcm(
+    source: &str,
+    start_ms: i64,
+    end_ms: i64,
+    index: Option<u32>,
+    ordinal: Option<usize>,
+) -> Result<Vec<u8>> {
+    let path = TemporaryMedia(temp_dir().join(format!("{}.pcm", Uuid::new_v4())));
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args(http_input_args(source));
+    cmd.args([
+        "-v",
+        "error",
+        "-y",
+        "-ss",
+        &format!("{:.3}", start_ms as f64 / 1000.0),
+        "-i",
+        source,
+        "-t",
+        &format!("{:.3}", (end_ms - start_ms) as f64 / 1000.0),
+    ]);
+    if let Some(ordinal) = ordinal {
+        cmd.args(["-map", &format!("0:a:{ordinal}")]);
+    } else if let Some(index) = index {
+        cmd.args(["-map", &format!("0:{index}")]);
+    }
+    cmd.args([
+        "-vn",
+        "-ac",
+        "1",
+        "-ar",
+        "48000",
+        "-c:a",
+        "pcm_s16le",
+        "-f",
+        "s16le",
+    ]);
+    cmd.arg(&path.0);
+    tokio::time::timeout(std::time::Duration::from_secs(45), run_ffmpeg(cmd)).await??;
+    Ok(tokio::fs::read(&path.0).await?)
+}
+
+pub async fn encode_pcm(pcm: &[u8], codec: AudioCodec) -> Result<Vec<u8>> {
+    let input = TemporaryMedia(temp_dir().join(format!("{}.pcm", Uuid::new_v4())));
+    let output =
+        TemporaryMedia(temp_dir().join(format!("{}.{}", Uuid::new_v4(), codec.extension())));
+    tokio::fs::write(&input.0, pcm).await?;
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args([
+        "-v", "error", "-y", "-f", "s16le", "-ar", "48000", "-ac", "1", "-i",
+    ]);
+    cmd.arg(&input.0);
+    cmd.args(codec.ffmpeg_args());
+    cmd.arg(&output.0);
+    run_ffmpeg(cmd).await?;
+    Ok(tokio::fs::read(&output.0).await?)
 }
 
 /// Extract audio from a video source to the configured audio codec.

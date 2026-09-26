@@ -168,6 +168,7 @@ mod tests {
             audio_languages: vec![],
             last_position_ms: 0,
             last_seen: chrono::Utc::now(),
+            previous_watches: Vec::new(),
         };
         let mut track = parse_srt(
             "1\n00:00:01,000 --> 00:00:03,000\n猫が魚を食べました。\n\n2\n00:00:04,000 --> 00:00:06,000\n猫は魚を食べる。\n",

@@ -1,6 +1,8 @@
 <script>
   import { autoApprove, alwaysReuseMiningAssets, pendingCards, nativeSubtitles, sessionState, showErrorToast } from './stores.js';
   import { enrichCard } from './api.js';
+  import { logEnrichment } from './enrichmentLog.js';
+  import { shouldAutoEnhance } from './enhancementPolicy.js';
   import { gatherTranslation } from './utils.js';
   import { contextSentence } from './review.js';
 
@@ -8,8 +10,8 @@
   let busy = false;
   let lastMine = null;
   const attempted = new Set();
-  $: next = enabled && $autoApprove && !busy
-    ? $pendingCards.find(c => c.source === 'pending' && !attempted.has(c.event.note_id)
+  $: next = enabled && !busy
+    ? $pendingCards.find(c => shouldAutoEnhance(c, $autoApprove) && !attempted.has(c.event.note_id)
       && c.end_ms > c.start_ms)
     : null;
   $: if (next) enhance(next);
@@ -18,6 +20,7 @@
     busy = true;
     const noteId = card.event.note_id;
     attempted.add(noteId);
+    logEnrichment(noteId, 'auto_confirmed');
     const rangeKey = `${card.history_id}:${card.start_ms}:${card.end_ms}:${card.generate_avif}`;
     try {
       const result = await enrichCard({

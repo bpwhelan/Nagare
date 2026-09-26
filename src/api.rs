@@ -25,9 +25,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
-use std::time::Duration;
-use tokio::sync::{RwLock, Semaphore, broadcast, mpsc, watch};
-use tracing::{error, info, warn};
+use std::time::{Duration, Instant};
+use tokio::sync::{OnceCell, RwLock, Semaphore, broadcast, mpsc, watch};
+use tracing::{Instrument, error, info, warn};
 
 #[allow(unused_imports)]
 use crate::anki::AnkiMedia;
@@ -46,6 +46,8 @@ pub struct AppState {
     pub enhancement_queue: Arc<RwLock<Vec<EnhancementQueueItem>>>,
     pub enhancement_tx: mpsc::Sender<EnhancementJob>,
     pub reusable_assets: Arc<RwLock<HashMap<i64, ReusableAssets>>>,
+    pub audio_cache: Arc<media::audio_cache::AudioCache>,
+    pub pending_review_saves: RwLock<HashMap<i64, Arc<PendingReviewSave>>>,
     pub session_rx: watch::Receiver<SessionState>,
     pub new_card_tx: broadcast::Sender<EnrichmentDialogState>,
     pub subtitles: Arc<RwLock<Option<SubtitleTrack>>>,
@@ -64,6 +66,7 @@ pub struct AppState {
     pub pending_enrichments: Arc<RwLock<Vec<EnrichmentDialogState>>>,
     /// Broadcast channel for enhancement job results (success/failure).
     pub enhancement_result_tx: broadcast::Sender<EnhancementResult>,
+    pub review_saved_tx: broadcast::Sender<i64>,
     /// Broadcast channel for remote control results (seek/play/pause).
     pub remote_result_tx: broadcast::Sender<RemoteControlResult>,
     /// Audio tracks for the current media item.
@@ -77,6 +80,7 @@ pub struct AppState {
 pub fn create_router(state: Arc<AppState>) -> Router {
     Router::new()
         .merge(crate::word_mining::router())
+        .merge(crate::database_admin::router())
         .route("/api/companion", get(crate::companion::snapshot))
         .route("/api/state", get(get_state))
         .route("/api/sessions", get(get_sessions))
@@ -102,6 +106,10 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/enrich", post(enrich_card))
         .route("/api/enrich/skip", post(skip_enrichment))
         .route("/api/enrich/pending", get(get_pending_enrichments))
+        .route(
+            "/api/enrich/client-event",
+            post(log_enrichment_client_event),
+        )
         .route("/api/config", get(get_config))
         .route("/api/config", put(update_config))
         .route("/api/tadoku/test", post(test_tadoku_connection))
@@ -141,16 +149,20 @@ pub fn create_router(state: Arc<AppState>) -> Router {
 
 async fn post_anki_event(
     State(state): State<Arc<AppState>>,
-    Json(event): Json<AnkiBeaconEvent>,
+    Json(mut event): Json<AnkiBeaconEvent>,
 ) -> StatusCode {
+    event.received_at = Instant::now();
     let accepted_status = match event.event {
         AnkiBeaconEventKind::Heartbeat => StatusCode::NO_CONTENT,
         AnkiBeaconEventKind::NoteAdded => {
+            info!(note_id = ?event.note_id, stage = "beacon_received", payload_mode = ?event.payload_mode,
+                fields = event.fields.as_ref().map_or(0, HashMap::len), card_ids = event.card_ids.as_ref().map_or(0, Vec::len),
+                created_at = ?event.created_at, "AnkiBeacon card received");
             if event.note_id.is_none() {
                 return StatusCode::BAD_REQUEST;
             }
             if !mining_context_available(&state).await {
-                tracing::debug!(
+                info!(note_id = ?event.note_id, stage = "intake_ignored",
                     "Ignoring AnkiBeacon note_added event because no subtitle mining context is active"
                 );
                 return StatusCode::NO_CONTENT;
@@ -163,6 +175,41 @@ async fn post_anki_event(
         Ok(()) => accepted_status,
         Err(_) => StatusCode::SERVICE_UNAVAILABLE,
     }
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "snake_case")]
+enum ClientEnrichmentStage {
+    Received,
+    DialogShown,
+    AutoConfirmed,
+    Confirmed,
+    Skipped,
+    AudioReady,
+    Failed,
+}
+
+#[derive(Deserialize)]
+struct ClientEnrichmentEvent {
+    note_id: i64,
+    stage: ClientEnrichmentStage,
+    elapsed_ms: Option<u64>,
+    client: Option<EnrichmentClient>,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "snake_case")]
+enum EnrichmentClient {
+    Website,
+    Companion,
+}
+
+async fn log_enrichment_client_event(
+    Json(event): Json<ClientEnrichmentEvent>,
+) -> Json<serde_json::Value> {
+    info!(note_id = event.note_id, stage = ?event.stage, client = ?event.client, elapsed_ms = ?event.elapsed_ms,
+        "Enhancement browser event (elapsed time measured in this browser)");
+    Json(serde_json::json!({"ok": true}))
 }
 
 async fn get_state(State(state): State<Arc<AppState>>) -> Json<SessionState> {
@@ -595,6 +642,91 @@ const PENDING_ENRICHMENT_TTL: chrono::Duration = chrono::Duration::minutes(10);
 const MAX_PENDING_ENRICHMENTS: usize = 10;
 const MAX_ENHANCEMENT_JOBS: usize = 12;
 
+pub(crate) struct PendingReviewSave {
+    session_id: String,
+    title: String,
+    track: SubtitleTrack,
+    candidate: EnrichmentDialogState,
+    audio_mapping: (Option<u32>, Option<usize>),
+    saved: OnceCell<()>,
+    created_at: Instant,
+}
+
+// Publication only needs the in-memory snapshot. Mutations share this save so
+// a fast confirmation/skip cannot overtake the INSERT or change audio tracks.
+async fn ensure_review_saved(state: &Arc<AppState>, note_id: i64) -> Result<(), String> {
+    let snapshot = state
+        .pending_review_saves
+        .read()
+        .await
+        .get(&note_id)
+        .cloned();
+    if let Some(snapshot) = snapshot {
+        snapshot
+            .saved
+            .get_or_try_init(|| async {
+                let started = Instant::now();
+                state
+                    .db
+                    .record_review_card(
+                        snapshot.session_id.clone(),
+                        snapshot.title.clone(),
+                        snapshot.track.clone(),
+                        snapshot.candidate.clone(),
+                        snapshot.audio_mapping,
+                    )
+                    .await
+                    .map_err(|error| format!("Could not save card for review: {error}"))?;
+                info!(
+                    note_id,
+                    stage = "review_saved",
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "Card snapshot saved"
+                );
+                let _ = state.review_saved_tx.send(note_id);
+                Ok::<_, String>(())
+            })
+            .await?;
+        state.pending_review_saves.write().await.remove(&note_id);
+    }
+    Ok(())
+}
+
+async fn note_audio_mapping(
+    state: &Arc<AppState>,
+    note_id: Option<i64>,
+) -> (Option<u32>, Option<usize>) {
+    if let Some(note_id) = note_id {
+        if let Some(snapshot) = state.pending_review_saves.read().await.get(&note_id) {
+            return snapshot.audio_mapping;
+        }
+        if let Ok(Some(mapping)) = state.db.review_audio_mapping(note_id).await {
+            return mapping;
+        }
+    }
+    resolve_audio_mapping(state, *state.selected_audio_track.read().await).await
+}
+
+async fn enrichment_stage<T, E: std::fmt::Display>(
+    stage: &'static str,
+    work: impl std::future::Future<Output = Result<T, E>>,
+) -> Result<T, E> {
+    let started = Instant::now();
+    info!(stage, "Enhancement stage started");
+    let result = work.await;
+    match &result {
+        Ok(_) => info!(
+            stage,
+            elapsed_ms = started.elapsed().as_millis(),
+            "Enhancement stage finished"
+        ),
+        Err(error) => {
+            warn!(stage, elapsed_ms = started.elapsed().as_millis(), %error, "Enhancement stage failed")
+        }
+    }
+    result
+}
+
 async fn active_history_track(state: &Arc<AppState>) -> Option<(String, SubtitleTrack)> {
     let context = {
         let context = state.active_history_context.read().await;
@@ -797,6 +929,85 @@ async fn resolve_audio_mapping(
     (stream_index, audio_ordinal)
 }
 
+pub async fn run_episode_audio_preparation(state: Arc<AppState>) {
+    use media::episode_audio::{SEGMENT_MS, SourceKey};
+    let mut interval = tokio::time::interval(Duration::from_secs(1));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut signature = None;
+    let mut job: Option<tokio::task::JoinHandle<()>> = None;
+    let mut attempted_at = Instant::now();
+    loop {
+        interval.tick().await;
+        let now_playing = state.session_rx.borrow().now_playing.clone();
+        let Some(np) = now_playing else {
+            if let Some(job) = job.take() {
+                job.abort();
+            }
+            signature = None;
+            continue;
+        };
+        if *state.audio_track_resolution.read().await
+            == crate::session::AudioTrackResolution::NeedsSelection
+        {
+            if let Some(job) = job.take() {
+                job.abort();
+            }
+            signature = None;
+            continue;
+        }
+        let mapping = resolve_audio_mapping(&state, *state.selected_audio_track.read().await).await;
+        let config = state.config.read().await.clone();
+        // Check the window before resolving paths/URLs, which can touch a slow
+        // network mount. Config identity stays private, never in the logs.
+        let next = serde_json::json!([
+            np.history_id,
+            np.media_source_id,
+            np.file_path,
+            mapping,
+            np.position_ms.max(0) / SEGMENT_MS,
+            &config
+        ])
+        .to_string();
+        if signature.as_ref() == Some(&next)
+            && (attempted_at.elapsed() < Duration::from_secs(30)
+                || job.as_ref().is_some_and(|j| !j.is_finished()))
+        {
+            continue;
+        }
+        if let Some(job) = job.take() {
+            job.abort();
+        }
+        signature = Some(next);
+        attempted_at = Instant::now();
+        let server = get_server(&state, np.server_kind).await;
+        let Ok(source) = media::resolve_media_source(
+            &config,
+            server.as_deref(),
+            &np.item_id,
+            &np.media_source_id,
+            np.file_path.as_deref(),
+        ) else {
+            continue;
+        };
+        let source = SourceKey::new(&source, mapping.0, mapping.1);
+        let cache = state.audio_cache.clone();
+        let span = tracing::info_span!("episode_audio", history_id = %np.history_id);
+        job = Some(tokio::spawn(
+            async move {
+                cache
+                    .episode
+                    .prepare_window(
+                        source,
+                        np.position_ms,
+                        np.duration_ms.filter(|end| *end > 0),
+                    )
+                    .await;
+            }
+            .instrument(span),
+        ));
+    }
+}
+
 async fn prepare_enrichment_candidate(
     state: &Arc<AppState>,
     notification: NewCardNotification,
@@ -805,6 +1016,7 @@ async fn prepare_enrichment_candidate(
         event,
         card_ids: provided_card_ids,
         needs_enhancement,
+        ..
     } = notification;
 
     let session_state = state.session_rx.borrow().clone();
@@ -841,12 +1053,17 @@ async fn prepare_enrichment_candidate(
     let config = state.config.read().await.clone();
     let track = active_history.map(|(_, track)| track).or(live_track)?;
     let line = track.lines.get(matched_line_index)?;
+    let skip_confirmation = needs_enhancement
+        && event
+            .tags
+            .iter()
+            .any(|tag| config.anki.skip_confirmation_tags.contains(tag));
     // Don't block the dialog on an AnkiConnect `findCards` round-trip. The card
     // ids are only needed for open-by-card-id routing and as an enrich-time
     // fallback, so when
     // the beacon didn't include them we leave the list empty here and let
-    // `run_new_card_processor` backfill it in the background. Only the local
-    // subtitle snapshot must be saved before publishing the card.
+    // `run_new_card_processor` backfill it in the background. The subtitle
+    // snapshot is captured in memory before publishing the card.
     let card_ids = provided_card_ids.unwrap_or_default();
 
     Some((
@@ -866,6 +1083,7 @@ async fn prepare_enrichment_candidate(
             } else {
                 EnrichmentSource::MiningHistory
             },
+            skip_confirmation,
             updated_at: Some(Utc::now()),
         },
         track,
@@ -983,6 +1201,7 @@ mod anki_intake_tests {
             included_line_last: None,
             card_ids: Vec::new(),
             source: Default::default(),
+            skip_confirmation: false,
             updated_at: Some(updated_at),
         }
     }
@@ -1036,7 +1255,7 @@ mod anki_intake_tests {
     }
 
     #[tokio::test]
-    async fn published_cards_already_have_their_review_snapshot() {
+    async fn publication_bypasses_locked_database_but_skip_waits_for_snapshot() {
         use super::*;
         let directory =
             std::env::temp_dir().join(format!("nagare-intake-{}", uuid::Uuid::new_v4()));
@@ -1045,7 +1264,9 @@ mod anki_intake_tests {
                 .await
                 .unwrap(),
         );
-        let config = Arc::new(RwLock::new(Config::default()));
+        let mut app_config = Config::default();
+        app_config.anki.skip_confirmation_tags = vec!["quick".into()];
+        let config = Arc::new(RwLock::new(app_config));
         let (session_tx, session_rx) = watch::channel(SessionState {
             sessions: vec![],
             active_session_id: None,
@@ -1068,6 +1289,7 @@ mod anki_intake_tests {
             .await
             .insert("plex|one".into(), track(&[(1_000, 2_000, "対象の文")]));
         let (new_card_tx, mut published) = broadcast::channel(4);
+        let (enhancement_tx, mut enhancement_rx) = mpsc::channel(4);
         let state = Arc::new(AppState {
             companion_events: Default::default(),
             kechimochi_sync: Arc::new(crate::kechimochi::SyncService::new(
@@ -1082,8 +1304,10 @@ mod anki_intake_tests {
             anki_status: Arc::new(RwLock::new(AnkiStatus::default())),
             anki_event_tx: mpsc::channel(4).0,
             enhancement_queue: Arc::new(RwLock::new(vec![])),
-            enhancement_tx: mpsc::channel(4).0,
+            enhancement_tx,
             reusable_assets: Arc::new(RwLock::new(HashMap::new())),
+            audio_cache: Arc::new(Default::default()),
+            pending_review_saves: RwLock::new(HashMap::new()),
             session_rx,
             new_card_tx,
             subtitles: manager.subtitles(),
@@ -1098,6 +1322,7 @@ mod anki_intake_tests {
             card_lookup_semaphore: Arc::new(Semaphore::new(1)),
             pending_enrichments: Arc::new(RwLock::new(vec![])),
             enhancement_result_tx: broadcast::channel(4).0,
+            review_saved_tx: broadcast::channel(4).0,
             remote_result_tx: broadcast::channel(4).0,
             audio_tracks: manager.audio_tracks(),
             selected_audio_track: manager.selected_audio_track(),
@@ -1108,30 +1333,67 @@ mod anki_intake_tests {
         conn.execute_batch("BEGIN IMMEDIATE").unwrap();
         let (tx, rx) = mpsc::channel(4);
         let processor = tokio::spawn(run_new_card_processor(state.clone(), rx));
+        let mut tagged_event = event(1, "対象の文");
+        tagged_event.tags.push("quick".into());
         tx.send(NewCardNotification {
-            event: event(1, "対象の文"),
+            event: tagged_event,
             card_ids: Some(vec![10]),
             needs_enhancement: true,
+            received_at: Instant::now(),
+            source: "test",
         })
         .await
         .unwrap();
-        assert!(
-            tokio::time::timeout(Duration::from_millis(100), published.recv())
-                .await
-                .is_err()
-        );
-        conn.execute_batch("COMMIT").unwrap();
-        drop(conn);
-        let card = tokio::time::timeout(Duration::from_secs(5), published.recv())
+        let card = tokio::time::timeout(Duration::from_millis(500), published.recv())
+            .await
+            .expect("card display must not wait for SQLite")
+            .unwrap();
+        assert!(card.skip_confirmation);
+        // A second card must not wait behind the first card's save either.
+        tx.send(NewCardNotification {
+            event: event(2, "対象の文"),
+            card_ids: Some(vec![20]),
+            needs_enhancement: true,
+            received_at: Instant::now(),
+            source: "test",
+        })
+        .await
+        .unwrap();
+        let second = tokio::time::timeout(Duration::from_millis(500), published.recv())
             .await
             .unwrap()
             .unwrap();
+        assert_eq!(second.event.note_id, 2);
+        assert!(!second.skip_confirmation);
+        let request: EnrichRequest = serde_json::from_value(serde_json::json!({
+            "note_id": 2, "start_ms": 900, "end_ms": 2500, "generate_avif": false
+        }))
+        .unwrap();
+        let response = tokio::time::timeout(
+            Duration::from_millis(500),
+            enrich_card(State(state.clone()), Json(request)),
+        )
+        .await
+        .expect("confirmation acknowledgement must not wait for SQLite")
+        .0;
+        assert!(response.success);
+        assert_eq!(enhancement_rx.recv().await.unwrap().req.note_id, 2);
+        let skip_state = state.clone();
+        let skip = tokio::spawn(async move {
+            skip_enrichment(State(skip_state), Json(serde_json::json!({"note_id": 1}))).await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !skip.is_finished(),
+            "skip must wait for the captured snapshot"
+        );
+        conn.execute_batch("COMMIT").unwrap();
+        drop(conn);
+        assert_eq!(skip.await.unwrap().0["ok"], true);
+        ensure_review_saved(&state, 2).await.unwrap();
         let saved = db.review_dialog(card.event.note_id).await.unwrap().unwrap();
         assert_eq!(saved.card_ids, vec![10]);
         assert_eq!(saved.matched_text.as_deref(), Some("対象の文"));
-        db.update_review_card(1, "skipped", None, None)
-            .await
-            .unwrap();
         let sessions = db.list_review_sessions().await.unwrap();
         let detail = db
             .review_detail(sessions[0].id.clone())
@@ -1267,16 +1529,13 @@ async fn enqueue_enhancement_job(
         );
     }
 
-    if let Err(error) = state
-        .db
-        .update_review_card(note_id, "queued", None, None)
-        .await
-    {
-        warn!("Could not persist queued review status: {}", error);
-    }
     if state
         .enhancement_tx
-        .send(EnhancementJob { req, fallback })
+        .send(EnhancementJob {
+            req,
+            fallback,
+            queued_at: Instant::now(),
+        })
         .await
         .is_err()
     {
@@ -1299,6 +1558,7 @@ async fn enqueue_enhancement_job(
 pub struct EnhancementJob {
     pub req: EnrichRequest,
     pub fallback: Option<EnrichmentDialogState>,
+    queued_at: Instant,
 }
 
 const ENHANCEMENT_TIMEOUT: Duration = Duration::from_secs(120);
@@ -1347,6 +1607,14 @@ async fn enhancement_worker_loop(
         };
 
         let note_id = job.req.note_id;
+        let started = Instant::now();
+        info!(
+            note_id,
+            worker_id,
+            stage = "worker_started",
+            queue_wait_ms = job.queued_at.elapsed().as_millis(),
+            "Enhancement worker accepted card"
+        );
         info!("[worker-{}] Processing note {}", worker_id, note_id);
         update_enhancement_queue_item(&state, note_id, EnhancementQueueState::Running).await;
         info!("Starting enhancement for note {}", note_id);
@@ -1358,16 +1626,21 @@ async fn enhancement_worker_loop(
             .map(|entry| entry.card_ids.clone())
             .unwrap_or_default();
 
-        let result = AssertUnwindSafe(tokio::time::timeout(
-            ENHANCEMENT_TIMEOUT,
-            perform_enrichment(&state, &job.req, fallback_event, fallback_card_ids),
-        ))
+        let result = AssertUnwindSafe(tokio::time::timeout(ENHANCEMENT_TIMEOUT, async {
+            ensure_review_saved(&state, note_id).await?;
+            state
+                .db
+                .update_review_card(note_id, "running", None, None)
+                .await
+                .map_err(|error| format!("Could not save enhancement status: {error}"))?;
+            perform_enrichment(&state, &job.req, fallback_event, fallback_card_ids).await
+        }))
         .catch_unwind()
         .await;
 
-        let tags = match &result {
+        let (tags_to_add, tags_to_remove) = match &result {
             Ok(Ok(Ok(tags))) => tags.clone(),
-            _ => Vec::new(),
+            _ => (Vec::new(), Vec::new()),
         };
 
         remove_enhancement_queue_item(&state, note_id).await;
@@ -1426,12 +1699,30 @@ async fn enhancement_worker_loop(
                 .await;
         }
         let _ = state.enhancement_result_tx.send(enhancement_result);
+        info!(
+            note_id,
+            worker_id,
+            stage = "result_published",
+            elapsed_ms = started.elapsed().as_millis(),
+            "Enhancement result sent to browsers"
+        );
         // Optional tag bookkeeping follows the confirmed field update and its
         // UI notification; it cannot hold up the success checkmark.
-        if !tags.is_empty() {
+        if !tags_to_add.is_empty() || !tags_to_remove.is_empty() {
             let client = state.anki_client.read().await.clone();
-            if let Err(error) = client.add_tags(&[note_id], &tags.join(" ")).await {
-                warn!("Failed to add tags to note {}: {}", note_id, error);
+            if !tags_to_add.is_empty() {
+                if let Err(error) = client.add_tags(&[note_id], &tags_to_add.join(" ")).await {
+                    warn!("Failed to add tags to note {}: {}", note_id, error);
+                }
+            }
+            // Removal wins when a tag is configured in both lists.
+            if !tags_to_remove.is_empty() {
+                if let Err(error) = client
+                    .remove_tags(&[note_id], &tags_to_remove.join(" "))
+                    .await
+                {
+                    warn!("Failed to remove tags from note {}: {}", note_id, error);
+                }
             }
         }
         info!(
@@ -1548,7 +1839,12 @@ async fn generate_and_store_screenshot(
         "[enhance {}] Capturing screenshot fallback at {}ms...",
         note_id, capture_time_ms
     );
-    match media::generate_screenshot(source, capture_time_ms, static_format).await {
+    match enrichment_stage(
+        "static_image",
+        media::generate_screenshot(source, capture_time_ms, static_format),
+    )
+    .await
+    {
         Ok(image) => {
             let ss_filename = anki_media_filename(
                 media_name,
@@ -1560,7 +1856,12 @@ async fn generate_and_store_screenshot(
                 image.format.extension(),
             );
             let ss_b64 = media::to_base64(&image.data);
-            let picture_html = match anki_client.store_media_file(&ss_filename, &ss_b64).await {
+            let picture_html = match enrichment_stage(
+                "static_image_upload",
+                anki_client.store_media_file(&ss_filename, &ss_b64),
+            )
+            .await
+            {
                 Ok(_) => {
                     info!("[enhance {}] Screenshot stored in Anki", note_id);
                     Some(format!("<img src=\"{}\">", ss_filename))
@@ -1790,12 +2091,13 @@ mod media_filename_tests {
     }
 }
 
+#[tracing::instrument(name = "anki_enhancement", skip_all, fields(note_id = req.note_id))]
 async fn perform_enrichment(
     state: &Arc<AppState>,
     req: &EnrichRequest,
     fallback_event: Option<NewCardEvent>,
     fallback_card_ids: Vec<i64>,
-) -> Result<Vec<String>, String> {
+) -> Result<(Vec<String>, Vec<String>), String> {
     let note_id = req.note_id;
     let result = async {
         info!(
@@ -1812,19 +2114,18 @@ async fn perform_enrichment(
             media_ctx.media_source_id
         );
 
-        info!("[enhance {}] Reading config...", note_id);
         let mut config = state.config.read().await.clone();
         if let Some(fields) = crate::word_mining::db::note_fields(state.db.db_path.clone(), note_id)
-            .await.map_err(|e| e.to_string())? {
+            .await
+            .map_err(|e| e.to_string())?
+        {
             config.anki.fields.sentence = fields.sentence;
             config.anki.fields.sentence_audio = fields.audio;
             config.anki.fields.picture = fields.picture;
             config.anki.fields.source_name = Some(fields.source);
             config.anki.fields.sentence_translation = None;
         }
-        info!("[enhance {}] Getting server...", note_id);
         let server_opt = get_server(state, media_ctx.server_kind).await;
-        info!("[enhance {}] Reading anki client...", note_id);
         let anki_client = state.anki_client.read().await.clone();
 
         let reused_assets = if let Some(source_note_id) = req.reuse_assets_from_note_id {
@@ -1837,7 +2138,6 @@ async fn perform_enrichment(
             None
         };
 
-        let mut audio_path = None;
         let assets = if let Some(assets) = reused_assets {
             info!("[enhance {}] Re-using cached mining assets", note_id);
             assets
@@ -1860,16 +2160,19 @@ async fn perform_enrichment(
             .map_err(|error| format!("Failed to resolve media source: {}", error))?;
             info!("[enhance {}] Media source resolved", note_id);
 
-            let media_probe = match media::probe_media(&source, req.start_ms).await {
-                Ok(probe) => Some(probe),
-                Err(error) => {
-                    warn!(
-                        "[enhance {}] Could not inspect media streams/chapters: {}",
-                        note_id, error
-                    );
-                    None
-                }
-            };
+            let media_probe =
+                match enrichment_stage("media_probe", media::probe_media(&source, req.start_ms))
+                    .await
+                {
+                    Ok(probe) => Some(probe),
+                    Err(error) => {
+                        warn!(
+                            "[enhance {}] Could not inspect media streams/chapters: {}",
+                            note_id, error
+                        );
+                        None
+                    }
+                };
             let fallback_audio_only = media_ctx
                 .file_path
                 .as_deref()
@@ -1891,20 +2194,19 @@ async fn perform_enrichment(
                 "[enhance {}] Extracting audio ({}ms - {}ms)...",
                 note_id, req.start_ms, req.end_ms
             );
-            let selected_audio_track = *state.selected_audio_track.read().await;
             let (audio_track_index, audio_track_ordinal) =
-                match state.db.review_audio_mapping(note_id).await {
-                    Ok(Some(mapping)) => mapping,
-                    _ => resolve_audio_mapping(&state, selected_audio_track).await,
-                };
+                note_audio_mapping(state, Some(note_id)).await;
             let audio_codec = config.mining.audio_codec;
-            let (generated_audio_path, audio_data) = media::extract_audio(
-                &source,
-                req.start_ms,
-                req.end_ms,
-                audio_track_index,
-                audio_track_ordinal,
-                audio_codec,
+            let audio_data = enrichment_stage(
+                "audio_extraction",
+                state.audio_cache.extract(
+                    &source,
+                    req.start_ms,
+                    req.end_ms,
+                    audio_track_index,
+                    audio_track_ordinal,
+                    audio_codec,
+                ),
             )
             .await
             .map_err(|error| format!("Audio extraction failed: {}", error))?;
@@ -1925,15 +2227,15 @@ async fn perform_enrichment(
                 audio_filename
             );
 
-            if let Err(error) = anki_client
-                .store_media_file(&audio_filename, &audio_b64)
-                .await
+            if let Err(error) = enrichment_stage(
+                "audio_upload",
+                anki_client.store_media_file(&audio_filename, &audio_b64),
+            )
+            .await
             {
-                media::cleanup_temp_file(&generated_audio_path).await;
                 return Err(format!("Failed to store audio: {}", error));
             }
             info!("[enhance {}] Audio stored in Anki", note_id);
-            audio_path = Some(generated_audio_path);
 
             let mut picture_html = String::new();
             let mid_ms = (req.start_ms + req.end_ms) / 2;
@@ -1946,11 +2248,9 @@ async fn perform_enrichment(
                     req.start_ms,
                     req.end_ms
                 );
-                match media::generate_avif(
-                    &source,
-                    req.start_ms,
-                    req.end_ms,
-                    &config.mining,
+                match enrichment_stage(
+                    "animated_image",
+                    media::generate_avif(&source, req.start_ms, req.end_ms, &config.mining),
                 )
                 .await
                 {
@@ -1965,9 +2265,11 @@ async fn perform_enrichment(
                             "avif",
                         );
                         let avif_b64 = media::to_base64(&avif_data);
-                        if let Err(error) = anki_client
-                            .store_media_file(&avif_filename, &avif_b64)
-                            .await
+                        if let Err(error) = enrichment_stage(
+                            "animated_image_upload",
+                            anki_client.store_media_file(&avif_filename, &avif_b64),
+                        )
+                        .await
                         {
                             warn!("Failed to store AVIF in Anki: {}", error);
                         } else {
@@ -2046,13 +2348,12 @@ async fn perform_enrichment(
             fields.len()
         );
         fields.retain(|name, _| !name.is_empty());
-        if let Err(error) = anki_client
-            .update_note_fields(req.note_id, fields.clone(), None, None)
-            .await
+        if let Err(error) = enrichment_stage(
+            "note_fields_update",
+            anki_client.update_note_fields(req.note_id, fields.clone(), None, None),
+        )
+        .await
         {
-            if let Some(path) = audio_path.as_ref() {
-                media::cleanup_temp_file(path).await;
-            }
             return Err(format!("Failed to update note: {}", error));
         }
         info!("[enhance {}] Note fields updated", note_id);
@@ -2095,13 +2396,16 @@ async fn perform_enrichment(
             }
         }
 
-        if let Some(path) = audio_path.as_ref() {
-            media::cleanup_temp_file(path).await;
-        }
         info!("[enhance {}] Saving mining history entry...", note_id);
+        let history_started = Instant::now();
         save_mining_history_entry(state, req, &media_ctx, saved_event, fallback_card_ids).await;
+        info!(
+            stage = "mining_history_saved",
+            elapsed_ms = history_started.elapsed().as_millis(),
+            "Mining history save finished"
+        );
         info!("[enhance {}] Enhancement complete", note_id);
-        Ok(tags_to_add)
+        Ok((tags_to_add, config.anki.remove_tags.clone()))
     }
     .await;
 
@@ -2113,17 +2417,46 @@ pub async fn run_new_card_processor(
     mut rx: mpsc::Receiver<NewCardNotification>,
 ) {
     use std::hash::{Hash, Hasher};
+    // A bounded writer queue keeps slow disks away from subsequent cards too.
+    let (save_tx, mut save_rx) = mpsc::channel::<i64>(128);
+    let save_state = state.clone();
+    let writer = tokio::spawn(async move {
+        while let Some(note_id) = save_rx.recv().await {
+            if let Err(error) = ensure_review_saved(&save_state, note_id).await {
+                error!(note_id, stage = "review_save_failed", %error, "Snapshot remains in memory; confirmation will retry the save");
+            }
+        }
+    });
     let mut seen = std::collections::HashSet::new();
     let mut last_session: Option<(String, String)> = None;
     let mut last_note_at = std::time::Instant::now();
     while let Some(notification) = rx.recv().await {
-        let received_at = std::time::Instant::now();
+        let received_at = notification.received_at;
+        let intake_source = notification.source;
+        let note_id = notification.event.note_id;
+        info!(
+            note_id,
+            stage = "matching",
+            intake_source,
+            queue_wait_ms = received_at.elapsed().as_millis(),
+            "Matching received card to subtitle context"
+        );
         let Some((candidate, track)) = prepare_enrichment_candidate(&state, notification).await
         else {
+            info!(
+                note_id,
+                stage = "intake_ignored",
+                "No subtitle match in the active mining context"
+            );
             continue;
         };
 
         if !seen.insert(candidate.event.note_id) {
+            info!(
+                note_id,
+                stage = "intake_duplicate",
+                "Card already published"
+            );
             continue;
         }
         let needs_card_ids = candidate.card_ids.is_empty();
@@ -2154,27 +2487,26 @@ pub async fn run_new_card_processor(
             .await
             .map(|ctx| ctx.title)
             .unwrap_or_else(|_| "Mining session".into());
-        if let Err(error) = state
-            .db
-            .record_review_card(
-                last_session.as_ref().unwrap().1.clone(),
-                title,
-                track,
-                candidate.clone(),
-                audio_mapping,
-            )
-            .await
         {
-            error!(
-                "Could not save detected card {} for review: {}",
-                note_id, error
+            let mut saves = state.pending_review_saves.write().await;
+            saves.retain(|_, snapshot| snapshot.created_at.elapsed() < Duration::from_secs(600));
+            saves.insert(
+                note_id,
+                Arc::new(PendingReviewSave {
+                    session_id: last_session.as_ref().unwrap().1.clone(),
+                    title,
+                    track,
+                    candidate: candidate.clone(),
+                    audio_mapping,
+                    saved: OnceCell::new(),
+                    created_at: Instant::now(),
+                }),
             );
         }
 
         // The browser can immediately auto-enhance or skip a published card.
-        // Save its snapshot first so those updates cannot race a missing row
-        // or fall back to a different live audio track. Optional AnkiConnect
-        // card-ID lookups still happen after the notification.
+        // Its snapshot is registered above. Only actions which mutate the card
+        // wait for persistence; showing it and preparing audio do not.
         if candidate.source == EnrichmentSource::Pending {
             queue_pending_enrichment(&state, candidate).await;
         } else {
@@ -2182,9 +2514,15 @@ pub async fn run_new_card_processor(
         }
         info!(
             note_id,
+            stage = "card_published",
+            intake_source,
             elapsed_ms = received_at.elapsed().as_millis(),
-            "Card matched and published to WebSocket"
+            listeners = state.new_card_tx.receiver_count(),
+            "Card matched and published to browsers; disk save runs separately"
         );
+        if save_tx.send(note_id).await.is_err() {
+            break;
+        }
 
         if needs_card_ids {
             match state.card_lookup_semaphore.clone().try_acquire_owned() {
@@ -2202,6 +2540,8 @@ pub async fn run_new_card_processor(
             }
         }
     }
+    drop(save_tx);
+    let _ = writer.await;
 }
 
 /// Resolve the Anki card ids for a freshly-detected note out of band and patch
@@ -2210,6 +2550,7 @@ pub async fn run_new_card_processor(
 /// enrichment is open-by-card-id routing, which falls back to the note-id path
 /// if it races ahead of this backfill.
 async fn backfill_pending_card_ids(state: &Arc<AppState>, note_id: i64) {
+    let started = Instant::now();
     let client = state.anki_client.read().await.clone();
     let ids = match client.find_cards_for_note(note_id).await {
         Ok(ids) if !ids.is_empty() => ids,
@@ -2232,7 +2573,17 @@ async fn backfill_pending_card_ids(state: &Arc<AppState>, note_id: i64) {
             entry.card_ids = ids.clone();
         }
     }
+    if let Err(error) = ensure_review_saved(state, note_id).await {
+        warn!(note_id, %error, "Could not persist optional card IDs");
+        return;
+    }
     let _ = state.db.backfill_review_card_ids(note_id, ids).await;
+    info!(
+        note_id,
+        stage = "card_ids_backfilled",
+        elapsed_ms = started.elapsed().as_millis(),
+        "Optional card lookup finished"
+    );
 }
 
 async fn enrich_card(
@@ -2347,6 +2698,14 @@ async fn skip_enrichment(
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
     if let Some(note_id) = body.get("note_id").and_then(|v| v.as_i64()) {
+        info!(
+            note_id,
+            stage = "skip_requested",
+            "User skipped enhancement"
+        );
+        if let Err(error) = ensure_review_saved(&state, note_id).await {
+            return Json(serde_json::json!({"ok": false, "error": error}));
+        }
         remove_pending_enrichment(&state, note_id).await;
         let _ = state
             .db
@@ -2922,10 +3281,12 @@ struct PreviewAudioRequest {
     item_id: Option<String>,
 }
 
+#[tracing::instrument(name = "audio_preview", skip_all, fields(note_id = ?req.note_id, start_ms = req.start_ms, end_ms = req.end_ms))]
 async fn preview_audio_url(
     State(state): State<Arc<AppState>>,
     Json(req): Json<PreviewAudioRequest>,
 ) -> Json<serde_json::Value> {
+    info!(stage = "preview_requested", "Audio preview requested");
     let media_ctx = match resolve_media_context(&state, req.item_id.as_deref()).await {
         Ok(ctx) => ctx,
         Err(error) => return Json(serde_json::json!({"error": error})),
@@ -2948,30 +3309,22 @@ async fn preview_audio_url(
         }
     };
 
-    let selected_audio_track = *state.selected_audio_track.read().await;
-    let saved_mapping = if let Some(note_id) = req.note_id {
-        state.db.review_audio_mapping(note_id).await.ok().flatten()
-    } else {
-        None
-    };
-    let (audio_track_index, audio_track_ordinal) = match saved_mapping {
-        Some(mapping) => mapping,
-        None => resolve_audio_mapping(&state, selected_audio_track).await,
-    };
+    let (audio_track_index, audio_track_ordinal) = note_audio_mapping(&state, req.note_id).await;
     let audio_codec = config.mining.audio_codec;
-    match media::extract_audio(
-        &source,
-        req.start_ms,
-        req.end_ms,
-        audio_track_index,
-        audio_track_ordinal,
-        audio_codec,
-    )
-    .await
+    match state
+        .audio_cache
+        .extract(
+            &source,
+            req.start_ms,
+            req.end_ms,
+            audio_track_index,
+            audio_track_ordinal,
+            audio_codec,
+        )
+        .await
     {
-        Ok((path, data)) => {
+        Ok(data) => {
             let b64 = media::to_base64(&data);
-            media::cleanup_temp_file(&path).await;
             Json(serde_json::json!({
                 "audio_base64": b64,
                 "format": audio_codec.as_str(),
@@ -3206,6 +3559,7 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
     let mut session_rx = state.session_rx.clone();
     let mut card_rx = state.new_card_tx.subscribe();
     let mut result_rx = state.enhancement_result_tx.subscribe();
+    let mut review_rx = state.review_saved_tx.subscribe();
     let mut remote_rx = state.remote_result_tx.subscribe();
     let subtitles = state.subtitles.clone();
     let native_subtitles = state.native_subtitles.clone();
@@ -3273,6 +3627,11 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
         loop {
             tokio::select! {
                 biased;
+                review = review_rx.recv() => {
+                    if let Ok(note_id) = review {
+                        if sender.send(Message::Text(serde_json::json!({"type": "review_saved", "note_id": note_id}).to_string().into())).await.is_err() { break; }
+                    }
+                }
                 card_result = card_rx.recv() => {
                     let candidate = match card_result {
                         Ok(e) => e,
@@ -3282,6 +3641,9 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
                         }
                         Err(broadcast::error::RecvError::Closed) => break,
                     };
+
+                    let note_id = candidate.event.note_id;
+                    let started = Instant::now();
 
                     let msg = WsMessage {
                         msg_type: "new_card".to_string(),
@@ -3301,6 +3663,7 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
                         if sender.send(Message::Text(json.into())).await.is_err() {
                             break;
                         }
+                        info!(note_id, stage = "websocket_sent", elapsed_ms = started.elapsed().as_millis(), "Card delivered to WebSocket connection");
                     }
                 }
                 result = result_rx.recv() => {

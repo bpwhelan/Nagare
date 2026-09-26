@@ -1,5 +1,9 @@
 # Word mining from History
 
+**WIP / untested in real-world use.** Vocabulary discovery, recommendations, and
+individual or bulk Anki card creation are experimental. Automated checks cover
+parts of this workflow, but it still needs everyday-use testing.
+
 Open **History → Watch history → Mine words** on any file. Nagare uses that
 file's media and saved subtitles. You can also choose a matching SRT, VTT, ASS,
 or SSA file in the mining workspace. Uploaded subtitles belong to this workspace;

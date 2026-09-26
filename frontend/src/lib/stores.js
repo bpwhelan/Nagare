@@ -21,7 +21,7 @@ function localStorageStore(key, defaultValue) {
 /** @typedef {{ id: string, source: 'server'|'sidecar', stream_index: number|null, language: string|null, label: string, codec: string|null, is_default: boolean, is_external: boolean, is_selected_in_session: boolean, match_confidence?: number }} SubtitleCandidate */
 /** @typedef {{ lines: SubtitleLine[], count: number, candidates: SubtitleCandidate[], selected_candidate_id: string|null, selection_mode: 'auto'|'manual', loading?: boolean }} SubtitlePayload */
 /** @typedef {{ note_id: number, sentence: string, fields: Object, model_name: string, tags: string[] }} NewCardEvent */
-/** @typedef {{ event: NewCardEvent, matched_line_index: number|null, history_id?: string|null, start_ms?: number|null, end_ms?: number|null, generate_avif?: boolean|null, included_line_first?: number|null, included_line_last?: number|null, card_ids?: number[], source?: 'pending'|'retry'|'mining_history', updated_at?: string|null }} NewCardWithMatch */
+/** @typedef {{ event: NewCardEvent, matched_line_index: number|null, history_id?: string|null, start_ms?: number|null, end_ms?: number|null, generate_avif?: boolean|null, included_line_first?: number|null, included_line_last?: number|null, card_ids?: number[], source?: 'pending'|'retry'|'mining_history', skip_confirmation?: boolean, updated_at?: string|null }} NewCardWithMatch */
 /** @typedef {{ state: 'unknown'|'connected'|'disconnected', message: string|null }} AnkiStatus */
 /** @typedef {{ note_id: number, state: 'queued'|'running', message: string }} EnhancementQueueItem */
 

@@ -69,11 +69,18 @@ already tracks; it does not extract subtitles from arbitrary streaming sites.
 
 ## Browser considerations
 
-The script uses the manager's cross-origin HTTP requests for the API, with a
-default update interval of 750 ms (3 seconds in a background tab). It doesn't
-require an HTTPS player page to embed an HTTP Nagare iframe or open an insecure
-WebSocket. It retries disconnected requests and retains server result events
-between polls. Subtitle files are only transferred when their revision changes.
+The Companion uses a WebSocket for immediate card, playback, and enhancement
+events, with no polling while connected. API commands still use the manager's
+cross-origin HTTP requests. If an HTTPS player or its security policy blocks
+the configured WebSocket, the Companion uses privileged HTTP requests that
+wait on the server and wake immediately for card/result events. The refresh
+interval controls playback snapshots on this fallback (750 ms by default,
+3 seconds in a background tab), without adding that delay to card delivery.
+Disconnected connections retry, and the fallback retains events between
+requests. Subtitle files are transferred only when their revision changes.
+
+Update/reinstall the Companion userscript after updating Nagare to receive
+these browser changes (Companion 0.1.3 or later).
 
 The metadata matches HTTP/HTTPS pages so sites can be changed in settings. Only
 enabled origins mount the panel or contact Nagare; other sites receive the manager
@@ -91,6 +98,28 @@ actual Jellyfin origin before deciding whether an extension is necessary.
 
 Reinstall from your Nagare server after updates that change the frontend. The
 script has no external runtime/CDN dependencies or remote code loader.
+
+## Checking the connection
+
+Open the browser's developer tools on the Nagare website or the player page,
+enable **Preserve log**, and filter the Console for `Nagare connection`.
+Both clients report the connection URL, handshake and first-message timings,
+disconnect codes, reconnect reasons, and long gaps in server traffic. These
+diagnostics stay in the browser console; routine playback updates are not logged.
+
+For a working HTTPS reverse proxy, expect `websocket_connecting` with your
+public `wss://…/ws` URL, followed by `websocket_open` and `websocket_ready`.
+The latter confirms that server messages are reaching the browser. Each
+`event_received` for a new card or enhancement result includes its `note_id`
+and `transport`, which should be `websocket`. Compare the same note's
+`[Nagare enhancement]` receipt and `dialog_shown` logs to measure the time
+from browser receipt to the confirmation dialog.
+
+If the Companion switches transports, `http_fallback_started` explains why;
+card events then show `transport: "http_fallback"`. A successful WebSocket
+reconnection logs `http_fallback_stopped`. Browser WebSocket errors often
+hide the underlying HTTP error, so inspect the `/ws` request in the Network
+tab when an upgrade fails. A successful HTTP/1.1 upgrade returns status 101.
 
 ## Development and validation
 

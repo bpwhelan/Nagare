@@ -1,4 +1,5 @@
 import { DEFAULTS, validateSettings } from './settings.js';
+export const clientKind = 'companion';
 
 const SETTINGS_KEY = 'nagare_userscript_settings';
 const overrides = typeof NAGARE_DEFAULTS === 'undefined' ? {} : NAGARE_DEFAULTS;
@@ -25,7 +26,8 @@ export function requestJson(path, options = {}) {
 }
 
 export function requestAt(serverUrl, path, options = {}) {
-  const mutation = options.method && options.method !== 'GET';
+  const readOnlyPost = ['/api/enrich/client-event', '/api/preview-audio', '/api/preview-screenshot', '/api/audio-tracks/preview', '/api/subtitle/matches'].includes(path);
+  const mutation = options.method && options.method !== 'GET' && !readOnlyPost;
   if (mutation) { revision++; mutations++; }
   return new Promise((resolve, reject) => {
     const failure = () => reject(new Error('Cannot reach Nagare. Check the server address and allow it in your userscript manager.'));

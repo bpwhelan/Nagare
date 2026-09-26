@@ -138,7 +138,8 @@ impl PlexClient {
             .unwrap_or("Unknown")
             .to_string();
         let user_name = v["User"]["title"].as_str().map(String::from);
-        let user_id = v["User"]["id"].as_u64().map(|id| id.to_string());
+        // Sessions may encode account IDs as strings, unlike the /accounts response.
+        let user_id = Self::value_as_u64(&v["User"]["id"]).map(|id| id.to_string());
         // PMS companion control consistently rejects Plex Web sessions with 404,
         // even when they appear in /status/sessions, so don't advertise them as
         // remotely controllable through the server.
@@ -961,6 +962,75 @@ impl MediaServer for PlexClient {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn selected_account_matches_string_and_numeric_session_user_ids() {
+        use crate::config::Config;
+        use axum::{Json, Router, routing::get};
+
+        let app = Router::new()
+            .route(
+                "/accounts",
+                get(|| async {
+                    Json(json!({ "MediaContainer": { "Account": [
+                        { "id": 42, "name": "Selected viewer" },
+                        { "id": "84", "name": "Other viewer" }
+                    ] } }))
+                }),
+            )
+            .route(
+                "/status/sessions",
+                get(|| async {
+                    let metadata: Vec<_> = [
+                        ("selected-string", json!("42")),
+                        ("selected-number", json!(42)),
+                        ("other-user", json!("84")),
+                        ("unknown-user", Value::Null),
+                    ]
+                    .into_iter()
+                    .map(|(device, user_id)| {
+                        json!({
+                            "ratingKey": "episode",
+                            "Player": { "machineIdentifier": device, "state": "playing" },
+                            "User": { "id": user_id, "title": "Viewer" }
+                        })
+                    })
+                    .collect();
+                    Json(json!({ "MediaContainer": { "Metadata": metadata } }))
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = PlexClient::new(&base_url, "test-token");
+        let users = client.get_users().await.unwrap();
+        let sessions = client.get_sessions().await.unwrap();
+        server.abort();
+
+        let mut config: Config = serde_json::from_value(json!({
+            "plex": { "url": base_url, "token": "test-token", "users": [] }
+        }))
+        .unwrap();
+        let allowed_ids = |config: &Config| {
+            sessions
+                .iter()
+                .filter(|session| {
+                    config.is_user_allowed(
+                        MediaServerKind::Plex,
+                        session.user_id.as_deref(),
+                        session.user_name.as_deref(),
+                    )
+                })
+                .map(|session| session.id.as_str())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(allowed_ids(&config).len(), 4);
+        assert_eq!(users.len(), 2);
+        config.plex.as_mut().unwrap().users = vec![users[0].id.clone()];
+        assert_eq!(allowed_ids(&config), ["selected-string", "selected-number"]);
+        config.plex.as_mut().unwrap().users = vec![users[1].id.clone()];
+        assert_eq!(allowed_ids(&config), ["other-user"]);
+    }
 
     #[test]
     fn separates_playback_instance_from_remote_control_identifier() {

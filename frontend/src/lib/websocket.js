@@ -1,4 +1,6 @@
 import { get } from 'svelte/store';
+import { logEnrichment } from './enrichmentLog.js';
+import { createConnectionLog } from './connectionLog.js';
 import { confirmCardReceived, reviewRevision } from './stores.js';
 import { activeHistoryItemId, sessionState, pendingCards, connected, ankiStatus, enhancementQueue, syncPositionFromSessionState, isSeekLocked, isPlayLocked, applySubtitlePayload, applyAudioTracksPayload, showErrorToast, flashEnhancementSuccess, forceResync } from './stores.js';
 
@@ -6,51 +8,58 @@ let ws = null;
 let reconnectTimer = null;
 let lastMessageAt = 0;
 let resyncWatchdog = null;
+let connectionLog = null;
 
 export function connectWebSocket() {
   if (ws && ws.readyState === WebSocket.OPEN) return;
 
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   const url = `${proto}//${location.host}/ws`;
-
-  ws = new WebSocket(url);
+  const diagnostics = createConnectionLog('website', url);
+  connectionLog = diagnostics;
+  try { ws = new WebSocket(url); }
+  catch (error) { diagnostics.error(error); throw error; }
+  const socket = ws;
 
   ws.onopen = () => {
     connected.set(true);
-    console.log('WebSocket connected');
+    diagnostics.opened();
     if (reconnectTimer) {
       clearTimeout(reconnectTimer);
       reconnectTimer = null;
     }
   };
 
-  ws.onclose = () => {
+  ws.onclose = event => {
+    diagnostics.closed(event);
     connected.set(false);
     ankiStatus.set({ state: 'unknown', message: null });
     enhancementQueue.set([]);
     // Drop the stale playback clock so the fresh `init` snapshot re-anchors cleanly.
     forceResync();
-    console.log('WebSocket disconnected, reconnecting in 2s...');
+    diagnostics.event('reconnect_scheduled', { retry_in_ms: 2000, reason: 'socket_closed' });
     reconnectTimer = setTimeout(connectWebSocket, 2000);
   };
 
   ws.onerror = (e) => {
-    console.error('WebSocket error:', e);
+    diagnostics.error(e, socket.readyState);
   };
 
   ws.onmessage = (event) => {
     lastMessageAt = Date.now();
     try {
       const msg = JSON.parse(event.data);
+      diagnostics.message(msg);
       handleMessage(msg);
     } catch (e) {
-      console.error('Failed to parse WS message:', e);
+      diagnostics.event('message_processing_failed', { message: e.message }, 'warn');
     }
   };
 }
 
 /** Tear down the current socket and reconnect immediately, skipping the backoff timer. */
-function reconnectNow() {
+function reconnectNow(reason = 'requested') {
+  connectionLog?.event('reconnect_requested', { reason });
   if (reconnectTimer) {
     clearTimeout(reconnectTimer);
     reconnectTimer = null;
@@ -77,7 +86,7 @@ export function resyncFromBackground() {
 
   // Dead or closing socket: reconnect right away instead of waiting out the backoff.
   if (!ws || ws.readyState === WebSocket.CLOSING || ws.readyState === WebSocket.CLOSED) {
-    reconnectNow();
+    reconnectNow('socket_unavailable_on_resume');
     return;
   }
 
@@ -89,8 +98,7 @@ export function resyncFromBackground() {
     clearTimeout(resyncWatchdog);
     resyncWatchdog = setTimeout(() => {
       if (lastMessageAt === seenAt) {
-        console.log('No WS traffic after resume, reconnecting');
-        reconnectNow();
+        reconnectNow('no_messages_within_1500ms_of_resume');
       }
     }, 1500);
   }
@@ -149,6 +157,7 @@ export function handleMessage(msg) {
 
     case 'new_card':
       if (msg.new_card) {
+        logEnrichment(msg.new_card.event.note_id, 'received');
         confirmCardReceived(msg.new_card.event.note_id);
         reviewRevision.update(n => n + 1);
         pendingCards.update(cards => {
@@ -162,6 +171,10 @@ export function handleMessage(msg) {
           return [...cards, msg.new_card].slice(-10);
         });
       }
+      break;
+
+    case 'review_saved':
+      reviewRevision.update(n => n + 1);
       break;
 
     case 'enhancement_result':
@@ -189,6 +202,7 @@ export function handleMessage(msg) {
 }
 
 export function disconnect() {
+  connectionLog?.event('connection_stopped', { reason: 'client_disconnected' });
   if (ws) {
     ws.close();
     ws = null;

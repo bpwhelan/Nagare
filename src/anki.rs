@@ -66,6 +66,8 @@ pub struct NewCardNotification {
     pub event: NewCardEvent,
     pub card_ids: Option<Vec<i64>>,
     pub needs_enhancement: bool,
+    pub received_at: Instant,
+    pub source: &'static str,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -78,6 +80,8 @@ pub enum AnkiBeaconEventKind {
 #[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]
 pub struct AnkiBeaconEvent {
+    #[serde(skip, default = "Instant::now")]
+    pub received_at: Instant,
     #[serde(default)]
     pub addon: Option<String>,
     #[serde(default)]
@@ -233,6 +237,13 @@ impl AnkiClient {
 
         let mut last_err = anyhow::anyhow!("no attempts");
         for attempt in 0..=max_retries {
+            let started = Instant::now();
+            debug!(
+                stage = "ankiconnect_request",
+                action,
+                attempt = attempt + 1,
+                "AnkiConnect request started"
+            );
             let body = json!({
                 "action": action,
                 "version": 6,
@@ -244,9 +255,22 @@ impl AnkiClient {
                     Ok(result) => {
                         if let Some(err) = result.get("error") {
                             if !err.is_null() {
+                                warn!(stage = "ankiconnect_response", action, elapsed_ms = started.elapsed().as_millis(), error = %err, "AnkiConnect rejected request");
                                 // AnkiConnect-level errors are not retried (they're deterministic)
                                 anyhow::bail!("AnkiConnect error: {}", err);
                             }
+                        }
+                        let elapsed_ms = started.elapsed().as_millis();
+                        if elapsed_ms >= 1_000 {
+                            warn!(
+                                stage = "ankiconnect_response",
+                                action, elapsed_ms, "Slow AnkiConnect response"
+                            );
+                        } else {
+                            debug!(
+                                stage = "ankiconnect_response",
+                                action, elapsed_ms, "AnkiConnect request finished"
+                            );
                         }
                         return Ok(result["result"].clone());
                     }
@@ -266,6 +290,8 @@ impl AnkiClient {
                 );
                 tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
                 backoff_ms = (backoff_ms * 2).min(MAX_BACKOFF_MS);
+            } else {
+                debug!(stage = "ankiconnect_failed", action, elapsed_ms = started.elapsed().as_millis(), error = %last_err, "AnkiConnect request failed");
             }
         }
         Err(last_err)
@@ -390,6 +416,12 @@ impl AnkiClient {
             .await?;
         Ok(())
     }
+
+    pub async fn remove_tags(&self, note_ids: &[i64], tags: &str) -> anyhow::Result<()> {
+        self.invoke("removeTags", json!({ "notes": note_ids, "tags": tags }))
+            .await?;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -452,6 +484,12 @@ pub fn note_info_to_event(note: NoteInfo, sentence_field: &str) -> NewCardEvent 
 fn should_skip_note(note: &NoteInfo, cfg: &AnkiConfig) -> bool {
     // The history miner creates complete cards and records its own exact source.
     if note.tags.iter().any(|tag| tag == "nagare::word_miner") {
+        info!(
+            note_id = note.note_id,
+            stage = "note_filtered",
+            reason = "word_miner",
+            "Card already handled by the word miner"
+        );
         return true;
     }
     let sentence = note
@@ -460,18 +498,20 @@ fn should_skip_note(note: &NoteInfo, cfg: &AnkiConfig) -> bool {
         .map(|field| field.value.trim())
         .unwrap_or_default();
     if sentence.is_empty() {
-        debug!(
+        info!(
+            stage = "note_filtered",
             "Skipping note {} (configured sentence field '{}' is empty or missing)",
-            note.note_id, cfg.fields.sentence
+            note.note_id,
+            cfg.fields.sentence
         );
         return true;
     }
 
     // Note type filter
     if !cfg.note_types.is_empty() && !cfg.note_types.contains(&note.model_name) {
-        debug!(
-            "Skipping note {} (model '{}' not in note_types)",
-            note.note_id, note.model_name
+        info!(
+            stage = "note_filtered",
+            "Skipping note {} (model '{}' not in note_types)", note.note_id, note.model_name
         );
         return true;
     }
@@ -479,15 +519,22 @@ fn should_skip_note(note: &NoteInfo, cfg: &AnkiConfig) -> bool {
     // Ignore-tags filter
     if !cfg.ignore_tags.is_empty() && note.tags.iter().any(|t| cfg.ignore_tags.contains(t)) {
         info!(
-            "Skipping note {} (has ignored tag: {:?})",
-            note.note_id, note.tags
+            note_id = note.note_id,
+            stage = "note_filtered",
+            reason = "ignored_tag",
+            "Card has an ignored tag"
         );
         return true;
     }
 
     // Require-tags filter
     if !cfg.require_tags.is_empty() && !note.tags.iter().any(|t| cfg.require_tags.contains(t)) {
-        debug!("Skipping note {} (missing required tag)", note.note_id);
+        info!(
+            note_id = note.note_id,
+            stage = "note_filtered",
+            reason = "missing_required_tag",
+            "Card does not have a required tag"
+        );
         return true;
     }
 
@@ -523,9 +570,9 @@ fn should_skip_note(note: &NoteInfo, cfg: &AnkiConfig) -> bool {
         let needs_picture_update = cfg.skip_if_picture_exists && !picture_already_set;
 
         if !needs_audio_update && !needs_picture_update {
-            debug!(
-                "Skipping note {} (all configured media fields already populated)",
-                note.note_id
+            info!(
+                stage = "enhancement_unnecessary",
+                "Skipping note {} (all configured media fields already populated)", note.note_id
             );
             return true;
         }
@@ -568,6 +615,8 @@ async fn emit_note_info(
     anki_config: &AnkiConfig,
     tx: &mpsc::Sender<NewCardNotification>,
     card_ids: Option<Vec<i64>>,
+    received_at: Instant,
+    source: &'static str,
 ) -> bool {
     let mut intake_config = anki_config.clone();
     intake_config.skip_if_audio_exists = false;
@@ -578,11 +627,23 @@ async fn emit_note_info(
     let needs_enhancement = !should_skip_note(&note, anki_config);
 
     let event = note_info_to_event(note, &anki_config.fields.sentence);
+    info!(
+        note_id = event.note_id,
+        stage = "note_ready",
+        source,
+        needs_enhancement,
+        fields = event.fields.len(),
+        card_ids = card_ids.as_ref().map_or(0, Vec::len),
+        elapsed_ms = received_at.elapsed().as_millis(),
+        "Anki metadata ready for subtitle matching"
+    );
     if tx
         .send(NewCardNotification {
             event,
             card_ids,
             needs_enhancement,
+            received_at,
+            source,
         })
         .await
         .is_err()
@@ -683,7 +744,16 @@ async fn poll_ankiconnect_once(
                     match client.notes_info(&new_ids).await {
                         Ok(notes) => {
                             for note in notes {
-                                if !emit_note_info(note, &anki_config, tx, None).await {
+                                if !emit_note_info(
+                                    note,
+                                    &anki_config,
+                                    tx,
+                                    None,
+                                    Instant::now(),
+                                    "polling_fallback",
+                                )
+                                .await
+                                {
                                     return PollStep::Stop;
                                 }
                             }
@@ -813,7 +883,15 @@ async fn handle_ankibeacon_event(
             let card_ids = payload.provided_card_ids();
 
             if let Some(note) = payload.note_info() {
-                let handled = emit_note_info(note, &anki_config, tx, card_ids).await;
+                let handled = emit_note_info(
+                    note,
+                    &anki_config,
+                    tx,
+                    card_ids,
+                    payload.received_at,
+                    "beacon_full",
+                )
+                .await;
                 if handled {
                     processed_push_notes.insert(note_id);
                 }
@@ -824,7 +902,16 @@ async fn handle_ankibeacon_event(
             match client.notes_info(&[note_id]).await {
                 Ok(notes) => {
                     for note in notes {
-                        if !emit_note_info(note, &anki_config, tx, card_ids.clone()).await {
+                        if !emit_note_info(
+                            note,
+                            &anki_config,
+                            tx,
+                            card_ids.clone(),
+                            payload.received_at,
+                            "beacon_id_lookup",
+                        )
+                        .await
+                        {
                             return false;
                         }
                     }
@@ -889,12 +976,18 @@ pub async fn run_anki_poller(
         let anki_config = config.read().await.anki.clone();
 
         while metadata_jobs.len() < 4 {
-            let Some((note_id, card_ids)) = metadata_pending.pop_front() else {
+            let Some((note_id, card_ids, received_at)) = metadata_pending.pop_front() else {
                 break;
             };
             let client = client.clone();
-            metadata_jobs
-                .spawn(async move { (note_id, card_ids, client.notes_info(&[note_id]).await) });
+            metadata_jobs.spawn(async move {
+                (
+                    note_id,
+                    card_ids,
+                    received_at,
+                    client.notes_info(&[note_id]).await,
+                )
+            });
         }
 
         tokio::select! {
@@ -905,7 +998,8 @@ pub async fn run_anki_poller(
                     if let Some(note_id) = payload.note_id {
                         if !processed_push_notes.contains(&note_id) && metadata_inflight.insert(note_id) {
                             if metadata_pending.len() < 128 {
-                                metadata_pending.push_back((note_id, payload.provided_card_ids()));
+                                info!(note_id, stage = "metadata_lookup_queued", "Beacon payload is incomplete; AnkiConnect metadata is required");
+                                metadata_pending.push_back((note_id, payload.provided_card_ids(), payload.received_at));
                             } else {
                                 metadata_inflight.remove(&note_id);
                                 warn!(note_id, "Anki metadata queue is full; polling will retry");
@@ -921,14 +1015,14 @@ pub async fn run_anki_poller(
                 known_ids.extend(processed_push_notes.iter().copied());
             }
             Some(result) = metadata_jobs.join_next(), if !metadata_jobs.is_empty() => {
-                if let Ok((note_id, card_ids, result)) = result {
+                if let Ok((note_id, card_ids, received_at, result)) = result {
                     metadata_inflight.remove(&note_id);
                     match result {
                         Ok(notes) => {
                             for note in notes {
                                 if processed_push_notes.insert(note.note_id) {
                                     known_ids.insert(note.note_id);
-                                    if !emit_note_info(note, &anki_config, &tx, card_ids.clone()).await { return; }
+                                    if !emit_note_info(note, &anki_config, &tx, card_ids.clone(), received_at, "beacon_id_lookup").await { return; }
                                 }
                             }
                         }
@@ -990,6 +1084,50 @@ mod note_filter_tests {
 
         assert!(should_skip_note(&note_with_sentence(None), &cfg));
         assert!(should_skip_note(&note_with_sentence(Some("   ")), &cfg));
+    }
+}
+
+#[cfg(test)]
+mod tag_action_tests {
+    use super::AnkiClient;
+    use axum::{Json, Router, routing::post};
+    use serde_json::{Value, json};
+
+    #[tokio::test]
+    async fn remove_tags_calls_ankiconnect_with_the_note_ids_and_tags() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Value>(1);
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route(
+                    "/",
+                    post(move |Json(request): Json<Value>| {
+                        let tx = tx.clone();
+                        async move {
+                            tx.send(request).await.unwrap();
+                            Json(json!({"result": null, "error": null}))
+                        }
+                    }),
+                ),
+            )
+            .await
+            .unwrap();
+        });
+
+        let client = AnkiClient::new(&format!("http://{address}"));
+        client
+            .remove_tags(&[12], "temporary pending")
+            .await
+            .unwrap();
+        let request = rx.recv().await.unwrap();
+        assert_eq!(request["action"], "removeTags");
+        assert_eq!(
+            request["params"],
+            json!({"notes": [12], "tags": "temporary pending"})
+        );
+        server.abort();
     }
 }
 
@@ -1129,7 +1267,7 @@ mod notification_latency_tests {
             },
         );
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-        assert!(emit_note_info(note, &cfg, &tx, None).await);
+        assert!(emit_note_info(note, &cfg, &tx, None, Instant::now(), "test").await);
         let notification = rx.recv().await.unwrap();
         assert!(!notification.needs_enhancement);
         assert_eq!(notification.event.sentence, "対象の文");

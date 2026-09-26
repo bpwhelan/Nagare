@@ -4,7 +4,7 @@ import { createPoller } from './poller.js';
 
 const flush = () => new Promise(resolve => setImmediate(resolve));
 const snapshot = (cursor = 1, epoch = 'server-one') => ({ protocol: 1, epoch, cursor, subtitle_revision: 'subs-one', snapshot: { pending_cards: [] } });
-function harness() {
+function harness(options = {}) {
   const requests = [], applied = [], statuses = [], scheduled = [];
   const state = { revision: 0, mutations: 0 };
   const poller = createPoller({
@@ -14,9 +14,18 @@ function harness() {
     requestState: () => ({ ...state }), interval: () => 750,
     schedule: (fn, delay) => { const timer = { fn, delay }; scheduled.push(timer); return timer; },
     cancel: timer => { if (timer) timer.cancelled = true; },
+    ...options,
   });
   return { poller, requests, applied, statuses, scheduled, state };
 }
+
+test('fallback waits on the server and immediately listens again after card delivery', async () => {
+  const h = harness({ longPoll: true }); h.poller.start();
+  assert.equal(new URL(h.requests[0].path, 'https://nagare.test').searchParams.get('wait_ms'), '750');
+  h.requests[0].resolve(snapshot()); await flush();
+  assert.equal(h.scheduled[0].delay, 0);
+  h.poller.stop();
+});
 
 test('snapshots overlapping a confirmation are discarded without consuming the event cursor', async () => {
   const h = harness(); h.poller.start();

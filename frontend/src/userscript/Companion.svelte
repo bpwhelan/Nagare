@@ -11,6 +11,7 @@
     alwaysReuseMiningAssets, showNativeSubtitles, showDownloadButton, ankiStatus, ankiNotice,
     enhancementFlash, enhancementQueue, requestTimelineRecenter, showToast } from '../lib/stores.js';
   import { formatTimeFull } from '../lib/utils.js';
+  import { needsConfirmation } from '../lib/enhancementPolicy.js';
   import { startYomitanObserver, stopYomitanObserver } from '../lib/yomitan.js';
   import { configured, getSettings, saveSettings, requestAt } from './runtime.js';
   import { validateSettings, isTyping, matchesHotkey, matchesSite } from './settings.js';
@@ -31,7 +32,7 @@
   let panel;
   let previousFocus;
 
-  $: needsAttention = $pendingCards.filter(c => !$autoApprove || c.source === 'retry').length;
+  $: needsAttention = $pendingCards.filter(c => needsConfirmation(c, $autoApprove)).length;
   $: reviewEnabled = !settingsOnly && pageVisible && !showSettings && $connected
     && (settings.openOnCard || visible);
 
@@ -159,7 +160,7 @@
         <label>Width (pixels)<input type="number" min="320" max="1000" step="10" bind:value={form.width} required /></label>
         <label>Toggle hotkey<input bind:value={form.hotkey} placeholder="Alt+N" required /></label>
       </div>
-      <label>Refresh interval (ms)<input type="number" min="500" max="10000" step="250" bind:value={form.pollIntervalMs} required /></label>
+      <label>Fallback refresh interval (ms)<input type="number" min="500" max="10000" step="250" bind:value={form.pollIntervalMs} required /></label>
       <label class="check"><input type="checkbox" bind:checked={form.showLauncher} />Show floating launcher</label>
       <label class="check"><input type="checkbox" bind:checked={form.openOnCard} />Show card review over video when sidebar is hidden</label>
       <p class="hint">Card review is centered over the current video. Disable this to review cards only while the sidebar is open.</p>
@@ -197,7 +198,7 @@
     {#if visible && !showSettings}<AudioTrackModal />{/if}
   </div>
 </section>
-<div class="video-dialogs" use:videoAnchor={reviewEnabled && !$autoApprove && $pendingCards.length > 0}>
+<div class="video-dialogs" use:videoAnchor={reviewEnabled && !$autoApprove && needsAttention > 0}>
   <EnrichDialog enabled={reviewEnabled} />
 </div>
 <AutoEnhance enabled={!settingsOnly && pageVisible && $connected} />

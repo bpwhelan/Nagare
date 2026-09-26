@@ -1,8 +1,8 @@
 mod anki;
-mod word_mining;
 mod api;
 mod companion;
 mod config;
+mod database_admin;
 mod kechimochi;
 mod media;
 mod media_server;
@@ -12,6 +12,7 @@ mod review;
 mod session;
 mod subtitle;
 mod tadoku;
+mod word_mining;
 
 use crate::anki::{AnkiBeaconEvent, AnkiClient, AnkiStatus, NewCardNotification};
 use crate::api::AppState;
@@ -245,6 +246,8 @@ async fn main() -> anyhow::Result<()> {
         enhancement_queue: Arc::new(RwLock::new(Vec::new())),
         enhancement_tx,
         reusable_assets: Arc::new(RwLock::new(HashMap::new())),
+        audio_cache: Arc::new(Default::default()),
+        pending_review_saves: RwLock::new(HashMap::new()),
         session_rx,
         new_card_tx: card_tx.clone(),
         subtitles,
@@ -256,6 +259,7 @@ async fn main() -> anyhow::Result<()> {
         card_lookup_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         pending_enrichments: Arc::new(RwLock::new(Vec::new())),
         enhancement_result_tx,
+        review_saved_tx: broadcast::channel(128).0,
         remote_result_tx,
         companion_events: Default::default(),
         audio_tracks,
@@ -266,6 +270,7 @@ async fn main() -> anyhow::Result<()> {
     // Start background tasks
     tokio::spawn(kechimochi_sync.run_scheduler());
     companion::start(&app_state);
+    tokio::spawn(api::run_episode_audio_preparation(app_state.clone()));
     let sm = session_manager.clone();
     tokio::spawn(async move {
         session::run_session_poller(sm).await;

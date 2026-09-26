@@ -44,6 +44,8 @@ pub struct EnrichmentDialogState {
     pub card_ids: Vec<i64>,
     #[serde(default)]
     pub source: EnrichmentSource,
+    #[serde(default)]
+    pub skip_confirmation: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<DateTime<Utc>>,
 }
@@ -85,6 +87,7 @@ pub struct TadokuExportBatch {
     pub batch_id: String,
     pub tadoku_log_id: Option<String>,
     pub is_longform_checkpoint: bool,
+    pub has_rewatch: bool,
     pub series_name: String,
     pub description: String,
     pub duration_seconds: i32,
@@ -148,6 +151,7 @@ impl MiningHistoryEntry {
             included_line_last: self.included_line_last,
             card_ids: self.card_ids.clone(),
             source: EnrichmentSource::MiningHistory,
+            skip_confirmation: false,
             updated_at: Some(self.updated_at),
         }
     }
@@ -611,6 +615,37 @@ pub(crate) fn open_connection(path: &Path) -> anyhow::Result<Connection> {
     )?;
     add_column_if_missing(
         &conn,
+        "media_history",
+        "previous_watches_json",
+        "TEXT NOT NULL DEFAULT '[]'",
+    )?;
+    // Preserve the original history ID for the first watch, including logs
+    // already sent by older versions. Subsequent qualified watches have stable
+    // identities of their own, while mining keeps the per-media history ID.
+    conn.execute_batch(
+        "CREATE VIEW IF NOT EXISTS media_watch_history AS
+        SELECT
+            CASE WHEN json_array_length(h.previous_watches_json) = 0 THEN h.history_id
+                 ELSE 'rewatch:' || json_array_length(h.previous_watches_json) || ':' || h.history_id END AS history_id,
+            h.history_id AS media_history_id,
+            json_array_length(h.previous_watches_json) AS watch_number,
+            h.server_kind, h.item_id, h.title, h.series_name, h.media_source_id,
+            h.file_path, h.duration_ms, h.subtitle_count, h.audio_languages_json,
+            h.last_position_ms, h.last_seen, '[]' AS previous_watches_json
+        FROM media_history h
+        UNION ALL
+        SELECT
+            CASE WHEN w.key = 0 THEN h.history_id
+                 ELSE 'rewatch:' || w.key || ':' || h.history_id END,
+            h.history_id, w.key,
+            h.server_kind, h.item_id, h.title, h.series_name, h.media_source_id,
+            h.file_path, h.duration_ms, h.subtitle_count, h.audio_languages_json,
+            json_extract(w.value, '$.last_position_ms'),
+            json_extract(w.value, '$.last_seen'), '[]'
+        FROM media_history h, json_each(h.previous_watches_json) w;",
+    )?;
+    add_column_if_missing(
+        &conn,
         "tadoku_export_batches",
         "is_longform_checkpoint",
         "INTEGER NOT NULL DEFAULT 0",
@@ -871,8 +906,9 @@ fn save_session_history_conn(
                 subtitle_count,
                 audio_languages_json,
                 last_position_ms,
-                last_seen
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                last_seen,
+                previous_watches_json
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
             ON CONFLICT(history_id) DO UPDATE SET
                 server_kind = excluded.server_kind,
                 item_id = excluded.item_id,
@@ -884,7 +920,8 @@ fn save_session_history_conn(
                 subtitle_count = excluded.subtitle_count,
                 audio_languages_json = excluded.audio_languages_json,
                 last_position_ms = excluded.last_position_ms,
-                last_seen = excluded.last_seen
+                last_seen = excluded.last_seen,
+                previous_watches_json = excluded.previous_watches_json
             ",
             params![
                 entry.history_id,
@@ -899,6 +936,7 @@ fn save_session_history_conn(
                 serde_json::to_string(&entry.audio_languages)?,
                 entry.last_position_ms,
                 entry.last_seen.to_rfc3339(),
+                serde_json::to_string(&entry.previous_watches)?,
             ],
         )
         .with_context(|| format!("Failed to upsert history {}", entry.history_id))?;
@@ -1040,6 +1078,9 @@ fn prepare_tadoku_batches_with_policy_sync(
         // Checkpoint credit belongs to one history item, even when multiple
         // books share the same display title. Episodes can still group by show.
         let is_longform_checkpoint = checkpoint_history_id.is_some();
+        let has_rewatch = items
+            .iter()
+            .any(|item| item.candidate.history_id.starts_with("rewatch:"));
         let batch_id = uuid::Uuid::new_v4().to_string();
         let duration_seconds = items
             .iter()
@@ -1093,6 +1134,7 @@ fn prepare_tadoku_batches_with_policy_sync(
             batch_id,
             tadoku_log_id: None,
             is_longform_checkpoint,
+            has_rewatch,
             series_name,
             description,
             duration_seconds,
@@ -1113,7 +1155,9 @@ fn prepare_tadoku_batches_with_policy_sync(
     let mut stmt = conn.prepare(
         "
         SELECT teb.batch_id, teb.tadoku_log_id, teb.series_name, teb.description,
-               teb.duration_seconds, teb.language_code, teb.is_longform_checkpoint
+               teb.duration_seconds, teb.language_code, teb.is_longform_checkpoint,
+               EXISTS(SELECT 1 FROM tadoku_export_items tei
+                      WHERE tei.batch_id = teb.batch_id AND tei.history_id LIKE 'rewatch:%')
         FROM tadoku_export_batches teb
         WHERE status = 'pending' AND language_code = ?1
         ORDER BY created_at, series_name
@@ -1128,6 +1172,7 @@ fn prepare_tadoku_batches_with_policy_sync(
             duration_seconds: row.get(4)?,
             language_code: row.get(5)?,
             is_longform_checkpoint: row.get(6)?,
+            has_rewatch: row.get(7)?,
             file_paths: Vec::new(),
         })
     })?;
@@ -1180,7 +1225,7 @@ fn tadoku_batch_is_scheduled_eligible(
         SELECT mh.last_seen, mh.last_position_ms, mh.audio_languages_json,
                mh.server_kind, mh.file_path
         FROM tadoku_export_items tei
-        JOIN media_history mh ON mh.history_id = tei.history_id
+        JOIN media_watch_history mh ON mh.history_id = tei.history_id
         WHERE tei.batch_id = ?1
         ",
     )?;
@@ -1245,7 +1290,7 @@ fn prepare_longform_tadoku_checkpoints(
                 WHEN teb.status IN ('pending', 'completed') THEN teb.duration_seconds
                 ELSE 0
             END), 0) AS credited_seconds
-        FROM media_history mh
+        FROM media_watch_history mh
         LEFT JOIN tadoku_episode_overrides teo ON teo.history_id = mh.history_id
         LEFT JOIN tadoku_export_items tei ON tei.history_id = mh.history_id
         LEFT JOIN tadoku_export_batches teb
@@ -1359,18 +1404,18 @@ fn refresh_pending_tadoku_batches(conn: &Connection, language_code: &str) -> any
             tadoku_export_batches.series_name,
             tadoku_export_batches.duration_seconds,
             tadoku_export_batches.is_longform_checkpoint,
-            media_history.title,
-            media_history.duration_ms,
-            media_history.last_position_ms
+            media_watch_history.title,
+            media_watch_history.duration_ms,
+            media_watch_history.last_position_ms
         FROM tadoku_export_batches
         JOIN tadoku_export_items
           ON tadoku_export_items.batch_id = tadoku_export_batches.batch_id
-        JOIN media_history
-          ON media_history.history_id = tadoku_export_items.history_id
+        JOIN media_watch_history
+          ON media_watch_history.history_id = tadoku_export_items.history_id
         WHERE tadoku_export_batches.status = 'pending'
           AND tadoku_export_batches.language_code = ?1
-          AND media_history.duration_ms IS NOT NULL
-          AND media_history.duration_ms > 0
+          AND media_watch_history.duration_ms IS NOT NULL
+          AND media_watch_history.duration_ms > 0
         ORDER BY tadoku_export_batches.created_at, tadoku_export_items.watched_at
         ",
     )?;
@@ -1477,7 +1522,7 @@ fn set_tadoku_candidate_title_sync(
         .context("Failed to start Tadoku title override transaction")?;
     let original_title: String = tx
         .query_row(
-            "SELECT title FROM media_history WHERE history_id = ?1",
+            "SELECT title FROM media_watch_history WHERE history_id = ?1",
             [history_id],
             |row| row.get(0),
         )
@@ -1573,7 +1618,7 @@ fn decline_tadoku_candidates_sync(db_path: &Path, history_ids: &[String]) -> any
         declined += tx.execute(
             "
             INSERT INTO tadoku_episode_decisions (history_id, decision, decided_at)
-            SELECT history_id, 'declined', ?2 FROM media_history WHERE history_id = ?1
+            SELECT history_id, 'declined', ?2 FROM media_watch_history WHERE history_id = ?1
             ON CONFLICT(history_id) DO UPDATE SET
                 decision = excluded.decision,
                 decided_at = excluded.decided_at
@@ -1608,7 +1653,9 @@ fn query_pending_tadoku_batches(
     let mut stmt = conn.prepare(
         "
         SELECT teb.batch_id, teb.tadoku_log_id, teb.series_name, teb.description,
-               teb.duration_seconds, teb.language_code, teb.is_longform_checkpoint
+               teb.duration_seconds, teb.language_code, teb.is_longform_checkpoint,
+               EXISTS(SELECT 1 FROM tadoku_export_items tei
+                      WHERE tei.batch_id = teb.batch_id AND tei.history_id LIKE 'rewatch:%')
         FROM tadoku_export_batches teb
         WHERE status = 'pending' AND language_code = ?1
         ORDER BY created_at, series_name
@@ -1623,6 +1670,7 @@ fn query_pending_tadoku_batches(
             duration_seconds: row.get(4)?,
             language_code: row.get(5)?,
             is_longform_checkpoint: row.get(6)?,
+            has_rewatch: row.get(7)?,
             file_paths: Vec::new(),
         })
     })?;
@@ -1647,7 +1695,7 @@ fn tadoku_batch_file_paths(conn: &Connection, batch_id: &str) -> anyhow::Result<
         "
         SELECT mh.file_path
         FROM tadoku_export_items tei
-        JOIN media_history mh ON mh.history_id = tei.history_id
+        JOIN media_watch_history mh ON mh.history_id = tei.history_id
         WHERE tei.batch_id = ?1 AND mh.file_path IS NOT NULL AND mh.file_path != ''
         ",
     )?;
@@ -1663,11 +1711,11 @@ fn query_pending_tadoku_candidates(
     let mut stmt = conn.prepare(
         "
         SELECT
-            media_history.history_id,
-            COALESCE(NULLIF(media_history.series_name, ''), tadoku_episode_overrides.title, media_history.title) AS show_name,
-            COALESCE(tadoku_episode_overrides.title, media_history.title) AS episode_title,
+            media_watch_history.history_id,
+            COALESCE(NULLIF(media_watch_history.series_name, ''), tadoku_episode_overrides.title, media_watch_history.title) AS show_name,
+            COALESCE(tadoku_episode_overrides.title, media_watch_history.title) AS episode_title,
             tadoku_export_items.watched_at,
-            media_history.duration_ms,
+            media_watch_history.duration_ms,
             tadoku_export_batches.duration_seconds,
             tadoku_export_batches.last_error,
             tadoku_episode_overrides.title IS NOT NULL AS title_overridden,
@@ -1675,15 +1723,15 @@ fn query_pending_tadoku_candidates(
         FROM tadoku_export_items
         JOIN tadoku_export_batches
           ON tadoku_export_batches.batch_id = tadoku_export_items.batch_id
-        JOIN media_history
-          ON media_history.history_id = tadoku_export_items.history_id
+        JOIN media_watch_history
+          ON media_watch_history.history_id = tadoku_export_items.history_id
         LEFT JOIN tadoku_episode_overrides
-          ON tadoku_episode_overrides.history_id = media_history.history_id
+          ON tadoku_episode_overrides.history_id = media_watch_history.history_id
         WHERE tadoku_export_batches.status = 'pending'
           AND tadoku_export_batches.language_code = ?1
           AND NOT EXISTS (
               SELECT 1 FROM tadoku_episode_decisions ted
-              WHERE ted.history_id = media_history.history_id
+              WHERE ted.history_id = media_watch_history.history_id
           )
         ORDER BY show_name, tadoku_export_items.watched_at
         ",
@@ -1717,46 +1765,48 @@ fn query_tadoku_candidates(
     let mut stmt = conn.prepare(
         "
         SELECT
-            media_history.history_id,
-            media_history.server_kind,
-            COALESCE(NULLIF(media_history.series_name, ''), tadoku_episode_overrides.title, media_history.title) AS show_name,
-            COALESCE(tadoku_episode_overrides.title, media_history.title) AS episode_title,
-            media_history.last_seen,
-            media_history.duration_ms,
-            media_history.file_path,
-            media_history.audio_languages_json,
-            tadoku_episode_overrides.title IS NOT NULL AS title_overridden
-        FROM media_history
+            media_watch_history.history_id,
+            media_watch_history.server_kind,
+            COALESCE(NULLIF(media_watch_history.series_name, ''), tadoku_episode_overrides.title, media_watch_history.title) AS show_name,
+            COALESCE(tadoku_episode_overrides.title, media_watch_history.title) AS episode_title,
+            media_watch_history.last_seen,
+            media_watch_history.duration_ms,
+            media_watch_history.file_path,
+            media_watch_history.audio_languages_json,
+            tadoku_episode_overrides.title IS NOT NULL AS title_overridden,
+            media_watch_history.watch_number
+        FROM media_watch_history
         LEFT JOIN tadoku_episode_overrides
-          ON tadoku_episode_overrides.history_id = media_history.history_id
-        WHERE media_history.duration_ms IS NOT NULL
-          AND media_history.duration_ms > 0
-          AND media_history.last_position_ms > 0
-          AND media_history.last_position_ms * 100 >= media_history.duration_ms * 80
-          AND media_history.last_position_ms + 300000 >= media_history.duration_ms
-          AND julianday(media_history.last_seen) >= julianday((
+          ON tadoku_episode_overrides.history_id = media_watch_history.history_id
+        WHERE media_watch_history.duration_ms IS NOT NULL
+          AND media_watch_history.duration_ms > 0
+          AND media_watch_history.last_position_ms > 0
+          AND media_watch_history.last_position_ms * 100 >= media_watch_history.duration_ms * 80
+          AND media_watch_history.last_position_ms + 300000 >= media_watch_history.duration_ms
+          AND julianday(media_watch_history.last_seen) >= julianday((
               SELECT value FROM app_metadata WHERE key = 'tadoku_candidate_cutoff'
           ))
           AND NOT EXISTS (
               SELECT 1 FROM tadoku_episode_decisions ted
-              WHERE ted.history_id = media_history.history_id
+              WHERE ted.history_id = media_watch_history.history_id
           )
           AND NOT EXISTS (
               SELECT 1 FROM tadoku_export_items tei
-              WHERE tei.history_id = media_history.history_id
+              WHERE tei.history_id = media_watch_history.history_id
           )
           AND NOT EXISTS (
               SELECT 1
               FROM tadoku_export_items tei
-              JOIN media_history exported ON exported.history_id = tei.history_id
+              JOIN media_watch_history exported ON exported.history_id = tei.history_id
               WHERE LOWER(COALESCE(NULLIF(exported.series_name, ''), exported.title)) =
-                    LOWER(COALESCE(NULLIF(media_history.series_name, ''), media_history.title))
-                AND LOWER(exported.title) = LOWER(media_history.title)
+                    LOWER(COALESCE(NULLIF(media_watch_history.series_name, ''), media_watch_history.title))
+                AND LOWER(exported.title) = LOWER(media_watch_history.title)
+                AND exported.watch_number = media_watch_history.watch_number
           )
           AND NOT EXISTS (
               SELECT 1 FROM tadoku_export_batches teb
               WHERE teb.status = 'pending'
-                AND teb.series_name = COALESCE(NULLIF(media_history.series_name, ''), media_history.title)
+                AND teb.series_name = COALESCE(NULLIF(media_watch_history.series_name, ''), media_watch_history.title)
                 AND teb.language_code = ?1
           )
         ORDER BY show_name, last_seen
@@ -1773,6 +1823,7 @@ fn query_tadoku_candidates(
             row.get::<_, Option<String>>(6)?,
             row.get::<_, String>(7)?,
             row.get::<_, bool>(8)?,
+            row.get::<_, i64>(9)?,
         ))
     })?;
     let mut seen_content = HashSet::new();
@@ -1788,9 +1839,10 @@ fn query_tadoku_candidates(
             file_path,
             audio_languages_json,
             title_overridden,
+            watch_number,
         ) = row?;
         let content_key = format!(
-            "{}\u{1f}{}",
+            "{}\u{1f}{}\u{1f}{watch_number}",
             series_name.trim().to_lowercase(),
             title.trim().to_lowercase()
         );
@@ -1841,7 +1893,7 @@ fn query_manual_longform_tadoku_candidates(
                 ELSE 0
             END), 0) AS credited_seconds,
             teo.title IS NOT NULL AS title_overridden
-        FROM media_history mh
+        FROM media_watch_history mh
         LEFT JOIN tadoku_episode_overrides teo ON teo.history_id = mh.history_id
         LEFT JOIN tadoku_export_items tei ON tei.history_id = mh.history_id
         LEFT JOIN tadoku_export_batches teb
@@ -2194,7 +2246,20 @@ fn parse_episode_number(series_name: &str, title: &str) -> Option<(u32, u32)> {
 }
 
 pub(crate) fn load_history_map(conn: &Connection) -> anyhow::Result<HashMap<String, HistoryEntry>> {
-    let mut stmt = conn.prepare(
+    load_history_map_from(conn, "media_history")
+}
+
+pub(crate) fn load_watch_history_map(
+    conn: &Connection,
+) -> anyhow::Result<HashMap<String, HistoryEntry>> {
+    load_history_map_from(conn, "media_watch_history")
+}
+
+fn load_history_map_from(
+    conn: &Connection,
+    table: &str,
+) -> anyhow::Result<HashMap<String, HistoryEntry>> {
+    let mut stmt = conn.prepare(&format!(
         "
         SELECT
             history_id,
@@ -2208,10 +2273,11 @@ pub(crate) fn load_history_map(conn: &Connection) -> anyhow::Result<HashMap<Stri
             last_position_ms,
             last_seen,
             series_name,
-            audio_languages_json
-        FROM media_history
+            audio_languages_json,
+            previous_watches_json
+        FROM {table}
         ",
-    )?;
+    ))?;
 
     let rows = stmt.query_map([], |row| {
         let server_kind_raw: String = row.get(1)?;
@@ -2236,6 +2302,8 @@ pub(crate) fn load_history_map(conn: &Connection) -> anyhow::Result<HashMap<Stri
             audio_languages: serde_json::from_str(&audio_languages_raw).map_err(to_sql_error)?,
             last_position_ms: row.get(8)?,
             last_seen: parse_timestamp(&last_seen_raw).map_err(to_sql_error)?,
+            previous_watches: serde_json::from_str(&row.get::<_, String>(12)?)
+                .map_err(to_sql_error)?,
         })
     })?;
 
@@ -2543,6 +2611,7 @@ mod tests {
             audio_languages: vec!["jpn".to_string()],
             last_position_ms: position_ms,
             last_seen: Utc::now(),
+            previous_watches: Vec::new(),
         }
     }
 
@@ -2696,6 +2765,110 @@ mod tests {
         let remaining = list_tadoku_candidates_sync(&path, "jpn").unwrap();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].history_id, "plex|2");
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn tadoku_credits_each_completed_watch_once_and_preserves_prior_batches() {
+        let path =
+            std::env::temp_dir().join(format!("nagare-rewatch-{}.sqlite", uuid::Uuid::new_v4()));
+        drop(open_connection(&path).unwrap());
+        let mut episode = history_entry("rewatched", "Show", 1_400_000);
+        episode.duration_ms = Some(1_440_000);
+        let original_id = episode.history_id.clone();
+        let save = |episode: &HistoryEntry| {
+            save_session_history_sync(
+                &path,
+                &HashMap::from([(original_id.clone(), episode.clone())]),
+                None,
+            )
+            .unwrap();
+        };
+        save(&episode);
+        let first = prepare_tadoku_batches_sync(&path, "2026-09-19", "jpn", None).unwrap();
+        assert_eq!(first.len(), 1);
+
+        // A new rewatch does not mutate or erase an earlier pending retry.
+        episode
+            .previous_watches
+            .push(crate::session::PreviousWatch {
+                last_position_ms: episode.last_position_ms,
+                last_seen: episode.last_seen,
+            });
+        episode.last_position_ms = 300_000;
+        episode.last_seen = Utc::now();
+        save(&episode);
+        let retry = prepare_tadoku_batches_sync(&path, "2026-09-19", "jpn", None).unwrap();
+        assert_eq!(retry.len(), 1);
+        assert_eq!(retry[0].batch_id, first[0].batch_id);
+        assert_eq!(retry[0].duration_seconds, 1_440);
+        let conn = open_connection(&path).unwrap();
+        conn.execute("UPDATE tadoku_export_batches SET status = 'completed'", [])
+            .unwrap();
+        drop(conn);
+        assert!(
+            list_tadoku_candidates_sync(&path, "jpn")
+                .unwrap()
+                .is_empty()
+        );
+
+        // Completion exposes the new watch despite matching episode/title.
+        episode.last_position_ms = 1_400_000;
+        save(&episode);
+        let candidates = list_tadoku_candidates_sync(&path, "jpn").unwrap();
+        assert_eq!(candidates.len(), 1);
+        let rewatch_id = format!("rewatch:1:{original_id}");
+        assert_eq!(candidates[0].history_id, rewatch_id);
+        set_tadoku_candidate_title_sync(&path, &rewatch_id, Some("Rewatch title")).unwrap();
+        let selected = HashSet::from([rewatch_id.clone()]);
+        let second =
+            prepare_tadoku_batches_sync(&path, "2026-09-19", "jpn", Some(&selected)).unwrap();
+        assert_eq!(second.len(), 1);
+        assert_ne!(second[0].batch_id, first[0].batch_id);
+        assert_eq!(second[0].duration_seconds, 1_440);
+        assert!(second[0].has_rewatch);
+        assert!(
+            prepare_tadoku_batches_sync(&path, "2026-09-19", "jpn", None).unwrap()[0].has_rewatch
+        );
+        assert!(second[0].description.contains("Rewatch title"));
+        let conn = open_connection(&path).unwrap();
+        conn.execute("UPDATE tadoku_export_batches SET status = 'completed'", [])
+            .unwrap();
+        drop(conn);
+        assert!(
+            prepare_tadoku_batches_sync(&path, "2026-09-19", "jpn", None)
+                .unwrap()
+                .is_empty()
+        );
+
+        // Declining one rewatch does not delete the original or claim a later
+        // qualified watch. Reopening the database preserves every identity.
+        episode
+            .previous_watches
+            .push(crate::session::PreviousWatch {
+                last_position_ms: episode.last_position_ms,
+                last_seen: episode.last_seen,
+            });
+        save(&episode);
+        let third_id = format!("rewatch:2:{original_id}");
+        assert_eq!(
+            decline_tadoku_candidates_sync(&path, &[third_id]).unwrap(),
+            1
+        );
+        assert!(
+            list_tadoku_candidates_sync(&path, "jpn")
+                .unwrap()
+                .is_empty()
+        );
+        let conn = open_connection(&path).unwrap();
+        assert_eq!(
+            super::load_history_map(&conn).unwrap()[&original_id]
+                .previous_watches
+                .len(),
+            2
+        );
+        assert_eq!(super::load_watch_history_map(&conn).unwrap().len(), 3);
+        drop(conn);
         std::fs::remove_file(path).unwrap();
     }
 

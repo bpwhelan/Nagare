@@ -14,13 +14,14 @@ use std::{
     hash::{DefaultHasher, Hash, Hasher},
     sync::Arc,
 };
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::{Mutex, Notify, broadcast};
 
 const EVENT_LIMIT: usize = 256;
 
 pub struct EventLog {
     epoch: String,
     entries: Mutex<Entries>,
+    changed: Notify,
 }
 
 #[derive(Default)]
@@ -34,7 +35,32 @@ impl Default for EventLog {
         Self {
             epoch: uuid::Uuid::new_v4().to_string(),
             entries: Mutex::new(Entries::default()),
+            changed: Notify::new(),
         }
+    }
+}
+
+impl EventLog {
+    async fn push(&self, event: Value) {
+        self.entries.lock().await.push(event);
+        self.changed.notify_waiters();
+    }
+
+    async fn wait_after(&self, epoch: Option<&str>, cursor: Option<u64>, wait_ms: u64) {
+        if wait_ms == 0 || epoch != Some(&self.epoch) {
+            return;
+        }
+        let notified = self.changed.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if cursor != Some(self.entries.lock().await.cursor) {
+            return;
+        }
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_millis(wait_ms.min(10_000)),
+            notified,
+        )
+        .await;
     }
 }
 
@@ -62,6 +88,7 @@ pub fn start(state: &Arc<AppState>) {
     let mut cards = state.new_card_tx.subscribe();
     let mut results = state.enhancement_result_tx.subscribe();
     let mut remote = state.remote_result_tx.subscribe();
+    let mut review = state.review_saved_tx.subscribe();
     let state = state.clone();
     tokio::spawn(async move {
         loop {
@@ -69,9 +96,10 @@ pub fn start(state: &Arc<AppState>) {
                 event = cards.recv() => event.map(|card| json!({"type": "new_card", "new_card": card})),
                 event = results.recv() => event.map(|result| json!({"type": "enhancement_result", "enhancement_result": result})),
                 event = remote.recv() => event.map(|result| json!({"type": "remote_result", "remote_result": result})),
+                event = review.recv() => event.map(|note_id| json!({"type": "review_saved", "note_id": note_id})),
             };
             match event {
-                Ok(event) => state.companion_events.entries.lock().await.push(event),
+                Ok(event) => state.companion_events.push(event).await,
                 Err(broadcast::error::RecvError::Lagged(count)) => {
                     tracing::warn!(count, "Companion event receiver lagged")
                 }
@@ -86,12 +114,18 @@ pub struct SnapshotQuery {
     epoch: Option<String>,
     after: Option<u64>,
     subtitle_revision: Option<String>,
+    #[serde(default)]
+    wait_ms: u64,
 }
 
 pub async fn snapshot(
     State(state): State<Arc<AppState>>,
     Query(query): Query<SnapshotQuery>,
 ) -> impl IntoResponse {
+    state
+        .companion_events
+        .wait_after(query.epoch.as_deref(), query.after, query.wait_ms)
+        .await;
     // Capture events before the snapshot. Events arriving during the read are
     // delivered next time; the pending-card snapshot remains authoritative.
     let log = state.companion_events.entries.lock().await;
@@ -172,6 +206,33 @@ pub async fn snapshot(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn waiting_clients_wake_on_events_without_a_polling_delay() {
+        let log = Arc::new(EventLog::default());
+        let waiter = |log: Arc<EventLog>| {
+            tokio::spawn(async move {
+                log.wait_after(Some(&log.epoch), Some(0), 10_000).await;
+            })
+        };
+        let first = waiter(log.clone());
+        let second = waiter(log.clone());
+        tokio::task::yield_now().await;
+        log.push(json!({"type": "new_card"})).await;
+        tokio::time::timeout(std::time::Duration::from_millis(500), async {
+            first.await.unwrap();
+            second.await.unwrap();
+        })
+        .await
+        .expect("every waiting client must wake on publication");
+        // Also covers the event arriving before the client starts waiting.
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            log.wait_after(Some(&log.epoch), Some(0), 10_000),
+        )
+        .await
+        .unwrap();
+    }
 
     #[test]
     fn outcomes_between_polls_are_replayed_once_using_the_cursor() {

@@ -298,7 +298,49 @@ fn entry(id: &str, position: i64) -> HistoryEntry {
         audio_languages: vec!["jpn".into()],
         last_position_ms: position,
         last_seen: "2026-04-17T01:00:00Z".parse().unwrap(),
+        previous_watches: Vec::new(),
     }
+}
+
+#[tokio::test]
+async fn rewatches_create_separate_logs_without_replacing_the_original() {
+    let mock = Mock::new().await;
+    let fixture = Fixture::new(&mock.url).await;
+    let mut episode = entry("rewatch", 1_400_000);
+    fixture.save(vec![episode.clone()]).await;
+    assert_eq!(fixture.sync().await.report.logs_created, 1);
+    let original = mock.state.lock().await.logs[0].clone();
+    episode
+        .previous_watches
+        .push(crate::session::PreviousWatch {
+            last_position_ms: episode.last_position_ms,
+            last_seen: episode.last_seen,
+        });
+    episode.last_position_ms = 300_000;
+    episode.last_seen = "2026-09-19T12:00:00Z".parse().unwrap();
+    fixture.save(vec![episode.clone()]).await;
+    assert_eq!(fixture.sync().await.report.logs_created, 1);
+    {
+        let data = mock.state.lock().await;
+        assert_eq!(data.logs.len(), 2);
+        assert_eq!(
+            data.logs.iter().find(|log| log.id == original.id),
+            Some(&original)
+        );
+        let rewatch = data.logs.iter().find(|log| log.id != original.id).unwrap();
+        assert_eq!(rewatch.duration_minutes, 5);
+        assert_eq!(rewatch.date, "2026-09-19");
+    }
+    episode.last_position_ms = 1_400_000;
+    fixture.save(vec![episode]).await;
+    assert_eq!(fixture.sync().await.report.logs_updated, 1);
+    let mutations = mock.state.lock().await.mutations;
+    let restarted = SyncService::new(fixture.service.config.clone(), fixture.service.db.clone());
+    restarted.execute(false).await.unwrap();
+    assert_eq!(mock.state.lock().await.mutations, mutations);
+    assert_eq!(mock.state.lock().await.logs.len(), 2);
+    fixture.remove_source("plex|rewatch").await;
+    assert_eq!(fixture.sync().await.report.logs_deleted, 2);
 }
 
 #[tokio::test]
