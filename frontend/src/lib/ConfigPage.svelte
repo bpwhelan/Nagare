@@ -1,6 +1,7 @@
 <script>
-  import { onDestroy, onMount } from 'svelte';
+  import { onDestroy, onMount, tick } from 'svelte';
   import KechimochiSettings from './KechimochiSettings.svelte';
+  import MediaFilters from './MediaFilters.svelte';
   import {
     getConfig,
     updateConfig,
@@ -86,6 +87,10 @@
     config.audiobookshelf = config.audiobookshelf || createServerConfig('audiobookshelf');
     for (const kind of ['emby', 'jellyfin', 'plex', 'audiobookshelf']) {
       if (!Array.isArray(config[kind].users)) config[kind].users = [];
+      config[kind].media_filter = {
+        included_libraries: [], excluded_libraries: [], included_folders: [], excluded_folders: [],
+        ...config[kind].media_filter,
+      };
     }
     if (!config.anki) config.anki = {};
     if (!config.anki.fields) config.anki.fields = {};
@@ -126,7 +131,9 @@
     if (obsoleteTadokuUrls.includes(config.tadoku.api_url || '')) {
       config.tadoku.api_url = 'https://tadoku.app/api/internal/immersion';
     }
-    if (!config.tadoku.session_url) config.tadoku.session_url = 'https://account.tadoku.app/kratos/sessions/whoami';
+    if (!config.tadoku.session_url || config.tadoku.session_url.trim().replace(/\/+$/, '') === 'https://account.tadoku.app/kratos/sessions/whoami') {
+      config.tadoku.session_url = 'https://tadoku.app/api/internal/identity/session';
+    }
     if (config.mining.audio_start_offset_ms == null) config.mining.audio_start_offset_ms = 100;
     if (config.mining.audio_end_offset_ms == null) config.mining.audio_end_offset_ms = 500;
     if (config.mining.audio_codec == null) config.mining.audio_codec = 'mp3';
@@ -189,6 +196,12 @@
       }
       serverUsers = { ...serverUsers };
     }
+  }
+
+  async function saveServerConnection() {
+    await tick();
+    await startSaveLoop();
+    if (saveError) throw new Error(saveError);
   }
 
   function toggleUser(kind, userId, checked) {
@@ -578,6 +591,7 @@
           {su ? 'Reload users' : 'Load users'}
         </button>
       </div>
+      <MediaFilters {kind} bind:filter={config[kind].media_filter} beforeLoad={saveServerConnection} />
     {/snippet}
 
     <!-- ── Media Servers ────────────────────────────── -->
@@ -949,7 +963,7 @@
     <section class="section">
       <h2>Tadoku Connection</h2>
       <div class="field">
-        <label for="tadoku-username">Username or email</label>
+        <label for="tadoku-username">Email</label>
         <input id="tadoku-username" type="text" autocomplete="username"
           bind:value={config.tadoku.username} />
       </div>
@@ -958,7 +972,7 @@
         <input id="tadoku-password" type="password" autocomplete="current-password"
           placeholder={config.tadoku.password_configured ? 'Saved — leave blank to keep it' : ''}
           bind:value={config.tadoku.password} />
-        <p class="hint">Nagare signs in automatically and keeps the Tadoku browser session fresh. Leave this blank to preserve an already saved password.</p>
+        <p class="hint">Nagare signs in with your Tadoku email and reuses the session until it expires. Existing saved emails and passwords continue to work. Leave this blank to preserve an already saved password.</p>
       </div>
       <div class="field">
         <label for="tadoku-language">Language <span class="hint">(ISO 639-3)</span></label>

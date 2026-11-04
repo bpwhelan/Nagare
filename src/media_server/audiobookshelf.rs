@@ -71,6 +71,7 @@ struct AbsAudioTrack {
 #[derive(Debug, Clone)]
 struct AbsSessionDetails {
     library_item_id: String,
+    library_id: Option<String>,
     display_title: String,
     series_name: Option<String>,
     media_type: String,
@@ -425,6 +426,10 @@ impl AudiobookshelfClient {
 
         Ok(AbsSessionDetails {
             library_item_id,
+            library_id: library_item["libraryId"]
+                .as_str()
+                .or_else(|| value["libraryId"].as_str())
+                .map(String::from),
             display_title: strip_volume_prefix(
                 value["displayTitle"]
                     .as_str()
@@ -597,6 +602,7 @@ impl AudiobookshelfClient {
 
         let now_playing = NowPlaying {
             item_id: item_id.clone(),
+            library_id: details.library_id.clone(),
             name: title.clone(),
             series_name: details.series_name.clone(),
             season_index: None,
@@ -737,6 +743,36 @@ impl MediaServer for AudiobookshelfClient {
             .collect())
     }
 
+    async fn get_libraries(&self) -> anyhow::Result<Vec<MediaLibrary>> {
+        let body: Value = self
+            .get("/api/libraries")
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let libraries = body["libraries"]
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("Library response omitted libraries"))?;
+        Ok(libraries
+            .iter()
+            .filter_map(|library| {
+                Some(MediaLibrary {
+                    id: library["id"].as_str()?.to_string(),
+                    name: library["name"]
+                        .as_str()
+                        .unwrap_or("Unnamed library")
+                        .to_string(),
+                    paths: library["folders"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|folder| folder["fullPath"].as_str().map(String::from))
+                        .collect(),
+                })
+            })
+            .collect())
+    }
+
     async fn get_item_info(
         &self,
         item_id: &str,
@@ -785,6 +821,21 @@ impl MediaServer for AudiobookshelfClient {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn captures_library_id_from_expanded_item_or_session() {
+        let mut session = expanded_session();
+        session["libraryItem"]["libraryId"] = serde_json::json!("jp");
+        let details = AudiobookshelfClient::parse_session_details(&session).unwrap();
+        assert_eq!(details.library_id.as_deref(), Some("jp"));
+        session["libraryItem"]
+            .as_object_mut()
+            .unwrap()
+            .remove("libraryId");
+        session["libraryId"] = serde_json::json!("jp-fallback");
+        let details = AudiobookshelfClient::parse_session_details(&session).unwrap();
+        assert_eq!(details.library_id.as_deref(), Some("jp-fallback"));
+    }
 
     fn expanded_session() -> Value {
         json!({

@@ -265,6 +265,17 @@ impl Fixture {
         self.service.execute(false).await.unwrap()
     }
 
+    async fn save_subtitles(&self, history_id: &str, track: SubtitleTrack) {
+        self.service
+            .db
+            .save_session_history(
+                HashMap::new(),
+                Some(HashMap::from([(history_id.to_string(), track)])),
+            )
+            .await
+            .unwrap();
+    }
+
     async fn remove_source(&self, id: &str) {
         let id = id.to_string();
         self.service
@@ -302,21 +313,117 @@ fn entry(id: &str, position: i64) -> HistoryEntry {
     }
 }
 
+fn moji_track() -> SubtitleTrack {
+    crate::subtitle::parse_srt(
+        "1\n00:00:00,000 --> 00:00:02,000\n日本 語\n𠮷。\n\n\
+         2\n00:02:00,000 --> 00:02:02,000\n次　の\t行\n\n\
+         3\n00:23:20,001 --> 00:23:22,000\n除外\n",
+    )
+}
+
+#[test]
+fn moji_counts_unicode_without_whitespace_at_cue_starts_and_respects_offsets() {
+    let mut track = moji_track();
+    for (position, expected) in [(-1, 0), (0, 0), (1, 5), (119_999, 5), (120_000, 8)] {
+        assert_eq!(subtitle_characters(&track, position), expected);
+    }
+    track.shift_by(5_000);
+    for (position, expected) in [(4_999, 0), (5_000, 5), (124_999, 5), (125_000, 8)] {
+        assert_eq!(subtitle_characters(&track, position), expected);
+    }
+    assert_eq!(
+        subtitle_characters(
+            &SubtitleTrack {
+                lines: vec![],
+                offset_ms: 0
+            },
+            1
+        ),
+        0
+    );
+}
+
+#[tokio::test]
+async fn moji_backfills_existing_logs_and_follows_bounded_progress_without_duplicates() {
+    let mock = Mock::new().await;
+    let fixture = Fixture::new(&mock.url).await;
+    fixture
+        .save(vec![
+            entry("partial", 90_000),
+            entry("overrun", 2_000_000),
+            entry("zero", 0),
+            entry("missing", 90_000),
+        ])
+        .await;
+    let first = fixture.sync().await;
+    assert!(first.last_error.is_none());
+    assert_eq!(first.report.logs_created, 3);
+    let original_ids: Vec<_> = {
+        let data = mock.state.lock().await;
+        assert!(data.logs.iter().all(|log| log.characters == 0));
+        data.logs.iter().map(|log| log.id).collect()
+    };
+    for id in ["partial", "overrun", "zero"] {
+        fixture
+            .save_subtitles(&format!("plex|{id}"), moji_track())
+            .await;
+    }
+    let backfill = fixture.sync().await;
+    assert!(backfill.last_error.is_none(), "{:?}", backfill.last_error);
+    assert_eq!(backfill.report.logs_updated, 2);
+    {
+        let data = mock.state.lock().await;
+        assert_eq!(
+            data.logs.iter().map(|log| log.id).collect::<Vec<_>>(),
+            original_ids
+        );
+        for (id, expected) in [("partial", 5), ("overrun", 8), ("missing", 0)] {
+            let log = data
+                .logs
+                .iter()
+                .find(|log| log.notes.contains(&format!("Show episode {id}")))
+                .unwrap();
+            assert_eq!(log.characters, expected);
+        }
+        assert!(!data.media[0].extra_data.contains("日本"));
+    }
+    fixture.save(vec![entry("partial", 180_000)]).await;
+    let updated = fixture.sync().await;
+    assert_eq!(updated.report.logs_updated, 1);
+    {
+        let data = mock.state.lock().await;
+        let log = data
+            .logs
+            .iter()
+            .find(|log| log.notes.contains("Show episode partial"))
+            .unwrap();
+        assert_eq!(log.characters, 8);
+        assert_eq!(log.duration_minutes, 3);
+    }
+    let mutations = mock.state.lock().await.mutations;
+    assert_eq!(fixture.sync().await.report.unchanged_logs, 3);
+    assert_eq!(mock.state.lock().await.mutations, mutations);
+}
+
 #[tokio::test]
 async fn rewatches_create_separate_logs_without_replacing_the_original() {
     let mock = Mock::new().await;
     let fixture = Fixture::new(&mock.url).await;
     let mut episode = entry("rewatch", 1_400_000);
     fixture.save(vec![episode.clone()]).await;
+    fixture
+        .save_subtitles(&episode.history_id, moji_track())
+        .await;
     assert_eq!(fixture.sync().await.report.logs_created, 1);
     let original = mock.state.lock().await.logs[0].clone();
+    assert_eq!(original.characters, 8);
     episode
         .previous_watches
         .push(crate::session::PreviousWatch {
             last_position_ms: episode.last_position_ms,
             last_seen: episode.last_seen,
         });
-    episode.last_position_ms = 300_000;
+    episode.last_position_ms = 90_000;
     episode.last_seen = "2026-09-19T12:00:00Z".parse().unwrap();
     fixture.save(vec![episode.clone()]).await;
     assert_eq!(fixture.sync().await.report.logs_created, 1);
@@ -328,7 +435,8 @@ async fn rewatches_create_separate_logs_without_replacing_the_original() {
             Some(&original)
         );
         let rewatch = data.logs.iter().find(|log| log.id != original.id).unwrap();
-        assert_eq!(rewatch.duration_minutes, 5);
+        assert_eq!(rewatch.duration_minutes, 2);
+        assert_eq!(rewatch.characters, 5);
         assert_eq!(rewatch.date, "2026-09-19");
     }
     episode.last_position_ms = 1_400_000;
@@ -698,6 +806,7 @@ fn progress_is_bounded_and_markers_support_arbitrary_history_ids() {
         vec![SourceItem {
             history,
             mined_notes: 0,
+            character_count: 0,
         }],
         "jpn",
     )

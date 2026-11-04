@@ -382,6 +382,60 @@ impl AppDatabase {
         .context("SQLite Tadoku completion task failed")?
     }
 
+    /// Keep retry identity local instead of publishing a batch UUID as a tag.
+    /// The first snapshot must survive retries, including a lost POST response.
+    pub async fn tadoku_log_match_exclusions(
+        &self,
+        batch_id: String,
+        existing_log_ids: Option<HashSet<String>>,
+    ) -> anyhow::Result<HashSet<String>> {
+        let db_path = self.db_path.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = open_connection(&db_path)?;
+            let mut log_ids = HashSet::new();
+            if let Some(existing_log_ids) = existing_log_ids {
+                conn.execute(
+                    "INSERT OR IGNORE INTO tadoku_log_creation_snapshots (batch_id, log_ids_json) VALUES (?1, ?2)",
+                    params![batch_id, serde_json::to_string(&existing_log_ids)?],
+                )?;
+                let raw: String = conn.query_row(
+                    "SELECT log_ids_json FROM tadoku_log_creation_snapshots WHERE batch_id = ?1",
+                    [&batch_id],
+                    |row| row.get(0),
+                )?;
+                log_ids = serde_json::from_str(&raw)?;
+            }
+            // Another batch may have completed since this snapshot was taken.
+            let mut stmt = conn.prepare(
+                "SELECT tadoku_log_id FROM tadoku_export_batches WHERE batch_id != ?1 AND tadoku_log_id IS NOT NULL",
+            )?;
+            for id in stmt.query_map([batch_id], |row| row.get::<_, String>(0))? {
+                log_ids.insert(id?);
+            }
+            Ok(log_ids)
+        })
+        .await
+        .context("SQLite Tadoku log snapshot task failed")?
+    }
+
+    pub async fn remember_tadoku_batch_log(
+        &self,
+        batch_id: String,
+        log_id: String,
+    ) -> anyhow::Result<()> {
+        let db_path = self.db_path.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = open_connection(&db_path)?;
+            conn.execute(
+                "UPDATE tadoku_export_batches SET tadoku_log_id = ?2, updated_at = ?3 WHERE batch_id = ?1",
+                params![batch_id, log_id, Utc::now().to_rfc3339()],
+            )?;
+            Ok(())
+        })
+        .await
+        .context("SQLite Tadoku log identity task failed")?
+    }
+
     pub async fn mark_tadoku_batch_failed(
         &self,
         batch_id: String,
@@ -575,6 +629,11 @@ pub(crate) fn open_connection(path: &Path) -> anyhow::Result<Connection> {
             is_longform_checkpoint INTEGER NOT NULL DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS idx_tadoku_batches_status ON tadoku_export_batches(status, created_at);
+
+        CREATE TABLE IF NOT EXISTS tadoku_log_creation_snapshots (
+            batch_id TEXT PRIMARY KEY REFERENCES tadoku_export_batches(batch_id),
+            log_ids_json TEXT NOT NULL
+        );
 
         CREATE TABLE IF NOT EXISTS tadoku_export_items (
             history_id TEXT NOT NULL,

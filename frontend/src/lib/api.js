@@ -124,6 +124,10 @@ export async function getServerUsers() {
   return api('/api/users');
 }
 
+export async function getServerLibraries() {
+  return api('/api/libraries');
+}
+
 export async function seekTo(positionMs) {
   return api('/api/seek', {
     method: 'POST',

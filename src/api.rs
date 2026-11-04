@@ -4,7 +4,7 @@ use crate::anki::{
 };
 use crate::config::{Config, MediaServerKind, TadokuConfig};
 use crate::media;
-use crate::media_server::{MediaServer, MediaUser, ServerMap};
+use crate::media_server::{MediaLibrary, MediaServer, MediaUser, ServerMap};
 use crate::mining::{
     AppDatabase, EnrichmentDialogState, EnrichmentSource, MiningHistoryEntry, MiningHistorySummary,
 };
@@ -132,6 +132,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         )
         .route("/api/kechimochi/sync", post(crate::kechimochi::sync_now))
         .route("/api/users", get(get_server_users))
+        .route("/api/libraries", get(get_server_libraries))
         .route("/api/seek", post(seek_to_line))
         .route("/api/play-pause", post(play_pause))
         .route("/api/subtitle/matches", post(subtitle_matches))
@@ -2752,7 +2753,7 @@ async fn refresh_tadoku_authentication(
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
                 "authenticated": false,
-                "error": "Save a Tadoku username and password first"
+                "error": "Save a Tadoku email and password first"
             })),
         );
     }
@@ -2901,6 +2902,34 @@ async fn get_server_users(State(state): State<Arc<AppState>>) -> Json<Vec<Server
     Json(result)
 }
 
+#[derive(Serialize)]
+struct ServerLibraries {
+    server_kind: MediaServerKind,
+    libraries: Vec<MediaLibrary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+async fn get_server_libraries(State(state): State<Arc<AppState>>) -> Json<Vec<ServerLibraries>> {
+    let servers = state.servers.read().await.clone();
+    let mut result = Vec::new();
+    for (kind, server) in servers {
+        match server.get_libraries().await {
+            Ok(libraries) => result.push(ServerLibraries {
+                server_kind: kind,
+                libraries,
+                error: None,
+            }),
+            Err(error) => result.push(ServerLibraries {
+                server_kind: kind,
+                libraries: Vec::new(),
+                error: Some(error.to_string()),
+            }),
+        }
+    }
+    Json(result)
+}
+
 async fn update_config(
     State(state): State<Arc<AppState>>,
     Json(mut new_config): Json<Config>,
@@ -2917,7 +2946,7 @@ async fn update_config(
         let old = state.config.read().await;
         merge_tadoku_secrets(&old.tadoku, &mut new_config.tadoku);
         // Only rebuild clients when connection parameters change; the per-server
-        // user allowlist is applied live during polling and needs no rebuild.
+        // user and media filters are applied live during polling and need no rebuild.
         let server_changed = old.server_connection_changed(&new_config);
         let anki_url_changed = old.anki.url != new_config.anki.url;
         (server_changed, anki_url_changed)

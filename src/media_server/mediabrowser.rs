@@ -147,6 +147,7 @@ impl MediaBrowserClient {
 
                 Some(NowPlaying {
                     item_id: npi["Id"].as_str().unwrap_or("").to_string(),
+                    library_id: None,
                     name: npi["Name"].as_str().unwrap_or("").to_string(),
                     series_name: npi["SeriesName"].as_str().map(String::from),
                     season_index: npi["ParentIndexNumber"].as_u64().map(|v| v as u32),
@@ -230,6 +231,39 @@ impl MediaServer for MediaBrowserClient {
             .unwrap_or_default();
 
         Ok(users)
+    }
+
+    async fn get_libraries(&self) -> anyhow::Result<Vec<MediaLibrary>> {
+        let body: Value = self
+            .http
+            .get(self.url("/Library/VirtualFolders"))
+            .query(&self.auth_params())
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let folders = body
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("Library response omitted virtual folders"))?;
+        Ok(folders
+            .iter()
+            .filter_map(|folder| {
+                Some(MediaLibrary {
+                    id: folder["ItemId"].as_str()?.to_string(),
+                    name: folder["Name"]
+                        .as_str()
+                        .unwrap_or("Unnamed library")
+                        .to_string(),
+                    paths: folder["Locations"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|path| path.as_str().map(String::from))
+                        .collect(),
+                })
+            })
+            .collect())
     }
 
     async fn get_item_info(

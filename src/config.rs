@@ -89,6 +89,25 @@ impl fmt::Display for MediaServerKind {
     }
 }
 
+/// Applied to server paths before local path mappings. Empty lists allow all media.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MediaFilterConfig {
+    /// None retains legacy include/exclude behavior until settings are edited.
+    pub mode: Option<MediaFilterMode>,
+    pub included_libraries: Vec<String>,
+    pub excluded_libraries: Vec<String>,
+    pub included_folders: Vec<String>,
+    pub excluded_folders: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MediaFilterMode {
+    Include,
+    Exclude,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct EmbyConfig {
     #[serde(default = "default_true")]
@@ -98,6 +117,8 @@ pub struct EmbyConfig {
     /// User IDs to monitor. Empty means all users on the server.
     #[serde(default)]
     pub users: Vec<String>,
+    #[serde(default)]
+    pub media_filter: MediaFilterConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -109,6 +130,8 @@ pub struct JellyfinConfig {
     /// User IDs to monitor. Empty means all users on the server.
     #[serde(default)]
     pub users: Vec<String>,
+    #[serde(default)]
+    pub media_filter: MediaFilterConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -120,6 +143,8 @@ pub struct PlexConfig {
     /// User IDs (account IDs) to monitor. Empty means all users on the server.
     #[serde(default)]
     pub users: Vec<String>,
+    #[serde(default)]
+    pub media_filter: MediaFilterConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -132,6 +157,8 @@ pub struct AudiobookshelfConfig {
     /// User IDs to monitor. Empty means all users on the server.
     #[serde(default)]
     pub users: Vec<String>,
+    #[serde(default)]
+    pub media_filter: MediaFilterConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -272,7 +299,7 @@ pub struct TadokuConfig {
     #[serde(default)]
     pub sync_mode: TadokuSyncMode,
 
-    /// Tadoku username or email used by the browser login flow.
+    /// Tadoku email. Keep the original field name so saved setups still load.
     #[serde(default)]
     pub username: String,
 
@@ -610,8 +637,19 @@ impl Config {
         })
     }
 
+    pub fn media_filter(&self, kind: MediaServerKind) -> Option<&MediaFilterConfig> {
+        match kind {
+            MediaServerKind::Emby => self.emby.as_ref().map(|c| &c.media_filter),
+            MediaServerKind::Jellyfin => self.jellyfin.as_ref().map(|c| &c.media_filter),
+            MediaServerKind::Plex => self.plex.as_ref().map(|c| &c.media_filter),
+            MediaServerKind::Audiobookshelf => {
+                self.audiobookshelf.as_ref().map(|c| &c.media_filter)
+            }
+        }
+    }
+
     /// Whether the connection parameters (URL/key/enabled) of any server differ
-    /// from `other`, ignoring unrelated fields such as the user allowlist. Used
+    /// from `other`, ignoring user and media filters. Used
     /// to decide whether media-server clients need to be rebuilt.
     pub fn server_connection_changed(&self, other: &Self) -> bool {
         let emby = match (&self.emby, &other.emby) {
@@ -809,10 +847,22 @@ impl TadokuConfig {
             }
             value => value.to_string(),
         };
-        if self.session_url.trim().is_empty() {
-            self.session_url = default_tadoku_session_url();
-        } else {
-            self.session_url = self.session_url.trim().to_string();
+        let session_url = self.session_url.trim().trim_end_matches('/');
+        self.session_url = match session_url {
+            "https://account.tadoku.app/kratos/sessions/whoami" => {
+                // Kratos sessions did not migrate. Credentials and sync state do.
+                self.session_cookie.clear();
+                default_tadoku_session_url()
+            }
+            "" => default_tadoku_session_url(),
+            value => value.to_string(),
+        };
+        if self
+            .session_cookie
+            .trim()
+            .starts_with("ory_kratos_session=")
+        {
+            self.session_cookie.clear();
         }
         self.language_code = self.language_code.trim().to_ascii_lowercase();
         self.export_hour_eastern = self.export_hour_eastern.min(23);
@@ -886,7 +936,7 @@ fn default_tadoku_api_url() -> String {
     "https://tadoku.app/api/internal/immersion".to_string()
 }
 fn default_tadoku_session_url() -> String {
-    "https://account.tadoku.app/kratos/sessions/whoami".to_string()
+    "https://tadoku.app/api/internal/identity/session".to_string()
 }
 
 fn default_tadoku_path_tag_rules() -> Vec<TadokuPathTagRule> {

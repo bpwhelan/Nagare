@@ -52,25 +52,39 @@
       syncRouteFromLocation();
     }
     currentView.set(view);
+    if ($isPlaying) {
+      clearMobileChromeTimer();
+      mobileChrome = false;
+    }
   }
 
   const FOREGROUND_RECOVERY_DEBOUNCE_MS = 500;
   const FOREGROUND_RECOVERY_DELAYS_MS = [0, 700, 2000];
 
-  // Mobile: show full chrome when paused, auto-hide when playing resumes
+  // Mobile: auto-hide on playback, with a manual toggle available at all times.
   let mobileChrome = true;
   let mobileChromeTimer = null;
 
-  $: {
-    if ($isPlaying) {
-      // When playback starts, hide chrome after a short delay
-      clearTimeout(mobileChromeTimer);
+  $: syncMobileChrome($isPlaying);
+
+  function clearMobileChromeTimer() {
+    clearTimeout(mobileChromeTimer);
+    mobileChromeTimer = null;
+  }
+
+  function syncMobileChrome(playing) {
+    clearMobileChromeTimer();
+    if (playing) {
       mobileChromeTimer = setTimeout(() => { mobileChrome = false; }, 1500);
     } else {
-      // When paused, show chrome immediately
-      clearTimeout(mobileChromeTimer);
       mobileChrome = true;
     }
+  }
+
+  function toggleMobileChrome() {
+    // Explicitly opened navigation stays open until dismissed or a page is chosen.
+    clearMobileChromeTimer();
+    mobileChrome = !mobileChrome;
   }
 
   function clearForegroundRecoveryTimers() {
@@ -136,6 +150,7 @@
     window.removeEventListener('pageshow', handlePageVisible);
     window.removeEventListener('focus', handlePageVisible);
     clearForegroundRecoveryTimers();
+    clearMobileChromeTimer();
     disconnect();
     stopYomitanObserver();
   });
@@ -252,6 +267,16 @@
         </button>
       </nav>
     </div>
+    <button
+      type="button"
+      class="mobile-menu-toggle"
+      aria-expanded={mobileChrome}
+      aria-controls="mobile-navigation"
+      aria-label={mobileChrome ? 'Hide navigation' : 'Show navigation'}
+      on:click={toggleMobileChrome}
+    >
+      {mobileChrome ? 'Close' : '☰ Menu'}
+    </button>
     <!-- Mobile compact: show title + time inline when playing -->
     <div class="topbar-np">
       <span class="topbar-np-title">{$nowPlayingTitle}</span>
@@ -294,9 +319,9 @@
     </div>
   </div>
 
-  <!-- Mobile paused overlay: nav + settings, overlays on top of content -->
-  <div class="mobile-chrome-overlay" class:visible={mobileChrome}>
-    <nav class="mobile-chrome-nav">
+  <!-- Mobile navigation: shown on pause or opened with the menu button. -->
+  <div id="mobile-navigation" class="mobile-chrome-overlay" class:visible={mobileChrome} inert={!mobileChrome}>
+    <nav class="mobile-chrome-nav" aria-label="Main navigation">
       <button
         class:active={$currentView === 'timeline'}
         on:click={() => showView('timeline')}
@@ -339,7 +364,7 @@
     {/if}
   </main>
 
-  <!-- Mobile bottom bar: media controls when playing, nav handles when paused (via overlay) -->
+  <!-- Mobile bottom bar: media controls stay available during navigation. -->
   <div class="mobile-bottom-bar">
     <div class="mobile-bottom-remote">
       <MediaRemote compact />
@@ -365,7 +390,8 @@
   .review-open .logo { margin:0; }
   .review-open .topbar { padding:10px 20px; }
   .review-open .now-playing, .review-open .mobile-chrome-overlay,
-  .review-open .mobile-bottom-bar, .review-open .topbar-np { display:none; }
+  .review-open .mobile-bottom-bar, .review-open .topbar-np,
+  .review-open .mobile-menu-toggle { display:none; }
   .review-open .content { padding:0; overflow:auto; }
   .card-received { font-size:11px; color:#80d9c0; white-space:nowrap; }
   /* ══════════════════════════════════════
@@ -583,6 +609,7 @@
   }
 
   /* Hidden on desktop */
+  .mobile-menu-toggle,
   .mobile-chrome-overlay {
     display: none;
   }
@@ -625,6 +652,22 @@
       display: none;
     }
 
+    .mobile-menu-toggle {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+      min-width: 72px;
+      min-height: 44px;
+      padding: 0.35rem 0.6rem;
+      font-size: 0.8rem;
+    }
+
+    .mobile-menu-toggle[aria-expanded="true"] {
+      color: var(--accent);
+      border-color: var(--accent);
+    }
+
     /* Compact now-playing info in topbar */
     .topbar-np {
       display: flex;
@@ -653,7 +696,7 @@
       flex-shrink: 0;
     }
 
-    /* ── Mobile chrome overlay: slides down when paused ── */
+    /* ── Mobile chrome overlay: slides down when opened ── */
     .mobile-chrome-overlay {
       display: block;
       position: absolute;

@@ -164,6 +164,7 @@
   <h2>What stays in sync</h2>
   <p>All Nagare history is included: episodes, movies, audiobooks, partial playback, older items, and every audio language. Episodes are grouped by show and media server. Items with recorded playback have an activity log that updates with their progress and latest playback date. Zero-progress items remain in the media library.</p>
   <p>Watching and listening time comes from each watch’s saved playback position, capped at the item’s runtime and rounded to the nearest minute, with a one-minute minimum for positive progress. Replaying a completed item starts a separate log after five consecutive real minutes of advancing playback. Pauses, stalls, and seeks restart that check; opening a player does not count. Earlier watches keep their progress and dates.</p>
+  <p>Moji counts come from saved subtitle lines that have started by each watch’s playback position. Each non-whitespace character counts once per subtitle line, including punctuation. Items without saved subtitles send zero characters. Existing logs receive these counts on the next sync.</p>
   <p>Nagare manages its own media variants and logs. Your other Kechimochi entries, covers, descriptions, custom metadata, and milestones are preserved. Append personal log notes after the Nagare section. Removing history from Nagare removes its synced logs; deleting a synced entry in Kechimochi recreates it on the next check.</p>
 </section>
 

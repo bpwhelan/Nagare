@@ -1,5 +1,26 @@
 # Nagare Companion userscript
 
+## YouTube → Tadoku (standalone)
+
+For a simple YouTube logging button, install `/youtube-tadoku.user.js` from your
+Nagare server in Tampermonkey (source: `frontend/public/youtube-tadoku.user.js`).
+Sign in at [Tadoku](https://tadoku.app) in the same browser, then open or reload a
+desktop YouTube watch page. Allow the script to contact Tadoku if prompted.
+
+**Log to Tadoku** appears below the video's channel/action row. One click logs
+the **full video duration** as **Japanese → Listening → Minute**, rounding up to
+one decimal like Nagare. The only tag is `youtube`; the description is the clean
+`https://www.youtube.com/watch?v=…` link. Eligible ongoing contest registrations
+are included automatically. The button shows the result or a sign-in/error message.
+
+The script works independently of Nagare and uses your browser's Tadoku session
+through the [userscript manager's requests](https://www.tampermonkey.net/documentation.php?q=GM_xmlhttpRequest).
+It stores no password and sends nothing until you click. Ads, live streams, and
+videos whose duration has not loaded cannot be logged. It follows YouTube's
+in-page navigation and prevents repeated clicks for the same video in that tab.
+Reloading allows another log; after an uncertain network error, check Tadoku
+before trying again to avoid a duplicate.
+
 The Companion brings Nagare's **Subtitles** workflow into your player tab. It
 shares the website's Svelte timeline, enhancement dialog, playback controls,
 audio-track picker, and auto-enhancement logic. Changes to these components go

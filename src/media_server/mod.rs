@@ -1,4 +1,5 @@
 pub mod audiobookshelf;
+pub mod filter;
 pub mod mediabrowser;
 pub mod plex;
 
@@ -21,6 +22,9 @@ pub trait MediaServer: Send + Sync {
     async fn get_sessions(&self) -> anyhow::Result<Vec<Session>>;
     /// List the users known to this server (for the per-server user allowlist).
     async fn get_users(&self) -> anyhow::Result<Vec<MediaUser>>;
+    async fn get_libraries(&self) -> anyhow::Result<Vec<MediaLibrary>> {
+        anyhow::bail!("Library discovery is unavailable for this server")
+    }
     async fn get_item_info(&self, item_id: &str, user_id: Option<&str>)
     -> anyhow::Result<ItemInfo>;
     async fn get_subtitles(
@@ -59,6 +63,13 @@ pub struct MediaUser {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MediaLibrary {
+    pub id: String,
+    pub name: String,
+    pub paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
     pub id: String,
     /// Playback-instance identifier when the provider exposes one separately
@@ -80,6 +91,8 @@ pub struct Session {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NowPlaying {
     pub item_id: String,
+    #[serde(default)]
+    pub library_id: Option<String>,
     pub name: String,
     pub series_name: Option<String>,
     pub season_index: Option<u32>,
@@ -197,9 +210,63 @@ pub(crate) fn episode_number_from_name(name: &str) -> Option<u32> {
 mod tests {
     use super::NowPlaying;
 
+    #[tokio::test]
+    async fn discovers_library_ids_and_server_folders_for_every_provider() {
+        use super::*;
+        use axum::{Json, Router, extract::Query, http::HeaderMap, routing::get};
+        use serde_json::json;
+        use std::collections::HashMap;
+
+        async fn virtual_folders(
+            Query(params): Query<HashMap<String, String>>,
+        ) -> Json<serde_json::Value> {
+            assert_eq!(params.get("api_key").map(String::as_str), Some("test-key"));
+            Json(
+                json!([{ "ItemId": "jp", "Name": "Japanese", "Locations": ["/media/Japanese", "D:\\Anime"] }]),
+            )
+        }
+        let app = Router::new()
+            .route("/Library/VirtualFolders", get(virtual_folders))
+            .route("/emby/Library/VirtualFolders", get(virtual_folders))
+            .route("/library/sections", get(|headers: HeaderMap| async move {
+                assert_eq!(headers.get("X-Plex-Token").unwrap(), "test-token");
+                Json(json!({ "MediaContainer": { "Directory": [{
+                    "key": "12", "title": "Japanese", "Location": [{ "path": "/media/Japanese" }]
+                }] } }))
+            }))
+            .route("/api/libraries", get(|headers: HeaderMap| async move {
+                assert_eq!(headers.get("Authorization").unwrap(), "Bearer test-token");
+                Json(json!({ "libraries": [{ "id": "jp", "name": "Japanese", "folders": [{ "fullPath": "/media/Japanese" }] }] }))
+            }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let clients: Vec<Box<dyn MediaServer>> = vec![
+            Box::new(EmbyClient::new(&url, "test-key")),
+            Box::new(JellyfinClient::new_jellyfin(&url, "test-key")),
+            Box::new(PlexClient::new(&url, "test-token")),
+            Box::new(AudiobookshelfClient::new(&url, "test-token")),
+        ];
+        for client in clients {
+            let libraries = client.get_libraries().await.unwrap();
+            assert_eq!(libraries.len(), 1);
+            let library = &libraries[0];
+            assert_eq!(library.name, "Japanese");
+            assert_eq!(library.paths[0], "/media/Japanese");
+            let filter = crate::config::MediaFilterConfig {
+                included_libraries: vec![library.id.clone()],
+                ..Default::default()
+            };
+            assert!(filter.allows(None, Some("/media/Japanese/show.mkv"), &libraries));
+            assert!(!filter.allows(None, Some("/media/English/show.mkv"), &libraries));
+        }
+        task.abort();
+    }
+
     fn episode(name: &str, season: u32, index: u32) -> NowPlaying {
         NowPlaying {
             item_id: "episode-1".to_string(),
+            library_id: None,
             name: name.to_string(),
             series_name: Some("Weekly Show".to_string()),
             season_index: Some(season),

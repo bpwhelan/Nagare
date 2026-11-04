@@ -7,6 +7,7 @@ use crate::api::AppState;
 use crate::config::{Config, KechimochiConfig, KechimochiSyncMode as SyncMode, MediaServerKind};
 use crate::mining::{AppDatabase, load_watch_history_map, open_connection};
 use crate::session::HistoryEntry;
+use crate::subtitle::SubtitleTrack;
 use anyhow::{Context, bail};
 use axum::{Json, extract::State, http::StatusCode};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -67,6 +68,7 @@ struct SourceItem {
     #[serde(flatten)]
     history: HistoryEntry,
     mined_notes: u64,
+    character_count: i64,
 }
 
 impl AppDatabase {
@@ -116,7 +118,7 @@ impl AppDatabase {
 
     async fn kechimochi_source(&self) -> anyhow::Result<(String, Vec<SourceItem>)> {
         self.kechimochi_query(|mut conn| {
-            // History and mining counts must describe the same local snapshot.
+            // History, subtitles, and mining counts must describe the same local snapshot.
             let tx = conn.transaction()?;
             let instance = tx.query_row(
                 "SELECT value FROM app_metadata WHERE key = 'kechimochi_instance_id'",
@@ -129,10 +131,32 @@ impl AppDatabase {
             let counts: HashMap<String, u64> = stmt
                 .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
                 .collect::<Result<_, _>>()?;
+            // Rewatches share their media's saved track, but count only the
+            // subtitles reached by that watch's own bounded playback position.
+            let mut stmt = tx.prepare(
+                "SELECT h.history_id, s.track_json FROM media_watch_history h
+                 JOIN subtitle_tracks s ON s.history_id = h.media_history_id",
+            )?;
+            let mut character_counts = HashMap::new();
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let (id, track_json) = row?;
+                let track: SubtitleTrack = serde_json::from_str(&track_json)
+                    .with_context(|| format!("Invalid saved subtitle track for {id}"))?;
+                if let Some(entry) = history.get(&id) {
+                    character_counts.insert(id, subtitle_characters(&track, progress_ms(entry)));
+                }
+            }
             let mut items: Vec<_> = history
                 .into_values()
                 .map(|history| SourceItem {
                     mined_notes: counts.get(&history.history_id).copied().unwrap_or_default(),
+                    character_count: character_counts
+                        .get(&history.history_id)
+                        .copied()
+                        .unwrap_or_default(),
                     history,
                 })
                 .collect();
@@ -403,6 +427,19 @@ fn progress_ms(history: &HistoryEntry) -> i64 {
         .min(history.duration_ms.filter(|d| *d > 0).unwrap_or(i64::MAX))
 }
 
+fn subtitle_characters(track: &SubtitleTrack, position_ms: i64) -> i64 {
+    if position_ms <= 0 {
+        return 0;
+    }
+    track
+        .lines
+        .iter()
+        .filter(|line| line.start_ms <= position_ms)
+        .flat_map(|line| line.text.chars())
+        .filter(|character| !character.is_whitespace())
+        .fold(0_i64, |count, _| count.saturating_add(1))
+}
+
 fn desired_log(
     item: &SourceItem,
     group: &Group,
@@ -426,7 +463,7 @@ fn desired_log(
         id: existing.and_then(|log| log.id),
         media_id,
         duration_minutes: (progress_ms(history).saturating_add(30_000) / 60_000).max(1),
-        characters: 0,
+        characters: item.character_count,
         date: history
             .last_seen
             .with_timezone(&timezone)

@@ -4,13 +4,13 @@ use anyhow::{Context, bail};
 use chrono::{DateTime, Datelike, FixedOffset, NaiveDate, Timelike, Utc, Weekday};
 use reqwest::cookie::{CookieStore, Jar};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock};
 use tracing::{error, info, warn};
 
-const TADOKU_AUTH_BASE_URL: &str = "https://account.tadoku.app/kratos";
+const TADOKU_AUTH_BASE_URL: &str = "https://tadoku.app/api/internal/identity";
 const AUTOMATIC_EXPORT_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const LISTENING_MINUTE_UNIT_KEY: &str = "listening_minute";
 const LISTENING_DENSE_MINUTES_UNIT_KEY: &str = "listening_dense_minutes";
@@ -27,18 +27,12 @@ pub struct TadokuConnectionInfo {
 
 #[derive(Debug, Deserialize)]
 struct SessionResponse {
-    identity: SessionIdentity,
+    account: Option<SessionAccount>,
 }
 
 #[derive(Debug, Deserialize)]
-struct SessionIdentity {
+struct SessionAccount {
     id: String,
-    #[serde(default)]
-    traits: SessionTraits,
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct SessionTraits {
     display_name: Option<String>,
 }
 
@@ -159,29 +153,6 @@ struct UpdateLogRequest<'a> {
     description: &'a str,
 }
 
-#[derive(Debug, Deserialize)]
-struct LoginFlow {
-    ui: LoginUi,
-}
-
-#[derive(Debug, Deserialize)]
-struct LoginUi {
-    action: String,
-    #[serde(default)]
-    nodes: Vec<LoginNode>,
-}
-
-#[derive(Debug, Deserialize)]
-struct LoginNode {
-    attributes: LoginNodeAttributes,
-}
-
-#[derive(Debug, Deserialize)]
-struct LoginNodeAttributes {
-    name: Option<String>,
-    value: Option<serde_json::Value>,
-}
-
 #[derive(Clone)]
 struct TadokuPersistence {
     config: Arc<RwLock<Config>>,
@@ -191,9 +162,13 @@ struct TadokuPersistence {
 impl TadokuPersistence {
     async fn save_cookie(&self, cookie: &str) -> anyhow::Result<()> {
         let mut config = self.config.write().await;
-        let previous = std::mem::replace(&mut config.tadoku.session_cookie, cookie.to_string());
+        let previous = config.tadoku.clone();
+        // Save the endpoint migration with the new cookie, otherwise the next
+        // client would mistake it for a legacy session and sign in again.
+        config.tadoku.normalize();
+        config.tadoku.session_cookie = cookie.to_string();
         if let Err(error) = self.db.save_config(config.clone()).await {
-            config.tadoku.session_cookie = previous;
+            config.tadoku = previous;
             return Err(error).context("Could not save the refreshed Tadoku session");
         }
         Ok(())
@@ -225,7 +200,7 @@ impl TadokuClient {
     ) -> anyhow::Result<Self> {
         config.normalize();
         if !config.has_credentials() {
-            bail!("Tadoku username and password are not configured");
+            bail!("Tadoku email and password are not configured");
         }
         if config.api_url.trim().is_empty() {
             bail!("Tadoku API URL is empty");
@@ -240,6 +215,7 @@ impl TadokuClient {
         }
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::none())
             .user_agent(concat!("Nagare/", env!("CARGO_PKG_VERSION")))
             .cookie_provider(cookies.clone())
             .build()?;
@@ -258,14 +234,6 @@ impl TadokuClient {
             self.config.api_url.trim_end_matches('/'),
             path.trim_start_matches('/')
         )
-    }
-
-    fn login_flow_url(&self) -> String {
-        format!("{}/self-service/login/browser", self.auth_url)
-    }
-
-    fn expected_login_action_prefix(&self) -> String {
-        format!("{}/self-service/login?", self.auth_url)
     }
 
     fn cookie_urls(&self) -> anyhow::Result<[reqwest::Url; 2]> {
@@ -293,68 +261,46 @@ impl TadokuClient {
     fn clear_session_cookie(&self) -> anyhow::Result<()> {
         let url = reqwest::Url::parse(&self.auth_url).context("Invalid Tadoku auth URL")?;
         let expired = if is_tadoku_production_host(&url) {
-            "ory_kratos_session=; Max-Age=0; Path=/; Domain=.tadoku.app; Secure"
+            "tadoku_session=; Max-Age=0; Path=/; Domain=.tadoku.app; Secure"
         } else {
-            "ory_kratos_session=; Max-Age=0; Path=/"
+            "tadoku_session=; Max-Age=0; Path=/"
         };
         self.cookies.add_cookie_str(expired, &url);
         Ok(())
     }
 
     async fn login(&mut self) -> anyhow::Result<()> {
-        let flow_response = self
-            .http
-            .get(self.login_flow_url())
-            .header(reqwest::header::ACCEPT, "application/json")
-            .send()
-            .await
-            .context("Could not start Tadoku login")?;
-        if !flow_response.status().is_success() {
-            bail!(
-                "Could not start Tadoku login (HTTP {})",
-                flow_response.status()
-            );
-        }
-        let flow: LoginFlow = flow_response
-            .json()
-            .await
-            .context("Tadoku returned an invalid login flow")?;
-        if !flow
-            .ui
-            .action
-            .starts_with(&self.expected_login_action_prefix())
-        {
-            bail!("Tadoku returned an invalid login flow");
-        }
-        let csrf_token = flow
-            .ui
-            .nodes
-            .iter()
-            .find(|node| node.attributes.name.as_deref() == Some("csrf_token"))
-            .and_then(|node| node.attributes.value.as_ref())
-            .and_then(serde_json::Value::as_str)
-            .filter(|value| !value.is_empty())
-            .context("Tadoku did not return a CSRF token")?;
-
+        let origin = reqwest::Url::parse(&self.auth_url)
+            .context("Invalid Tadoku auth URL")?
+            .origin()
+            .ascii_serialization();
         let login_response = self
             .http
-            .post(&flow.ui.action)
+            .post(format!("{}/login", self.auth_url))
             .header(reqwest::header::ACCEPT, "application/json")
-            .form(&[
-                ("identifier", self.config.username.as_str()),
-                ("password", self.config.password.as_str()),
-                ("method", "password"),
-                ("csrf_token", csrf_token),
-            ])
+            .header(reqwest::header::ORIGIN, origin)
+            .json(&serde_json::json!({
+                "email": self.config.username,
+                "password": self.config.password,
+            }))
             .send()
             .await
             .context("Could not complete Tadoku login")?;
-        if !login_response.status().is_success() {
-            bail!("Tadoku login failed; check the saved username and password");
+        match login_response.status() {
+            reqwest::StatusCode::OK => {}
+            reqwest::StatusCode::UNAUTHORIZED => {
+                bail!(
+                    "Tadoku login failed; check the saved email and password (Tadoku now requires your email address)"
+                );
+            }
+            reqwest::StatusCode::TOO_MANY_REQUESTS => {
+                bail!("Tadoku sign-in is rate limited; wait 15 minutes before trying again");
+            }
+            status => bail!("Tadoku login failed (HTTP {status})"),
         }
         let cookie = self
             .session_cookie()?
-            .context("Tadoku login did not return a browser session cookie")?;
+            .context("Tadoku login did not return a tadoku_session cookie")?;
         if let Some(persistence) = &self.persistence {
             persistence.save_cookie(&cookie).await?;
         }
@@ -395,14 +341,33 @@ impl TadokuClient {
         self.login().await
     }
 
+    async fn session_account(&self) -> anyhow::Result<Option<SessionAccount>> {
+        let response = self
+            .http
+            .get(&self.config.session_url)
+            .send()
+            .await
+            .context("Could not check Tadoku session")?;
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+            return Ok(None);
+        }
+        let session: SessionResponse = response_json(response, "Tadoku authentication").await?;
+        Ok(session.account)
+    }
+
     async fn connection_info(&mut self, language_code: &str) -> anyhow::Result<TadokuConnection> {
-        let session_url = self.config.session_url.clone();
-        let session: SessionResponse = response_json(
-            self.send_authenticated(|http| http.get(&session_url))
-                .await?,
-            "Tadoku authentication",
-        )
-        .await?;
+        self.ensure_authenticated().await?;
+        // Unlike protected API calls, an expired session returns HTTP 200 with
+        // account: null. Refresh once for either form of an unauthenticated reply.
+        let account = match self.session_account().await? {
+            Some(account) => account,
+            None => {
+                self.refresh_session().await?;
+                self.session_account().await?.context(
+                    "Tadoku did not return a signed-in account after refreshing the login",
+                )?
+            }
+        };
 
         let options_url = self.api_url("logs/configuration-options");
         let options: ConfigurationOptions = response_json(
@@ -443,8 +408,8 @@ impl TadokuClient {
 
         Ok(TadokuConnection {
             info: TadokuConnectionInfo {
-                user_id: session.identity.id,
-                display_name: session.identity.traits.display_name,
+                user_id: account.id,
+                display_name: account.display_name,
                 listening_activity_id: activity.id,
                 listening_minutes_unit_id: minutes_unit.id.clone(),
                 listening_dense_minutes_unit_id: dense_minutes_unit.id.clone(),
@@ -536,6 +501,14 @@ impl TadokuClient {
         batch: &TadokuExportBatch,
         listening_unit: &TadokuUnit,
     ) -> anyhow::Result<String> {
+        // Save the remote identity before corrections can remove a legacy
+        // marker or fail, so a retry still knows which log belongs to this batch.
+        if let Some(persistence) = &self.persistence {
+            persistence
+                .db
+                .remember_tadoku_batch_log(batch.batch_id.clone(), log.id.clone())
+                .await?;
+        }
         let minutes = tadoku_minutes(batch.duration_seconds);
         let desired_tags = tadoku_tags(&self.config, batch);
         let amount_matches = log
@@ -547,7 +520,7 @@ impl TadokuClient {
             log.tags
                 .iter()
                 .any(|existing| existing.eq_ignore_ascii_case(desired))
-        });
+        }) && !log.tags.iter().any(|tag| is_rewatch_batch_tag(tag));
         if amount_matches && unit_matches && description_matches && tags_match {
             return Ok(log.id);
         }
@@ -557,6 +530,7 @@ impl TadokuClient {
             log.id
         );
         let mut tags = log.tags.clone();
+        tags.retain(|tag| !is_rewatch_batch_tag(tag));
         for desired in desired_tags {
             if !tags
                 .iter()
@@ -587,7 +561,7 @@ impl TadokuClient {
                 .tags
                 .iter()
                 .any(|existing| existing.eq_ignore_ascii_case(desired))
-        });
+        }) && !updated.tags.iter().any(|tag| is_rewatch_batch_tag(tag));
         if !updated_amount_matches
             || !tadoku_log_unit_matches(&updated, listening_unit)
             || updated.description.as_deref() != Some(batch.description.as_str())
@@ -680,15 +654,13 @@ fn find_listening_unit<'a>(
 
 fn tadoku_tags(config: &TadokuConfig, batch: &TadokuExportBatch) -> Vec<String> {
     let mut tags = vec!["nagare".to_string()];
-    if batch.has_rewatch {
-        tags.push(rewatch_batch_tag(batch));
-    }
     for rule in &config.path_tag_rules {
         let needle = rule.contains.to_lowercase();
-        if batch
-            .file_paths
-            .iter()
-            .any(|path| path.to_lowercase().contains(&needle))
+        if !is_rewatch_batch_tag(&rule.tag)
+            && batch
+                .file_paths
+                .iter()
+                .any(|path| path.to_lowercase().contains(&needle))
             && !tags
                 .iter()
                 .any(|existing| existing.eq_ignore_ascii_case(&rule.tag))
@@ -703,32 +675,57 @@ fn rewatch_batch_tag(batch: &TadokuExportBatch) -> String {
     format!("nagare-watch-{}", batch.batch_id)
 }
 
+fn is_rewatch_batch_tag(tag: &str) -> bool {
+    tag.get(.."nagare-watch-".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("nagare-watch-"))
+}
+
 fn matching_existing_log<'a>(
     batch: &TadokuExportBatch,
     existing: &'a HashMap<String, TadokuLog>,
-) -> Option<&'a TadokuLog> {
-    batch
+    prior_log_ids: Option<&HashSet<String>>,
+) -> anyhow::Result<Option<&'a TadokuLog>> {
+    let linked = batch
         .tadoku_log_id
         .as_deref()
-        .and_then(|id| existing.get(id))
-        .or_else(|| {
-            if batch.has_rewatch {
-                // A rewatch may have exactly the same title and runtime as an old
-                // log. Match only its persisted batch identity, including when a
-                // previous POST succeeded but its response was lost.
-                let marker = rewatch_batch_tag(batch);
-                existing
-                    .values()
-                    .find(|log| log.tags.iter().any(|tag| tag == &marker))
-            } else if batch.is_longform_checkpoint {
-                None
-            } else {
-                existing.values().find(|log| {
-                    log.description.as_deref() == Some(&batch.description)
-                        && !log.tags.iter().any(|tag| tag.starts_with("nagare-watch-"))
-                })
-            }
-        })
+        .and_then(|id| existing.get(id));
+    if linked.is_some() {
+        return Ok(linked);
+    }
+    if batch.has_rewatch {
+        // Recognize pending exports from older versions without sending their
+        // internal marker back to Tadoku.
+        let marker = rewatch_batch_tag(batch);
+        if let Some(log) = existing
+            .values()
+            .find(|log| log.tags.iter().any(|tag| tag.eq_ignore_ascii_case(&marker)))
+        {
+            return Ok(Some(log));
+        }
+        let Some(prior_log_ids) = prior_log_ids else {
+            return Ok(None);
+        };
+        let mut candidates = existing.values().filter(|log| {
+            !prior_log_ids.contains(&log.id)
+                && log.description.as_deref() == Some(&batch.description)
+                && !log.tags.iter().any(|tag| is_rewatch_batch_tag(tag))
+        });
+        let candidate = candidates.next();
+        if candidates.next().is_some() {
+            bail!(
+                "Multiple Tadoku logs could belong to this rewatch; refusing to create or change a log until the match is resolved"
+            );
+        }
+        Ok(candidate)
+    } else if batch.is_longform_checkpoint {
+        Ok(None)
+    } else {
+        Ok(existing.values().find(|log| {
+            log.description.as_deref() == Some(&batch.description)
+                && !log.tags.iter().any(|tag| is_rewatch_batch_tag(tag))
+                && !prior_log_ids.is_some_and(|ids| ids.contains(&log.id))
+        }))
+    }
 }
 
 fn tadoku_minutes(duration_seconds: i32) -> f64 {
@@ -792,7 +789,7 @@ fn extract_cookie_value(raw: &str) -> anyhow::Result<String> {
 fn cookie_from_header(header: &str) -> Option<String> {
     header.split(';').find_map(|part| {
         let (name, value) = part.trim().split_once('=')?;
-        (name == "ory_kratos_session" && !value.is_empty()).then(|| value.to_string())
+        (name == "tadoku_session" && !value.is_empty()).then(|| value.to_string())
     })
 }
 
@@ -804,9 +801,9 @@ fn is_tadoku_production_host(url: &reqwest::Url) -> bool {
 fn add_session_cookie(cookies: &Jar, auth_url: &str, value: &str) -> anyhow::Result<()> {
     let url = reqwest::Url::parse(auth_url).context("Invalid Tadoku auth URL")?;
     let cookie = if is_tadoku_production_host(&url) {
-        format!("ory_kratos_session={value}; Path=/; Domain=.tadoku.app; Secure; HttpOnly")
+        format!("tadoku_session={value}; Path=/; Domain=.tadoku.app; Secure; HttpOnly")
     } else {
-        format!("ory_kratos_session={value}; Path=/; HttpOnly")
+        format!("tadoku_session={value}; Path=/; HttpOnly")
     };
     cookies.add_cookie_str(&cookie, &url);
     Ok(())
@@ -907,25 +904,36 @@ async fn export(
         } else {
             &connection.listening_minutes_unit
         };
-        let existing_log = matching_existing_log(&batch, &existing);
-        let result = if let Some(log) = existing_log {
-            info!(
-                "Tadoku batch {} already exists remotely as {}; verifying it locally",
-                batch.batch_id, log.id
-            );
-            client
-                .ensure_log_minutes(log.clone(), &batch, listening_unit)
-                .await
-        } else {
-            client
-                .create_log(
-                    &batch,
-                    connection.info.listening_activity_id,
-                    listening_unit,
-                    &registrations,
+        let result = async {
+            let prior_log_ids = db
+                .tadoku_log_match_exclusions(
+                    batch.batch_id.clone(),
+                    batch
+                        .has_rewatch
+                        .then(|| existing.keys().cloned().collect()),
                 )
-                .await
-        };
+                .await?;
+            let existing_log = matching_existing_log(&batch, &existing, Some(&prior_log_ids))?;
+            if let Some(log) = existing_log {
+                info!(
+                    "Tadoku batch {} already exists remotely as {}; verifying it locally",
+                    batch.batch_id, log.id
+                );
+                client
+                    .ensure_log_minutes(log.clone(), &batch, listening_unit)
+                    .await
+            } else {
+                client
+                    .create_log(
+                        &batch,
+                        connection.info.listening_activity_id,
+                        listening_unit,
+                        &registrations,
+                    )
+                    .await
+            }
+        }
+        .await;
 
         match result {
             Ok(log_id) => {
@@ -1068,9 +1076,8 @@ mod tests {
         matching_existing_log, tadoku_log_unit_matches, tadoku_minutes, tadoku_tags,
     };
     use crate::config::TadokuConfig;
-    use crate::mining::TadokuExportBatch;
-    use axum::body::Body;
-    use axum::extract::State;
+    use crate::mining::{AppDatabase, TadokuExportBatch};
+    use axum::extract::{Path, State};
     use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
     use axum::response::{IntoResponse, Response};
     use axum::routing::{get, post};
@@ -1082,79 +1089,81 @@ mod tests {
 
     struct MockTadoku {
         base_url: String,
-        trusted_action: bool,
-        include_csrf: bool,
         set_session_cookie: bool,
         reject_first_options_request: bool,
+        reject_all_options: AtomicBool,
+        guest_session: AtomicBool,
+        login_status: AtomicUsize,
         login_count: AtomicUsize,
+        session_count: AtomicUsize,
         options_count: AtomicUsize,
-        login_forms: Mutex<Vec<String>>,
+        login_requests: Mutex<Vec<(HeaderMap, serde_json::Value)>>,
         request_cookies: Mutex<Vec<String>>,
         logs: Mutex<Vec<serde_json::Value>>,
         lose_log_response: AtomicBool,
     }
 
-    async fn login_flow(State(state): State<Arc<MockTadoku>>) -> Response {
-        let action = if state.trusted_action {
-            format!("{}/self-service/login?flow=test", state.base_url)
-        } else {
-            "https://malicious.example/self-service/login?flow=test".to_string()
-        };
-        let nodes = if state.include_csrf {
-            json!([{"attributes": {"name": "csrf_token", "value": "csrf-value"}}])
-        } else {
-            json!([])
-        };
-        let mut response = Json(json!({"ui": {"action": action, "nodes": nodes}})).into_response();
-        response.headers_mut().insert(
-            header::SET_COOKIE,
-            HeaderValue::from_static("csrf_cookie=csrf-cookie; Path=/; HttpOnly"),
-        );
-        response
-    }
-
     async fn submit_login(
         State(state): State<Arc<MockTadoku>>,
         headers: HeaderMap,
-        body: String,
+        Json(body): Json<serde_json::Value>,
     ) -> Response {
         state.login_count.fetch_add(1, Ordering::SeqCst);
-        state.login_forms.lock().unwrap().push(body);
-        if let Some(cookie) = headers
-            .get(header::COOKIE)
-            .and_then(|value| value.to_str().ok())
-        {
-            state
-                .request_cookies
-                .lock()
-                .unwrap()
-                .push(cookie.to_string());
+        state
+            .login_requests
+            .lock()
+            .unwrap()
+            .push((headers.clone(), body));
+        if headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) != Some(&state.base_url) {
+            return StatusCode::FORBIDDEN.into_response();
         }
-        let mut response = Response::new(Body::from("{}"));
+        let status =
+            StatusCode::from_u16(state.login_status.load(Ordering::SeqCst) as u16).unwrap();
+        if status != StatusCode::OK {
+            // A redirect must never forward the credential body to this URL.
+            return (
+                status,
+                [(
+                    header::LOCATION,
+                    format!("{}/credential-leak", state.base_url),
+                )],
+            )
+                .into_response();
+        }
+        let mut response = Json(
+            json!({"account": {"id": "user-id", "display_name": "Reader"}, "account_app": "v2"}),
+        )
+        .into_response();
         if state.set_session_cookie {
             response.headers_mut().insert(
                 header::SET_COOKIE,
-                HeaderValue::from_static("ory_kratos_session=fresh-session; Path=/; HttpOnly"),
+                HeaderValue::from_static("tadoku_session=fresh-session; Path=/; HttpOnly"),
             );
         }
         response
     }
 
-    async fn whoami(State(state): State<Arc<MockTadoku>>, headers: HeaderMap) -> Response {
+    async fn session(State(state): State<Arc<MockTadoku>>, headers: HeaderMap) -> Response {
+        state.session_count.fetch_add(1, Ordering::SeqCst);
+        let mut authenticated = false;
         if let Some(cookie) = headers
             .get(header::COOKIE)
             .and_then(|value| value.to_str().ok())
         {
+            authenticated = cookie.contains("tadoku_session=fresh-session")
+                || cookie.contains("tadoku_session=saved-session");
             state
                 .request_cookies
                 .lock()
                 .unwrap()
                 .push(cookie.to_string());
         }
-        Json(json!({
-            "identity": {"id": "user-id", "traits": {"display_name": "Reader"}}
-        }))
-        .into_response()
+        let account = if authenticated && !state.guest_session.load(Ordering::SeqCst) {
+            json!({"id": "user-id", "display_name": "Reader"})
+        } else {
+            serde_json::Value::Null
+        };
+        Json(json!({"account": account, "account_app": "v2"})).into_response()
     }
 
     async fn configuration_options(
@@ -1172,7 +1181,9 @@ mod tests {
                 .push(cookie.to_string());
         }
         let call = state.options_count.fetch_add(1, Ordering::SeqCst);
-        if state.reject_first_options_request && call == 0 {
+        if (state.reject_first_options_request && call == 0)
+            || state.reject_all_options.load(Ordering::SeqCst)
+        {
             return StatusCode::UNAUTHORIZED.into_response();
         }
         Json(json!({
@@ -1190,8 +1201,6 @@ mod tests {
     }
 
     async fn spawn_mock_tadoku(
-        trusted_action: bool,
-        include_csrf: bool,
         set_session_cookie: bool,
         reject_first_options_request: bool,
     ) -> (Arc<MockTadoku>, tokio::task::JoinHandle<()>) {
@@ -1199,21 +1208,23 @@ mod tests {
         let base_url = format!("http://{}", listener.local_addr().unwrap());
         let state = Arc::new(MockTadoku {
             base_url,
-            trusted_action,
-            include_csrf,
             set_session_cookie,
             reject_first_options_request,
+            reject_all_options: AtomicBool::new(false),
+            guest_session: AtomicBool::new(false),
+            login_status: AtomicUsize::new(200),
             login_count: AtomicUsize::new(0),
+            session_count: AtomicUsize::new(0),
             options_count: AtomicUsize::new(0),
-            login_forms: Mutex::new(Vec::new()),
+            login_requests: Mutex::new(Vec::new()),
             request_cookies: Mutex::new(Vec::new()),
             logs: Mutex::new(Vec::new()),
             lose_log_response: AtomicBool::new(false),
         });
         let app = Router::new()
-            .route("/self-service/login/browser", get(login_flow))
-            .route("/self-service/login", post(submit_login))
-            .route("/sessions/whoami", get(whoami))
+            .route("/login", post(submit_login))
+            .route("/credential-leak", post(submit_login))
+            .route("/session", get(session))
             .route("/logs/configuration-options", get(configuration_options))
             .route(
                 "/users/user-id/logs",
@@ -1238,6 +1249,25 @@ mod tests {
                     },
                 ),
             )
+            .route(
+                "/logs/{id}",
+                axum::routing::put(
+                    |State(state): State<Arc<MockTadoku>>,
+                     Path(id): Path<String>,
+                     Json(body): Json<serde_json::Value>| async move {
+                        let mut logs = state.logs.lock().unwrap();
+                        let log = logs.iter_mut().find(|log| log["id"] == id).unwrap();
+                        for (key, value) in body.as_object().unwrap() {
+                            log[key] = value.clone();
+                        }
+                        if state.lose_log_response.swap(false, Ordering::SeqCst) {
+                            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                        } else {
+                            Json(log.clone()).into_response()
+                        }
+                    },
+                ),
+            )
             .with_state(state.clone());
         let server = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
@@ -1247,19 +1277,34 @@ mod tests {
 
     fn mock_config(state: &MockTadoku) -> TadokuConfig {
         TadokuConfig {
-            username: "reader".to_string(),
+            username: "reader@example.com".to_string(),
             password: "super-secret".to_string(),
             api_url: state.base_url.clone(),
-            session_url: format!("{}/sessions/whoami", state.base_url),
+            session_url: format!("{}/session", state.base_url),
             ..TadokuConfig::default()
         }
+    }
+
+    async fn mock_batch_database(
+        batch: &TadokuExportBatch,
+    ) -> (Arc<AppDatabase>, std::path::PathBuf) {
+        let path =
+            std::env::temp_dir().join(format!("nagare-tadoku-log-{}.sqlite", uuid::Uuid::new_v4()));
+        let db = Arc::new(AppDatabase::new(path.clone(), None).await.unwrap());
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute(
+            "INSERT INTO tadoku_export_batches (batch_id, export_date, series_name, description, duration_seconds, language_code, created_at, updated_at) VALUES (?1, '2026-10-28', ?2, ?3, ?4, ?5, ?6, ?6)",
+            rusqlite::params![batch.batch_id, batch.series_name, batch.description, batch.duration_seconds, batch.language_code, Utc::now().to_rfc3339()],
+        )
+        .unwrap();
+        (db, path)
     }
 
     #[test]
     fn extracts_cookie_values_and_headers() {
         assert_eq!(extract_cookie_value("abc").unwrap(), "abc");
         assert_eq!(
-            extract_cookie_value("ory_kratos_session=abc").unwrap(),
+            extract_cookie_value("other=xyz; tadoku_session=abc; Path=/").unwrap(),
             "abc"
         );
         assert!(extract_cookie_value("abc\ndef").is_err());
@@ -1268,7 +1313,7 @@ mod tests {
     #[test]
     fn adds_configured_tags_for_case_insensitive_path_matches() {
         let config = TadokuConfig::default();
-        let batch = TadokuExportBatch {
+        let mut batch = TadokuExportBatch {
             batch_id: "batch".to_string(),
             tadoku_log_id: None,
             is_longform_checkpoint: false,
@@ -1280,11 +1325,13 @@ mod tests {
             file_paths: vec!["/media/Anime/Frieren/episode01.mkv".to_string()],
         };
         assert_eq!(tadoku_tags(&config, &batch), vec!["nagare", "anime"]);
+        batch.has_rewatch = true;
+        assert_eq!(tadoku_tags(&config, &batch), vec!["nagare", "anime"]);
     }
 
     #[tokio::test]
     async fn rewatch_export_ignores_original_log_and_recovers_a_lost_creation_response() {
-        let (state, server) = spawn_mock_tadoku(true, true, true, false).await;
+        let (state, server) = spawn_mock_tadoku(true, false).await;
         let config = mock_config(&state);
         let mut client =
             TadokuClient::new_with_auth_url(config.clone(), None, false, &state.base_url).unwrap();
@@ -1304,6 +1351,7 @@ mod tests {
             language_code: "jpn".into(),
             file_paths: Vec::new(),
         };
+        let (db, path) = mock_batch_database(&batch).await;
         let original = json!({
             "id": "original", "description": batch.description,
             "amount": 24.0, "unit_id": "minutes", "unit_key": "listening_minute",
@@ -1311,17 +1359,44 @@ mod tests {
         });
         state.logs.lock().unwrap().push(original.clone());
         let existing = client.existing_nagare_logs("user-id").await.unwrap();
-        assert!(matching_existing_log(&batch, &existing).is_none());
+        let prior_ids = db
+            .tadoku_log_match_exclusions(
+                batch.batch_id.clone(),
+                Some(existing.keys().cloned().collect()),
+            )
+            .await
+            .unwrap();
+        assert!(
+            matching_existing_log(&batch, &existing, Some(&prior_ids))
+                .unwrap()
+                .is_none()
+        );
         state.lose_log_response.store(true, Ordering::SeqCst);
         assert!(client.create_log(&batch, 2, &unit, &[]).await.is_err());
         assert_eq!(state.logs.lock().unwrap().len(), 2);
+        assert_eq!(state.logs.lock().unwrap()[1]["tags"], json!(["nagare"]));
 
         // A new client represents retrying after Nagare restarts. Discovery
-        // finds this batch's marker despite the original log's identical text.
+        // uses the local snapshot despite the original log's identical text.
         let mut restarted =
             TadokuClient::new_with_auth_url(config, None, false, &state.base_url).unwrap();
+        drop(db);
+        let db = Arc::new(AppDatabase::new(path.clone(), None).await.unwrap());
         let existing = restarted.existing_nagare_logs("user-id").await.unwrap();
-        let recovered = matching_existing_log(&batch, &existing).unwrap();
+        let prior_ids = db
+            .tadoku_log_match_exclusions(
+                batch.batch_id.clone(),
+                Some(existing.keys().cloned().collect()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            prior_ids,
+            std::collections::HashSet::from(["original".into()])
+        );
+        let recovered = matching_existing_log(&batch, &existing, Some(&prior_ids))
+            .unwrap()
+            .unwrap();
         assert_ne!(recovered.id, "original");
         restarted
             .ensure_log_minutes(recovered.clone(), &batch, &unit)
@@ -1329,14 +1404,123 @@ mod tests {
             .unwrap();
         assert_eq!(state.logs.lock().unwrap().len(), 2);
         assert_eq!(state.logs.lock().unwrap()[0], original);
+        let mut ambiguous = existing.clone();
+        let mut duplicate = recovered.clone();
+        duplicate.id = "ambiguous".into();
+        ambiguous.insert(duplicate.id.clone(), duplicate);
+        assert!(matching_existing_log(&batch, &ambiguous, Some(&prior_ids)).is_err());
+
         batch.batch_id = uuid::Uuid::new_v4().to_string();
-        assert!(matching_existing_log(&batch, &existing).is_none());
+        let all_ids = existing.keys().cloned().collect();
+        assert!(
+            matching_existing_log(&batch, &existing, Some(&all_ids))
+                .unwrap()
+                .is_none()
+        );
         batch.has_rewatch = false;
+        let rewatch_ids = std::collections::HashSet::from([recovered.id.clone()]);
         assert_eq!(
-            matching_existing_log(&batch, &existing).unwrap().id,
+            matching_existing_log(&batch, &existing, Some(&rewatch_ids))
+                .unwrap()
+                .unwrap()
+                .id,
             "original"
         );
         server.abort();
+        drop(db);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn removes_legacy_rewatch_tags_and_keeps_the_log_identity_after_a_lost_update_response() {
+        let (state, server) = spawn_mock_tadoku(true, false).await;
+        let config = mock_config(&state);
+        let mut batch = TadokuExportBatch {
+            batch_id: uuid::Uuid::new_v4().to_string(),
+            tadoku_log_id: None,
+            is_longform_checkpoint: false,
+            has_rewatch: true,
+            series_name: "Show".into(),
+            description: "Show — S01E01".into(),
+            duration_seconds: 1_440,
+            language_code: "jpn".into(),
+            file_paths: vec!["/media/anime/show.mkv".into()],
+        };
+        let (db, path) = mock_batch_database(&batch).await;
+        let shared = Arc::new(tokio::sync::RwLock::new(crate::config::Config {
+            tadoku: config.clone(),
+            ..Default::default()
+        }));
+        let mut client = TadokuClient::new_with_auth_url(
+            config,
+            Some(super::persistence(shared, db.clone())),
+            false,
+            &state.base_url,
+        )
+        .unwrap();
+        let unit = client
+            .connection_info("jpn")
+            .await
+            .unwrap()
+            .listening_minutes_unit;
+        state.logs.lock().unwrap().push(json!({
+            "id": "rewatch", "description": batch.description,
+            "amount": 24.0, "unit_id": "minutes", "unit_key": "listening_minute",
+            "tags": ["nagare", "anime", "favorite", super::rewatch_batch_tag(&batch)]
+        }));
+        let existing = client.existing_nagare_logs("user-id").await.unwrap();
+        let legacy = matching_existing_log(&batch, &existing, None)
+            .unwrap()
+            .unwrap();
+        state.lose_log_response.store(true, Ordering::SeqCst);
+        assert!(
+            client
+                .ensure_log_minutes(legacy.clone(), &batch, &unit)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            state.logs.lock().unwrap()[0]["tags"],
+            json!(["nagare", "anime", "favorite"])
+        );
+
+        // The marker is gone remotely, but the local ID was saved before PUT.
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let (log_id, status): (String, String) = conn
+            .query_row(
+                "SELECT tadoku_log_id, status FROM tadoku_export_batches WHERE batch_id = ?1",
+                [&batch.batch_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(log_id, "rewatch");
+        assert_eq!(status, "pending");
+        let other_batch_exclusions = db
+            .tadoku_log_match_exclusions("another-batch".into(), None)
+            .await
+            .unwrap();
+        assert!(other_batch_exclusions.contains("rewatch"));
+        assert!(
+            db.tadoku_log_match_exclusions(batch.batch_id.clone(), None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        batch.tadoku_log_id = Some(log_id);
+        let existing = client.existing_nagare_logs("user-id").await.unwrap();
+        let recovered = matching_existing_log(&batch, &existing, None)
+            .unwrap()
+            .unwrap();
+        client
+            .ensure_log_minutes(recovered.clone(), &batch, &unit)
+            .await
+            .unwrap();
+        assert_eq!(state.logs.lock().unwrap().len(), 1);
+        server.abort();
+        drop(conn);
+        drop(client);
+        drop(db);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -1345,18 +1529,19 @@ mod tests {
         let error = TadokuClient::new(config, None, true).err().unwrap();
         assert_eq!(
             error.to_string(),
-            "Tadoku username and password are not configured"
+            "Tadoku email and password are not configured"
         );
     }
 
     #[tokio::test]
-    async fn browser_login_submits_credentials_and_csrf_as_form_data() {
-        let (state, server) = spawn_mock_tadoku(true, true, true, false).await;
+    async fn login_submits_email_and_password_as_json_with_origin() {
+        let (state, server) = spawn_mock_tadoku(true, false).await;
         let mut client =
             TadokuClient::new_with_auth_url(mock_config(&state), None, false, &state.base_url)
                 .unwrap();
         let connection = client.connection_info("jpn").await.unwrap();
         assert_eq!(connection.info.user_id, "user-id");
+        assert_eq!(connection.info.display_name.as_deref(), Some("Reader"));
         assert_eq!(connection.info.listening_minutes_unit_id, "minutes");
         assert_eq!(
             connection.info.listening_dense_minutes_unit_id,
@@ -1367,61 +1552,75 @@ mod tests {
             Some("listening_dense_minutes")
         );
         assert_eq!(state.login_count.load(Ordering::SeqCst), 1);
-        let forms = state.login_forms.lock().unwrap();
-        let form = forms.first().unwrap();
-        assert!(form.contains("identifier=reader"));
-        assert!(form.contains("password=super-secret"));
-        assert!(form.contains("method=password"));
-        assert!(form.contains("csrf_token=csrf-value"));
+        let requests = state.login_requests.lock().unwrap();
+        let (headers, body) = requests.first().unwrap();
+        assert_eq!(headers[header::CONTENT_TYPE], "application/json");
+        assert_eq!(headers[header::ORIGIN], state.base_url);
+        assert!(!headers.contains_key(header::AUTHORIZATION));
+        assert!(!headers.contains_key("x-session-token"));
+        assert_eq!(
+            *body,
+            json!({"email": "reader@example.com", "password": "super-secret"})
+        );
         assert_eq!(
             client.session_cookie().unwrap().as_deref(),
             Some("fresh-session")
         );
-        drop(forms);
+        drop(requests);
         server.abort();
     }
 
     #[tokio::test]
-    async fn rejects_untrusted_login_action_before_submitting_credentials() {
-        let (state, server) = spawn_mock_tadoku(false, true, true, false).await;
+    async fn refuses_login_redirects_without_forwarding_credentials() {
+        let (state, server) = spawn_mock_tadoku(true, false).await;
+        state.login_status.store(307, Ordering::SeqCst);
         let mut client =
             TadokuClient::new_with_auth_url(mock_config(&state), None, false, &state.base_url)
                 .unwrap();
         let error = client.connection_info("jpn").await.unwrap_err();
-        assert_eq!(error.to_string(), "Tadoku returned an invalid login flow");
-        assert_eq!(state.login_count.load(Ordering::SeqCst), 0);
+        assert!(error.to_string().contains("HTTP 307"));
+        assert_eq!(state.login_count.load(Ordering::SeqCst), 1);
         server.abort();
     }
 
     #[tokio::test]
-    async fn rejects_login_flow_without_csrf_token() {
-        let (state, server) = spawn_mock_tadoku(true, false, true, false).await;
-        let mut client =
-            TadokuClient::new_with_auth_url(mock_config(&state), None, false, &state.base_url)
-                .unwrap();
-        let error = client.connection_info("jpn").await.unwrap_err();
-        assert_eq!(error.to_string(), "Tadoku did not return a CSRF token");
-        assert_eq!(state.login_count.load(Ordering::SeqCst), 0);
-        server.abort();
+    async fn failed_or_throttled_login_is_not_retried() {
+        for (status, message) in [
+            (401, "saved email and password"),
+            (429, "wait 15 minutes"),
+            (503, "HTTP 503"),
+        ] {
+            let (state, server) = spawn_mock_tadoku(true, false).await;
+            state.login_status.store(status, Ordering::SeqCst);
+            let mut client =
+                TadokuClient::new_with_auth_url(mock_config(&state), None, false, &state.base_url)
+                    .unwrap();
+            let error = client.connection_info("jpn").await.unwrap_err();
+            assert!(error.to_string().contains(message));
+            assert!(!error.to_string().contains("super-secret"));
+            assert_eq!(state.login_count.load(Ordering::SeqCst), 1);
+            assert_eq!(state.options_count.load(Ordering::SeqCst), 0);
+            server.abort();
+        }
     }
 
     #[tokio::test]
     async fn successful_login_requires_browser_session_cookie() {
-        let (state, server) = spawn_mock_tadoku(true, true, false, false).await;
+        let (state, server) = spawn_mock_tadoku(false, false).await;
         let mut client =
             TadokuClient::new_with_auth_url(mock_config(&state), None, false, &state.base_url)
                 .unwrap();
         let error = client.connection_info("jpn").await.unwrap_err();
         assert_eq!(
             error.to_string(),
-            "Tadoku login did not return a browser session cookie"
+            "Tadoku login did not return a tadoku_session cookie"
         );
         server.abort();
     }
 
     #[tokio::test]
     async fn reuses_saved_cookie_without_login() {
-        let (state, server) = spawn_mock_tadoku(true, true, true, false).await;
+        let (state, server) = spawn_mock_tadoku(true, false).await;
         let mut config = mock_config(&state);
         config.session_cookie = "saved-session".to_string();
         let mut client =
@@ -1434,16 +1633,16 @@ mod tests {
                 .lock()
                 .unwrap()
                 .iter()
-                .any(|cookie| cookie.contains("ory_kratos_session=saved-session"))
+                .any(|cookie| cookie.contains("tadoku_session=saved-session"))
         );
         server.abort();
     }
 
     #[tokio::test]
     async fn unauthorized_request_reauthenticates_and_retries_once() {
-        let (state, server) = spawn_mock_tadoku(true, true, true, true).await;
+        let (state, server) = spawn_mock_tadoku(true, true).await;
         let mut config = mock_config(&state);
-        config.session_cookie = "expired-session".to_string();
+        config.session_cookie = "saved-session".to_string();
         let mut client =
             TadokuClient::new_with_auth_url(config, None, true, &state.base_url).unwrap();
         client.connection_info("jpn").await.unwrap();
@@ -1454,6 +1653,138 @@ mod tests {
             Some("fresh-session")
         );
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn expired_session_with_http_200_refreshes_once() {
+        let (state, server) = spawn_mock_tadoku(true, false).await;
+        let mut config = mock_config(&state);
+        // Also covers old bare Kratos tokens whose endpoint was already updated.
+        config.session_cookie = "expired-session".into();
+        let mut client =
+            TadokuClient::new_with_auth_url(config, None, true, &state.base_url).unwrap();
+        client.connection_info("jpn").await.unwrap();
+        assert_eq!(state.session_count.load(Ordering::SeqCst), 2);
+        assert_eq!(state.login_count.load(Ordering::SeqCst), 1);
+        assert_eq!(state.options_count.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn persistent_authentication_failure_stops_after_one_refresh() {
+        for guest_session in [true, false] {
+            let (state, server) = spawn_mock_tadoku(true, false).await;
+            state.guest_session.store(guest_session, Ordering::SeqCst);
+            state
+                .reject_all_options
+                .store(!guest_session, Ordering::SeqCst);
+            let mut config = mock_config(&state);
+            config.session_cookie = "saved-session".into();
+            let mut client =
+                TadokuClient::new_with_auth_url(config, None, true, &state.base_url).unwrap();
+            assert!(client.connection_info("jpn").await.is_err());
+            assert_eq!(state.login_count.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                state.options_count.load(Ordering::SeqCst),
+                if guest_session { 0 } else { 2 }
+            );
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn persists_migrated_session_and_reuses_it_after_restart() {
+        let (state, server) = spawn_mock_tadoku(true, false).await;
+        let path = std::env::temp_dir().join(format!(
+            "nagare-tadoku-auth-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let db = Arc::new(
+            crate::mining::AppDatabase::new(path.clone(), None)
+                .await
+                .unwrap(),
+        );
+        let mut original = crate::config::Config::default();
+        original.tadoku = mock_config(&state);
+        original.tadoku.session_url = "https://account.tadoku.app/kratos/sessions/whoami".into();
+        original.tadoku.session_cookie = "old-kratos-token".into();
+        original.tadoku.enabled = true;
+        original.tadoku.sync_mode = crate::config::TadokuSyncMode::Automatic;
+        db.save_config(original.clone()).await.unwrap();
+        let shared = Arc::new(tokio::sync::RwLock::new(original.clone()));
+        let mut client = TadokuClient::new_with_auth_url(
+            original.tadoku.clone(),
+            Some(super::persistence(shared.clone(), db.clone())),
+            true,
+            &state.base_url,
+        )
+        .unwrap();
+        assert!(client.session_cookie().unwrap().is_none());
+        client.ensure_authenticated().await.unwrap();
+        let saved = db
+            .load_config_or_default(path.with_extension("json"))
+            .await
+            .unwrap();
+        let mut expected = original;
+        expected.tadoku.session_url = "https://tadoku.app/api/internal/identity/session".into();
+        expected.tadoku.session_cookie = "fresh-session".into();
+        assert_eq!(
+            serde_json::to_value(&saved).unwrap(),
+            serde_json::to_value(&expected).unwrap()
+        );
+        assert_eq!(shared.read().await.tadoku.session_cookie, "fresh-session");
+
+        let mut restarted =
+            TadokuClient::new_with_auth_url(saved.tadoku, None, true, &state.base_url).unwrap();
+        restarted.ensure_authenticated().await.unwrap();
+        assert_eq!(state.login_count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            restarted.session_cookie().unwrap().as_deref(),
+            Some("fresh-session")
+        );
+        server.abort();
+        drop(db);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn migrates_legacy_session_settings_without_changing_credentials_or_sync_options() {
+        for old_url in [
+            "https://account.tadoku.app/kratos/sessions/whoami",
+            " https://account.tadoku.app/kratos/sessions/whoami/ ",
+        ] {
+            let mut config: TadokuConfig = serde_json::from_value(json!({
+                "username": "reader@example.com", "password": "saved-password",
+                "session_cookie": "legacy-cookie", "session_url": old_url,
+                "enabled": true, "sync_mode": "automatic", "language_code": "jpn",
+                "export_hour_eastern": 18, "path_tag_rules": [{"contains": "books", "tag": "book"}]
+            }))
+            .unwrap();
+            let mut expected = serde_json::to_value(&config).unwrap();
+            expected["session_url"] = json!("https://tadoku.app/api/internal/identity/session");
+            expected["session_cookie"] = json!("");
+            config.normalize();
+            assert_eq!(serde_json::to_value(&config).unwrap(), expected);
+            config.session_cookie = "new-session".into();
+            config.normalize();
+            assert_eq!(config.session_cookie, "new-session");
+        }
+    }
+
+    #[test]
+    fn preserves_custom_endpoints_and_current_cookies() {
+        let mut config = TadokuConfig {
+            api_url: "https://custom.example/api".into(),
+            session_url: "https://custom.example/session".into(),
+            session_cookie: "tadoku_session=saved-session".into(),
+            ..TadokuConfig::default()
+        };
+        let original = serde_json::to_value(&config).unwrap();
+        config.normalize();
+        assert_eq!(serde_json::to_value(&config).unwrap(), original);
+        config.session_cookie = "ory_kratos_session=legacy".into();
+        config.normalize();
+        assert!(config.session_cookie.is_empty());
     }
 
     #[test]

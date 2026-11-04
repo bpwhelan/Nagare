@@ -1,6 +1,7 @@
 use crate::config::{Config, MediaServerKind};
 use crate::media_server::{
-    ItemInfo, MediaServer, MediaStream, NowPlaying, ServerMap, Session, StreamType, SubtitleFormat,
+    ItemInfo, MediaLibrary, MediaServer, MediaStream, NowPlaying, ServerMap, Session, StreamType,
+    SubtitleFormat,
 };
 use crate::mining::AppDatabase;
 use crate::subtitle::{SubtitleTrack, parse_subtitle};
@@ -350,6 +351,12 @@ fn compare_auto_session_priority(
         .then_with(|| left.id.cmp(&right.id))
 }
 
+struct CachedLibraries {
+    server: Arc<dyn MediaServer>,
+    fetched_at: Instant,
+    libraries: Vec<MediaLibrary>,
+}
+
 pub struct SessionManager {
     servers: Arc<RwLock<ServerMap>>,
     config: Arc<RwLock<Config>>,
@@ -383,6 +390,7 @@ pub struct SessionManager {
     /// Prevent overlapping poll cycles when the API forces immediate refreshes.
     poll_lock: Mutex<()>,
     playback_sessions: Mutex<PlaybackSessions>,
+    library_cache: Mutex<HashMap<MediaServerKind, CachedLibraries>>,
     history_tracker: Mutex<HistoryTracker>,
     /// Throttle: only persist to SQLite at most once per position-save interval.
     last_save: Arc<Mutex<Instant>>,
@@ -442,6 +450,7 @@ impl SessionManager {
             db,
             poll_lock: Mutex::new(()),
             playback_sessions: Mutex::new(PlaybackSessions::default()),
+            library_cache: Mutex::new(HashMap::new()),
             history_tracker: Mutex::new(HistoryTracker::default()),
             last_save,
             plex_ws_connected: AtomicBool::new(false),
@@ -826,20 +835,91 @@ impl SessionManager {
 
     async fn collect_playback_sessions(&self, servers: ServerMap) -> Vec<ServerSession> {
         let reported = self.collect_server_sessions(servers).await;
-        let mut sessions = self
+        let sessions = self
             .playback_sessions
             .lock()
             .await
             .update(reported, Instant::now());
-        let config = self.config.read().await;
-        sessions.retain(|s| {
-            config.is_user_allowed(
+        let config = self.config.read().await.clone();
+        let mut allowed = Vec::new();
+        for mut s in sessions {
+            if !config.is_user_allowed(
                 s.kind,
                 s.session.user_id.as_deref(),
                 s.session.user_name.as_deref(),
-            )
-        });
-        sessions
+            ) {
+                continue;
+            }
+            if let Some(filter) = config.media_filter(s.kind) {
+                if filter.filters_libraries() || filter.filters_folders() {
+                    let Some(item) = s.session.now_playing.as_mut() else {
+                        continue;
+                    };
+                    if item
+                        .path
+                        .as_deref()
+                        .is_none_or(|path| path.trim().is_empty())
+                        && (filter.filters_folders() || item.library_id.is_none())
+                    {
+                        if let Ok(info) = s
+                            .server
+                            .get_item_info(&item.item_id, s.session.user_id.as_deref())
+                            .await
+                        {
+                            item.path = info.path.or_else(|| {
+                                info.media_sources
+                                    .into_iter()
+                                    .find_map(|source| source.path)
+                            });
+                        }
+                    }
+                    let libraries = if filter.filters_libraries() && item.library_id.is_none() {
+                        self.libraries_for_filter(s.kind, &s.server).await
+                    } else {
+                        Vec::new()
+                    };
+                    if !filter.allows(item.library_id.as_deref(), item.path.as_deref(), &libraries)
+                    {
+                        continue;
+                    }
+                }
+            }
+            allowed.push(s);
+        }
+        allowed
+    }
+
+    async fn libraries_for_filter(
+        &self,
+        kind: MediaServerKind,
+        server: &Arc<dyn MediaServer>,
+    ) -> Vec<MediaLibrary> {
+        let mut cache = self.library_cache.lock().await;
+        if let Some(cached) = cache.get(&kind) {
+            if Arc::ptr_eq(&cached.server, server)
+                && cached.fetched_at.elapsed() < Duration::from_secs(60)
+            {
+                return cached.libraries.clone();
+            }
+        }
+        let libraries = match server.get_libraries().await {
+            Ok(libraries) => libraries,
+            Err(error) => {
+                warn!(
+                    "Cannot resolve {kind} libraries for media filters; skipping unresolved playback: {error}"
+                );
+                Vec::new()
+            }
+        };
+        cache.insert(
+            kind,
+            CachedLibraries {
+                server: server.clone(),
+                fetched_at: Instant::now(),
+                libraries: libraries.clone(),
+            },
+        );
+        libraries
     }
 
     fn is_loadable_text_subtitle(stream: &MediaStream) -> bool {
@@ -2337,6 +2417,7 @@ mod tests {
 
     fn now_playing(name: &str, media_type: &str, series_name: Option<&str>) -> NowPlaying {
         NowPlaying {
+            library_id: None,
             item_id: "item-1".to_string(),
             name: name.to_string(),
             series_name: series_name.map(str::to_string),
@@ -2402,6 +2483,21 @@ mod tests {
         async fn get_users(&self) -> anyhow::Result<Vec<MediaUser>> {
             Ok(vec![])
         }
+        async fn get_libraries(&self) -> anyhow::Result<Vec<MediaLibrary>> {
+            Ok(vec![
+                MediaLibrary {
+                    id: "jp".into(),
+                    name: "Japanese".into(),
+                    paths: vec!["/media/Japanese".into()],
+                },
+                MediaLibrary {
+                    id: "en".into(),
+                    name: "English".into(),
+                    paths: vec!["/media/English".into()],
+                },
+            ])
+        }
+
         async fn get_item_info(&self, _: &str, _: Option<&str>) -> anyhow::Result<ItemInfo> {
             anyhow::bail!("No item details")
         }
@@ -2674,6 +2770,109 @@ mod tests {
         .await
         .unwrap();
         (manager, server, directory)
+    }
+
+    #[tokio::test]
+    async fn media_filters_skip_history_and_apply_to_retained_playback_live() {
+        let mut japanese = browser_tab("jp-episode", false, 12_000);
+        japanese.now_playing.as_mut().unwrap().path = Some("/media/Japanese/show.mkv".into());
+        let mut english = browser_tab("en-episode", false, 20_000);
+        english.id = "tv".into();
+        english.now_playing.as_mut().unwrap().path = Some("/media/English/show.mkv".into());
+        let (manager, server, directory) = session_test_manager(
+            MediaServerKind::Jellyfin,
+            vec![japanese.clone(), english.clone()],
+        )
+        .await;
+        manager.config.write().await.jellyfin = Some(
+            serde_json::from_value(serde_json::json!({
+                "url": "http://localhost", "api_key": "test",
+                "media_filter": { "included_libraries": ["jp"] }
+            }))
+            .unwrap(),
+        );
+        manager.poll_once().await;
+        assert_eq!(manager.state.read().await.sessions.len(), 1);
+        assert!(
+            manager
+                .history
+                .read()
+                .await
+                .contains_key("jellyfin|jp-episode")
+        );
+        assert!(
+            !manager
+                .history
+                .read()
+                .await
+                .contains_key("jellyfin|en-episode")
+        );
+
+        // Retain the Japanese browser tab while its provider row switches to
+        // another item, then exclude its folder without rebuilding the client.
+        let mut other = browser_tab("new-episode", false, 3_000);
+        other.now_playing.as_mut().unwrap().path = Some("/media/Japanese/other.mkv".into());
+        *server.0.write().await = vec![other, english];
+        manager
+            .config
+            .write()
+            .await
+            .jellyfin
+            .as_mut()
+            .unwrap()
+            .media_filter
+            .excluded_folders = vec!["/media/Japanese".into()];
+        manager.poll_once().await;
+        assert!(manager.state.read().await.sessions.is_empty());
+        assert!(manager.state.read().await.now_playing.is_none());
+        assert!(
+            !manager
+                .history
+                .read()
+                .await
+                .contains_key("jellyfin|new-episode")
+        );
+        assert_eq!(manager.history.read().await.len(), 1);
+
+        // Clear the filters: the other library becomes eligible immediately.
+        manager
+            .config
+            .write()
+            .await
+            .jellyfin
+            .as_mut()
+            .unwrap()
+            .media_filter = Default::default();
+        manager.poll_once().await;
+        assert!(
+            manager
+                .history
+                .read()
+                .await
+                .contains_key("jellyfin|en-episode")
+        );
+        assert!(manager.state.read().await.sessions.len() >= 2);
+        drop(manager);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn media_filters_are_scoped_to_their_server() {
+        let session = browser_tab("episode", false, 12_000);
+        let (manager, _, directory) =
+            session_test_manager(MediaServerKind::Plex, vec![session]).await;
+        manager.config.write().await.jellyfin = Some(
+            serde_json::from_value(serde_json::json!({
+                "url": "http://localhost", "api_key": "test",
+                "media_filter": { "included_libraries": ["jp"], "included_folders": ["/Japanese"] }
+            }))
+            .unwrap(),
+        );
+        manager.poll_once().await;
+        assert_eq!(manager.state.read().await.sessions.len(), 1);
+        assert!(manager.history.read().await.contains_key("plex|episode"));
+        drop(manager);
+        fs::remove_dir_all(directory).unwrap();
     }
 
     fn browser_tab(item_id: &str, paused: bool, position_ms: i64) -> Session {

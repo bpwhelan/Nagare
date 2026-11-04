@@ -38,9 +38,10 @@ sent to Tadoku by this integration.
 | Individual episode, movie, or audiobook with positive recorded progress | One activity log per watch, including confirmed rewatches |
 | History without recorded playback | Stored with the media; creates an activity when playback is recorded |
 | Saved playback position | Activity duration, capped at runtime and rounded to the nearest whole minute, with a one-minute minimum for positive progress |
+| Saved subtitles up to each watch's playback position | Activity character (moji) count, excluding whitespace |
 | Latest observed playback timestamp | Activity date in the configured time zone |
 | Video / AudioBookShelf | Watching / Listening activity |
-| Full history metadata, exact position, runtime, subtitle count, mined-note count | Media's `extra_data.nagare.history` |
+| Full history metadata, exact position, runtime, subtitle count, character count, mined-note count | Media's `extra_data.nagare.history` |
 | Title, progress in seconds, mined-note count | Managed section of the activity's notes |
 
 **Playback progress is not elapsed watch time.** Nagare observes all permitted
@@ -52,6 +53,14 @@ requires positive whole-minute durations for these activities, so positive
 sub-minute progress becomes one minute. Items with zero progress remain in the
 media metadata without inventing activity time. If progress resets to zero,
 the previous managed log is removed and its media history remains.
+
+Moji counts include each non-whitespace Unicode character, including punctuation,
+in saved subtitle lines whose start time is at or before that watch's bounded
+playback position. A line counts in full when it starts. The saved track's timing
+offset is respected. Zero progress and items without saved subtitles send zero
+characters. These are subtitle-based progress counts; seeks can include skipped
+lines. Each rewatch uses its own position against the media's saved subtitle track.
+Existing managed logs receive counts on the next sync without creating new logs.
 
 After a completed item is restarted below 80% and more than a minute behind its
 saved position, **five consecutive real minutes of advancing playback** confirm

@@ -233,6 +233,7 @@ impl PlexClient {
 
         let now_playing = Some(NowPlaying {
             item_id: item_id.clone(),
+            library_id: Self::value_as_u64(&v["librarySectionID"]).map(|id| id.to_string()),
             name: v["title"].as_str().unwrap_or("").to_string(),
             series_name: v["grandparentTitle"].as_str().map(String::from),
             season_index: v["parentIndex"].as_u64().map(|v| v as u32),
@@ -759,6 +760,38 @@ impl MediaServer for PlexClient {
         Ok(users)
     }
 
+    async fn get_libraries(&self) -> anyhow::Result<Vec<MediaLibrary>> {
+        let body: Value = self
+            .with_plex_headers(self.http.get(self.url("/library/sections")))
+            .header("Accept", "application/json")
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let sections = body["MediaContainer"]["Directory"]
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("Library response omitted sections"))?;
+        Ok(sections
+            .iter()
+            .filter_map(|section| {
+                Some(MediaLibrary {
+                    id: Self::value_as_u64(&section["key"])?.to_string(),
+                    name: section["title"]
+                        .as_str()
+                        .unwrap_or("Unnamed library")
+                        .to_string(),
+                    paths: section["Location"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|location| location["path"].as_str().map(String::from))
+                        .collect(),
+                })
+            })
+            .collect())
+    }
+
     async fn get_item_info(
         &self,
         item_id: &str,
@@ -962,6 +995,21 @@ impl MediaServer for PlexClient {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn captures_library_section_id_from_playback_metadata() {
+        for id in [json!(12), json!("12")] {
+            let session = PlexClient::parse_session(&json!({
+                "ratingKey": "episode", "librarySectionID": id,
+                "Player": { "machineIdentifier": "device", "state": "playing" }
+            }))
+            .unwrap();
+            assert_eq!(
+                session.now_playing.unwrap().library_id.as_deref(),
+                Some("12")
+            );
+        }
+    }
 
     #[tokio::test]
     async fn selected_account_matches_string_and_numeric_session_user_ids() {
