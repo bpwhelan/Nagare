@@ -1863,9 +1863,9 @@ async fn generate_and_store_screenshot(
             )
             .await
             {
-                Ok(_) => {
+                Ok(stored_filename) => {
                     info!("[enhance {}] Screenshot stored in Anki", note_id);
-                    Some(format!("<img src=\"{}\">", ss_filename))
+                    Some(format!("<img src=\"{}\">", stored_filename))
                 }
                 Err(error) => {
                     warn!(
@@ -2228,14 +2228,12 @@ async fn perform_enrichment(
                 audio_filename
             );
 
-            if let Err(error) = enrichment_stage(
+            let audio_filename = enrichment_stage(
                 "audio_upload",
                 anki_client.store_media_file(&audio_filename, &audio_b64),
             )
             .await
-            {
-                return Err(format!("Failed to store audio: {}", error));
-            }
+            .map_err(|error| format!("Failed to store audio: {}", error))?;
             info!("[enhance {}] Audio stored in Anki", note_id);
 
             let mut picture_html = String::new();
@@ -2266,15 +2264,16 @@ async fn perform_enrichment(
                             "avif",
                         );
                         let avif_b64 = media::to_base64(&avif_data);
-                        if let Err(error) = enrichment_stage(
+                        match enrichment_stage(
                             "animated_image_upload",
                             anki_client.store_media_file(&avif_filename, &avif_b64),
                         )
                         .await
                         {
-                            warn!("Failed to store AVIF in Anki: {}", error);
-                        } else {
-                            picture_html = format!("<img src=\"{}\">", avif_filename);
+                            Ok(stored_filename) => {
+                                picture_html = format!("<img src=\"{}\">", stored_filename);
+                            }
+                            Err(error) => warn!("Failed to store AVIF in Anki: {}", error),
                         }
                         media::cleanup_temp_file(&avif_path).await;
                     }

@@ -393,7 +393,7 @@ async fn create_card(
         .await?;
         media::cleanup_temp_file(&path).await;
         let filename = format!("{prefix}.{}", codec.extension());
-        client
+        let filename = client
             .store_media_file(&filename, &media::to_base64(&data))
             .await?;
         fields.insert(mapping.audio.clone(), format!("[sound:{filename}]"));
@@ -420,7 +420,7 @@ async fn create_card(
         };
         media::cleanup_temp_file(&path).await;
         let filename = format!("{prefix}_picture.{ext}");
-        client
+        let filename = client
             .store_media_file(&filename, &media::to_base64(&data))
             .await?;
         fields.insert(mapping.picture.clone(), format!("<img src=\"{filename}\">"));

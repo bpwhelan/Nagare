@@ -9,6 +9,7 @@ import base64
 import json
 import os
 from pathlib import Path
+import re
 import socket
 import subprocess
 import tempfile
@@ -33,6 +34,8 @@ class MockAnki(BaseHTTPRequestHandler):
     models = {"Vocabulary Mock": list(CUSTOM.values())}
     notes = {100: dict(modelName="Vocabulary Mock", fields={"Expression": "猫"}, tags=[])}
     media = {}
+    media_names = {}
+    updates = []
     additions = []
     lose_response = ""
     delay = 0
@@ -84,8 +87,12 @@ class MockAnki(BaseHTTPRequestHandler):
                          fields={k: dict(value=v, order=j) for j, (k, v) in enumerate(cls.notes[i]["fields"].items())})
                     for i in params["notes"] if i in cls.notes]
         if action == "storeMediaFile":
-            cls.media[params["filename"]] = base64.b64decode(params["data"])
-            return params["filename"]
+            # Return a different name even for already-safe word-mining filenames.
+            # Callers must honor Anki's response, not guess its normalization rules.
+            filename = "stored-" + params["filename"].lower().replace("[", "").replace("]", "")
+            cls.media_names[params["filename"]] = filename
+            cls.media[filename] = base64.b64decode(params["data"])
+            return filename
         if action == "retrieveMediaFile":
             data = cls.media.get(params["filename"])
             return base64.b64encode(data).decode() if data else False
@@ -110,6 +117,7 @@ class MockAnki(BaseHTTPRequestHandler):
         if action == "updateNoteFields":
             note = params["note"]
             cls.notes[note["id"]]["fields"].update(note["fields"])
+            cls.updates.append(note["id"])
             return None
         if action in ("findCards", "cardsInfo"):
             return []
@@ -126,10 +134,20 @@ def request(url, body=None, method=None):
         return json.load(response)
 
 
+def assert_media_links(fields):
+    for value in fields.values():
+        for filename in re.findall(r'\[sound:([^\]]+)\]|<img src="([^"]+)">', value):
+            filename = filename[0] or filename[1]
+            assert filename in MockAnki.media, f"Card references missing media: {filename}"
+
+
 def main():
     args = argparse.ArgumentParser(description=__doc__)
     args.add_argument("--serve", action="store_true")
+    args.add_argument("--media-only", action="store_true", help="Check enhancement media links without downloading dictionaries")
+    args.add_argument("--binary", type=Path, default=ROOT / ("target/debug/nagare.exe" if os.name == "nt" else "target/debug/nagare"))
     args = args.parse_args()
+    (ROOT / "target").mkdir(exist_ok=True)
     directory = Path(tempfile.mkdtemp(prefix="word-mining-smoke-", dir=ROOT / "target"))
     media = directory / "scene.mp4"
     audio = directory / "book.flac"
@@ -147,14 +165,16 @@ def main():
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
     base = f"http://127.0.0.1:{port}"
-    config = dict(listen_address=f"127.0.0.1:{port}", anki={"url": f"http://127.0.0.1:{mock.server_port}"},
-                  mining={"static_screenshot_format": "png", "audio_codec": "mp3"})
+    config = dict(listen_address=f"127.0.0.1:{port}", anki={"url": f"http://127.0.0.1:{mock.server_port}",
+                  "fields": {"sentence": "Sentence", "sentence_audio": "SentenceAudio", "picture": "Picture"}},
+                  mining={"static_screenshot_format": "png", "audio_codec": "mp3",
+                          "avif_max_width": 160, "avif_max_fps": 2})
     (directory / "config.json").write_text(json.dumps(config), encoding="utf-8")
     history = {}
     for ident, title, file in [("video", "言葉の森 · A walk through the forest", media), ("audio", "日本語の物語 · Audiobook", audio)]:
         key = f"jellyfin|{ident}"
         history[key] = dict(history_id=key, server_kind="jellyfin", item_id=ident, title=title,
-                            series_name="Mining test", media_source_id=ident, file_path=str(file),
+                            series_name="Mining Test [字幕]", media_source_id=ident, file_path=str(file),
                             duration_ms=20000, subtitle_count=len(LINES), audio_languages=["jpn"],
                             last_position_ms=15000, last_seen="2026-09-17T12:00:00Z")
     track = dict(lines=[dict(index=i * 5, start_ms=i * 3500 + 500, end_ms=i * 3500 + 3000, text=text)
@@ -170,7 +190,7 @@ def main():
 
     def start():
         nonlocal process
-        process = subprocess.Popen([str(ROOT / ("target/debug/nagare.exe" if os.name == "nt" else "target/debug/nagare"))],
+        process = subprocess.Popen([str(args.binary.resolve())],
                                    cwd=ROOT, env=env, stdout=log, stderr=subprocess.STDOUT, creationflags=flags)
         for _ in range(100):
             try:
@@ -211,6 +231,39 @@ def main():
 
     try:
         start()
+        def enhance(ident="video", animated=False, reuse=None):
+            note_id = max(MockAnki.notes) + 1
+            MockAnki.notes[note_id] = dict(modelName="Media Mock", fields={"Sentence": LINES[0]}, tags=[])
+            result = request(base + "/api/enrich", dict(note_id=note_id, item_id=f"jellyfin|{ident}",
+                             sentence=LINES[0], start_ms=500, end_ms=1500, generate_avif=animated,
+                             reuse_assets_from_note_id=reuse))
+            assert result["success"], result
+            for _ in range(1200):
+                if note_id in MockAnki.updates:
+                    break
+                time.sleep(.1)
+            else:
+                raise AssertionError(f"Enhancement timed out; inspect {directory / 'server.log'}")
+            fields = MockAnki.notes[note_id]["fields"]
+            assert fields["SentenceAudio"].startswith("[sound:"), fields
+            assert_media_links(fields)
+            return note_id, fields
+
+        static_id, static = enhance()
+        assert static["Picture"].endswith('.png">'), static
+        _, animated = enhance(animated=True)
+        assert animated["Picture"].endswith('.avif">'), animated
+        uploads = len(MockAnki.media_names)
+        _, reused = enhance(reuse=static_id)
+        assert reused["SentenceAudio"] == static["SentenceAudio"] and reused["Picture"] == static["Picture"]
+        assert len(MockAnki.media_names) == uploads, "Reusing media must not upload new files"
+        _, audio_only = enhance(ident="audio", animated=True)
+        assert not audio_only.get("Picture"), audio_only
+        assert any("Mining_Test_[字幕]" in name for name in MockAnki.media_names)
+        assert all(requested != stored for requested, stored in MockAnki.media_names.items())
+        print("PASS: Anki-returned filenames for audio, static screenshots, AVIFs, reused media, and audio-only enhancement", flush=True)
+        if args.media_only:
+            return
         assert api(path)["workspace"] is None
         assert "Word" in api("/api/word-mining/anki")["fields"]
         media_info = api(path + "/media")
@@ -257,6 +310,7 @@ def main():
         created_note = MockAnki.notes[job["cards"][0]["note_id"]]
         assert created_note["fields"]["Context"] == LINES[0]
         assert "[sound:" in created_note["fields"]["Clip"] and "<img" in created_note["fields"]["Image"]
+        assert_media_links(created_note["fields"])
         assert job["settings"]["audio_ordinal"] == 1
         print("PASS: Custom fields, duplicate skipping, lost-response recovery, request idempotency, review snapshot", flush=True)
 
@@ -295,6 +349,8 @@ def main():
         assert job["status"] == "complete", job
         note = MockAnki.notes[job["cards"][0]["note_id"]]
         assert "[sound:" in note["fields"]["SentenceAudio"] and not note["fields"].get("Picture")
+        for note in MockAnki.notes.values():
+            assert_media_links(note["fields"])
         print("PASS: Built-in vocabulary note type creation and audio-only mining", flush=True)
         uploaded = api(audio_path + "/analyze", dict(split_mode="C", subtitle_name="replacement.srt",
                        subtitle_text="\ufeff5\n00:00:01,250 --> 00:00:03,750\n国際連合で働く。\n\n19\n00:00:05,000 --> 00:00:07,000\n猫は寝ています。\n"))["workspace"]

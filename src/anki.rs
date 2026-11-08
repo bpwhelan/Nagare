@@ -393,6 +393,8 @@ impl AnkiClient {
         Ok(())
     }
 
+    /// Returns Anki's stored filename, which may differ from the requested name.
+    /// Use this returned name when building references in note fields.
     pub async fn store_media_file(
         &self,
         filename: &str,
