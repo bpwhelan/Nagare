@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube - Log to Tadoku
 // @namespace    https://github.com/bpwhelan/Nagare
-// @version      1.0.1
+// @version      1.0.2
 // @description  Log a YouTube video's full duration to Tadoku as Japanese listening.
 // @match        https://www.youtube.com/*
 // @match        https://youtube.com/*
@@ -15,7 +15,7 @@
   'use strict';
 
   // Sign in at https://tadoku.app in this browser first. No Nagare server needed.
-  const LANGUAGE = 'ja';
+  const LANGUAGE = 'jpn';
   const API = 'https://tadoku.app/api/internal/immersion';
   const pending = new Set();
   const logged = new Map();
@@ -124,23 +124,10 @@
     });
   }
 
-  function listeningUnit(options, activityId) {
-    const units = options.units.filter(unit => unit.log_activity_id === activityId);
-    const languageMatches = unit => unit.language_code?.toLowerCase() === LANGUAGE;
-    const keyMatches = unit => (unit.unit_key || unit.key)?.toLowerCase() === 'listening_minute';
-    const nameMatches = unit => unit.name?.toLowerCase() === 'minute';
-    return units.find(unit => keyMatches(unit) && languageMatches(unit))
-      || units.find(unit => keyMatches(unit) && !unit.language_code)
-      || units.find(unit => nameMatches(unit) && languageMatches(unit))
-      || units.find(unit => nameMatches(unit) && !unit.language_code);
-  }
-
-  function logMatches(log, payload, unit) {
-    const unitMatches = log.unit_id === unit.id
-      || (payload.unit_key && log.unit_key === payload.unit_key)
-      || log.unit_name?.trim().toLowerCase() === unit.name.trim().toLowerCase();
-    return typeof log.amount === 'number' && Math.abs(log.amount - payload.amount) < 0.001
-      && unitMatches && log.description === payload.description
+  function logMatches(log, payload) {
+    return log.duration_seconds === payload.duration_seconds
+      && (log.amount == null || log.amount === 0) && !log.unit_key
+      && log.description === payload.description
       && log.tags?.some(tag => tag.toLowerCase() === 'youtube');
   }
 
@@ -159,8 +146,7 @@
       throw new Error('Tadoku did not offer Japanese as a logging language.');
     }
     const activity = options.activities.find(activity => activity.name.toLowerCase() === 'listening');
-    const unit = activity && listeningUnit(options, activity.id);
-    if (!unit) throw new Error('Tadoku did not offer Listening minutes.');
+    if (!activity) throw new Error('Tadoku did not offer Listening.');
     const payload = {
       registration_ids: registrations.filter(registration =>
         registration.languages?.some(language => language.code.toLowerCase() === LANGUAGE)
@@ -168,27 +154,23 @@
       ).map(registration => registration.id),
       language_code: LANGUAGE,
       activity_id: activity.id,
-      amount: Math.ceil(seconds / 6) / 10,
-      unit_id: unit.id,
-      ...(unit.unit_key || unit.key ? { unit_key: unit.unit_key || unit.key } : {}),
+      duration_seconds: Math.ceil(seconds),
       tags: ['youtube'],
       description: `https://www.youtube.com/watch?v=${encodeURIComponent(id)}`,
     };
     let log = await request(`${API}/logs`, 'POST', payload);
     if (!log.id) throw new Error('Tadoku did not return a log ID. Check your logs before retrying.');
-    // Match Nagare: some Tadoku responses need the minutes/unit corrected after creation.
-    if (!logMatches(log, payload, unit)) {
+    if (!logMatches(log, payload)) {
       log = await request(`${API}/logs/${encodeURIComponent(log.id)}`, 'PUT', {
-        amount: payload.amount, unit_id: payload.unit_id,
-        ...(payload.unit_key ? { unit_key: payload.unit_key } : {}),
+        duration_seconds: payload.duration_seconds,
         tags: [...new Set([...(log.tags || []), 'youtube'])],
         description: payload.description,
       });
-      if (!logMatches(log, payload, unit)) {
+      if (!logMatches(log, payload)) {
         throw new Error('Tadoku saved unexpected log details. Check your logs before retrying.');
       }
     }
-    return payload.amount;
+    return Math.ceil(payload.duration_seconds / 6) / 10;
   }
 
   button.addEventListener('click', async () => {

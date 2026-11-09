@@ -8,10 +8,11 @@ Sign in at [Tadoku](https://tadoku.app) in the same browser, then open or reload
 desktop YouTube watch page. Allow the script to contact Tadoku if prompted.
 
 **Log to Tadoku** appears below the video's channel/action row. One click logs
-the **full video duration** as **Japanese → Listening → Minute**, rounding up to
-one decimal like Nagare. The only tag is `youtube`; the description is the clean
-`https://www.youtube.com/watch?v=…` link. Eligible ongoing contest registrations
-are included automatically. The button shows the result or a sign-in/error message.
+the **full video duration** as **Japanese → Listening**, rounded up to a whole
+second. Displayed minutes round up to one decimal. The only tag is `youtube`;
+the description is the clean `https://www.youtube.com/watch?v=…` link. Eligible
+ongoing contest registrations are included automatically. The button shows the
+result or a sign-in/error message.
 
 The script works independently of Nagare and uses your browser's Tadoku session
 through the [userscript manager's requests](https://www.tampermonkey.net/documentation.php?q=GM_xmlhttpRequest).

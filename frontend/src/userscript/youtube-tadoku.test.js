@@ -6,7 +6,7 @@ import { runInNewContext } from 'node:vm';
 const source = readFileSync(new URL('../../public/youtube-tadoku.user.js', import.meta.url), 'utf8');
 const API = 'https://tadoku.app/api/internal/immersion';
 
-function fixture({ duration = 1415, signedIn = true, incorrectLog = false, deferPost = false } = {}) {
+function fixture({ duration = 1415, signedIn = true, incorrectLog = false, deferPost = false, incorrectUpdate = false } = {}) {
   const elements = [];
   const listeners = new Map();
   const requests = [];
@@ -61,14 +61,8 @@ function fixture({ duration = 1415, signedIn = true, incorrectLog = false, defer
   const location = { pathname: '/watch', href: 'https://www.youtube.com/watch?v=first&t=90&list=playlist' };
   const options = {
     activities: [{ id: 1, name: 'Reading' }, { id: 2, name: 'Listening' }],
-    languages: [{ code: 'ja' }],
-    units: [
-      { id: 'reading', log_activity_id: 1, name: 'Minute', unit_key: 'reading_minute' },
-      { id: 'dense', log_activity_id: 2, name: 'Dense minute', unit_key: 'listening_dense_minutes' },
-      { id: 'ko', log_activity_id: 2, name: 'Minute', unit_key: 'listening_minute', language_code: 'ko' },
-      { id: 'generic', log_activity_id: 2, name: 'Minute', unit_key: 'listening_minute' },
-      { id: 'ja', log_activity_id: 2, name: 'Minute', unit_key: 'listening_minute', language_code: 'ja' },
-    ],
+    languages: [{ code: 'jpn' }],
+    units: [{ log_activity_id: 1, name: 'Page', unit_key: 'pages', modifier: 1 }],
   };
   const registration = (id, code, activity) => ({
     id, languages: [{ code }], contest: { allowed_activities: [{ id: activity }] },
@@ -90,14 +84,14 @@ function fixture({ duration = 1415, signedIn = true, incorrectLog = false, defer
         respond(request, options);
       } else if (request.url.endsWith('/ongoing-registrations')) {
         respond(request, { registrations: [
-          registration('eligible', 'ja', 2), registration('korean', 'ko', 2),
-          registration('reading-only', 'ja', 1), { id: 'no-contest', languages: [{ code: 'ja' }] },
+          registration('eligible', 'jpn', 2), registration('korean', 'ko', 2),
+          registration('reading-only', 'jpn', 1), { id: 'no-contest', languages: [{ code: 'jpn' }] },
         ] });
       } else if (request.method === 'POST') {
         post = request;
-        if (!deferPost) respond(request, { ...JSON.parse(request.data), id: 'log', ...(incorrectLog ? { amount: 1, unit_id: 'dense', unit_key: 'listening_dense_minutes' } : {}) });
+        if (!deferPost) respond(request, { ...JSON.parse(request.data), id: 'log', ...(incorrectLog ? { duration_seconds: 1 } : {}) });
       } else if (request.method === 'PUT') {
-        respond(request, { ...JSON.parse(request.data), id: 'log' });
+        respond(request, { ...JSON.parse(request.data), id: 'log', ...(incorrectUpdate ? { duration_seconds: 1 } : {}) });
       } else throw new Error(`Unexpected request: ${request.url}`);
     },
   });
@@ -124,11 +118,12 @@ test('YouTube script logs the full duration with clean URL, youtube tag, and eli
   const post = f.requests.find(request => request.method === 'POST');
   assert.equal(post.url, `${API}/logs`);
   assert.deepEqual(JSON.parse(post.data), {
-    registration_ids: ['eligible'], language_code: 'ja', activity_id: 2,
-    amount: 23.6, unit_id: 'ja', unit_key: 'listening_minute',
+    registration_ids: ['eligible'], language_code: 'jpn', activity_id: 2,
+    duration_seconds: 1415,
     tags: ['youtube'], description: 'https://www.youtube.com/watch?v=first',
   });
   assert.ok(f.requests.every(request => request.anonymous === false));
+  assert.equal(f.requests.filter(request => request.method === 'PUT').length, 0);
   assert.equal(f.status.textContent, '23.6 minutes logged.');
   assert.equal(f.button.disabled, true);
   await f.click();
@@ -204,7 +199,7 @@ test('pending clicks stay tied to the original video when autoplay navigates', a
   assert.equal(f.button.disabled, false);
   const post = f.requests.find(request => request.method === 'POST');
   assert.equal(JSON.parse(post.data).description, 'https://www.youtube.com/watch?v=first');
-  assert.equal(JSON.parse(post.data).amount, 23.6);
+  assert.equal(JSON.parse(post.data).duration_seconds, 1415);
 });
 
 test('an uncertain submission is never retried automatically', async () => {
@@ -217,25 +212,37 @@ test('an uncertain submission is never retried automatically', async () => {
   assert.equal(f.requests.filter(request => request.method === 'POST').length, 1);
 });
 
-test('incorrect saved minutes are corrected by updating the created log', async () => {
+test('incorrect saved duration is corrected by updating the created log', async () => {
   const f = fixture({ incorrectLog: true });
   await f.click();
   const update = f.requests.find(request => request.method === 'PUT');
   assert.equal(update.url, `${API}/logs/log`);
-  assert.equal(JSON.parse(update.data).amount, 23.6);
-  assert.equal(JSON.parse(update.data).unit_key, 'listening_minute');
+  assert.deepEqual(JSON.parse(update.data), {
+    duration_seconds: 1415, tags: ['youtube'],
+    description: 'https://www.youtube.com/watch?v=first',
+  });
   assert.equal(f.status.textContent, '23.6 minutes logged.');
 });
 
-test('legacy unit names and generic units work without selecting another language or dense minutes', async () => {
-  const f = fixture();
-  f.options.units = f.options.units.filter(unit => unit.id !== 'ja');
-  delete f.options.units.find(unit => unit.id === 'generic').unit_key;
+test('listening works with no amount units and rounds fractional seconds to a whole second', async () => {
+  const f = fixture({ duration: 1415.3 });
+  f.options.units = [];
   await f.click();
   const payload = JSON.parse(f.requests.find(request => request.method === 'POST').data);
-  assert.equal(payload.unit_id, 'generic');
+  assert.equal(payload.duration_seconds, 1416);
+  assert.equal(payload.amount, undefined);
+  assert.equal(payload.unit_id, undefined);
   assert.equal(payload.unit_key, undefined);
   assert.equal(f.status.textContent, '23.6 minutes logged.');
+});
+
+test('a failed duration correction never reports success', async () => {
+  const f = fixture({ incorrectLog: true, incorrectUpdate: true });
+  await f.click();
+  assert.match(f.status.textContent, /unexpected log details/);
+  assert.equal(f.button.disabled, false);
+  assert.equal(f.requests.filter(request => request.method === 'POST').length, 1);
+  assert.equal(f.requests.filter(request => request.method === 'PUT').length, 1);
 });
 
 test('own status mutations do not keep refreshing every animation frame', () => {
